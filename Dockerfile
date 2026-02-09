@@ -6,7 +6,7 @@ FROM node:20-alpine AS frontend-builder
 WORKDIR /build/frontend
 
 COPY frontend/package.json frontend/package-lock.json* ./
-RUN npm ci
+RUN npm ci || npm install
 
 COPY frontend/ ./
 
@@ -20,25 +20,40 @@ RUN npm run build
 # ============================================================
 FROM python:3.11-slim
 
-# System dependencies for document processing
+# System dependencies for document processing and building C extensions
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Build tools (needed for chromadb, weasyprint, etc.)
+    build-essential \
+    gcc \
+    g++ \
+    # PDF processing
     poppler-utils \
+    # OCR
     tesseract-ocr \
     tesseract-ocr-eng \
+    # WeasyPrint dependencies
     libpango-1.0-0 \
+    libpangoft2-1.0-0 \
     libpangocairo-1.0-0 \
     libgdk-pixbuf2.0-0 \
     libffi-dev \
     libcairo2 \
+    libcairo2-dev \
     libglib2.0-0 \
+    libglib2.0-dev \
+    shared-mime-info \
+    # General utilities
     curl \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
+# Install Python dependencies
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
+# Copy application code
 COPY app/ ./app/
 COPY tools/ ./tools/
 
