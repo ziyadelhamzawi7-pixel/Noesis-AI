@@ -1,16 +1,22 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useCallback, memo, Fragment } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Send, FileText, AlertCircle, Loader2, MessageSquare, FileEdit, Sparkles, User, Users, UserPlus } from 'lucide-react';
+import { Send, FileText, AlertCircle, Loader2, MessageSquare, FileEdit, Sparkles, User, Users, UserPlus, Pencil, Trash2, Check } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import InvestmentMemo from './InvestmentMemo';
+import ChartRenderer from './ChartRenderer';
 import {
   getDataRoomStatus,
   askQuestion,
   getQuestionHistory,
   getDocuments,
+  deleteQuestion,
+  listConnectedFolders,
+  getCurrentUser,
+  getFolderSyncProgress,
   Question,
   DataRoomStatus,
+  SyncProgress,
   Source,
   Document,
   DocumentWithPath,
@@ -18,6 +24,68 @@ import {
 import FilePreviewModal from './FilePreviewModal';
 import DocumentTreeSidebar from './DocumentTreeSidebar';
 import ShareDialog from './ShareDialog';
+
+function getErrorMessage(err: any): string {
+  if (err.response?.data?.detail) {
+    return err.response.data.detail;
+  }
+  if (err.code === 'ECONNABORTED') {
+    return 'Request timed out. The analysis is taking longer than expected. Please try again.';
+  }
+  if (err.request && !err.response) {
+    return 'Unable to reach the server. Please check that the backend is running.';
+  }
+  if (err.message) {
+    return err.message;
+  }
+  return 'Failed to get answer';
+}
+
+const messagesByPhase: Record<string, string[]> = {
+  uploading: [
+    'Receiving your documents...',
+    'Securing file transfer...',
+    'Preparing for analysis...',
+  ],
+  parsing: [
+    'Extracting financial tables...',
+    'Reading pitch deck content...',
+    'Parsing document structure...',
+    'Identifying key metrics...',
+    'Processing spreadsheet formulas...',
+    'Analyzing revenue models...',
+  ],
+  indexing: [
+    'Building semantic search index...',
+    'Generating document embeddings...',
+    'Connecting related concepts...',
+    'Optimizing for Q&A retrieval...',
+    'Mapping knowledge graph...',
+  ],
+  extracting: [
+    'Analyzing financial models...',
+    'Extracting key data points...',
+    'Mapping revenue projections...',
+    'Cataloging company metrics...',
+  ],
+};
+
+function getMilestoneIndex(status: string): number {
+  switch (status) {
+    case 'uploading': return 0;
+    case 'parsing': return 1;
+    case 'indexing':
+    case 'extracting': return 2;
+    case 'complete': return 3;
+    default: return 0;
+  }
+}
+
+function getEndColor(progress: number): string {
+  if (progress < 34) return 'var(--accent-secondary)';
+  if (progress < 67) return 'var(--accent-tertiary)';
+  return 'var(--success)';
+}
 
 export default function ChatInterface() {
   const { dataRoomId } = useParams<{ dataRoomId: string }>();
@@ -29,13 +97,34 @@ export default function ChatInterface() {
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [activeTab, setActiveTab] = useState<'qa' | 'memo'>('qa');
-  const [questionFilter, setQuestionFilter] = useState<'team' | 'mine'>('team');
+  const [questionFilter, setQuestionFilter] = useState<'team' | 'mine'>('mine');
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const lastQuestionRef = useRef<HTMLDivElement>(null);
 
   const [selectedDocument, setSelectedDocument] = useState<Document | null>(null);
   const [isPreviewOpen, setIsPreviewOpen] = useState(false);
   const [shareDialogOpen, setShareDialogOpen] = useState(false);
+  const [syncConnectionId, setSyncConnectionId] = useState<string | null>(null);
+  const [chatInputReady, setChatInputReady] = useState(false);
+
+  // Streaming answer state
+  const [pendingQuestionId, setPendingQuestionId] = useState<string | null>(null);
+  const [streamingQuestionId, setStreamingQuestionId] = useState<string | null>(null);
+  const [displayedAnswer, setDisplayedAnswer] = useState('');
+  const streamingIntervalRef = useRef<number | null>(null);
+  const streamingFullQuestionRef = useRef<Question | null>(null);
+
+  // Enhanced progress state
+  const [syncProgress, setSyncProgress] = useState<SyncProgress | null>(null);
+  const [displayedParsed, setDisplayedParsed] = useState(0);
+  const [contextMessage, setContextMessage] = useState('');
+  const [messageExiting, setMessageExiting] = useState(false);
+  const countAnimRef = useRef<number>(0);
+  const messageIndexRef = useRef(0);
+  // High-water mark to prevent progress bar from going backwards
+  const progressHighWaterMark = useRef<number>(0);
+  // Track last progress change to detect stalls
+  const lastProgressChangeRef = useRef<{ value: number; time: number }>({ value: 0, time: Date.now() });
 
   useEffect(() => {
     if (!dataRoomId) {
@@ -43,33 +132,217 @@ export default function ChatInterface() {
       return;
     }
 
-    loadDataRoom();
-    loadHistory();
-    loadDocuments();
+    // Stagger requests: load status first, then history + documents on success.
+    // This avoids overwhelming the backend when it's busy processing uploads.
+    loadDataRoom(true);
   }, [dataRoomId]);
 
   useEffect(() => {
     scrollToBottom();
   }, [questions]);
 
+  // Auto-scroll during answer streaming
+  useEffect(() => {
+    if (streamingQuestionId) {
+      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    }
+  }, [displayedAnswer]);
+
+  // Cleanup streaming interval on unmount
+  useEffect(() => {
+    return () => {
+      if (streamingIntervalRef.current !== null) {
+        window.clearInterval(streamingIntervalRef.current);
+      }
+    };
+  }, []);
+
   const scrollToBottom = () => {
     lastQuestionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
   };
 
-  const loadDataRoom = async () => {
+  const loadDataRoom = async (initialLoad = false, retryCount = 0) => {
     if (!dataRoomId) return;
+    const MAX_RETRIES = 5;
 
     try {
       const status = await getDataRoomStatus(dataRoomId);
-      setDataRoom(status);
+
+      // Clear any previous transient errors on success
+      setError(null);
+
+      // On first successful load, also fetch history and documents
+      if (initialLoad) {
+        loadHistory();
+        loadDocuments();
+      }
+
+      // Enforce monotonic progress — never let progress_percent decrease
+      if (status.processing_status === 'complete') {
+        progressHighWaterMark.current = 100;
+      } else {
+        progressHighWaterMark.current = Math.max(progressHighWaterMark.current, status.progress_percent);
+      }
+      // Track when progress last changed (for stall detection)
+      if (status.progress_percent !== lastProgressChangeRef.current.value) {
+        lastProgressChangeRef.current = { value: status.progress_percent, time: Date.now() };
+      }
+      const clampedStatus = { ...status, progress_percent: progressHighWaterMark.current };
+      setDataRoom(prev => {
+        if (prev &&
+            prev.processing_status === clampedStatus.processing_status &&
+            prev.progress_percent === clampedStatus.progress_percent &&
+            prev.total_documents === clampedStatus.total_documents &&
+            prev.parsed_documents === clampedStatus.parsed_documents) {
+          return prev;
+        }
+        return clampedStatus;
+      });
 
       if (status.processing_status !== 'complete' && status.processing_status !== 'failed') {
-        setTimeout(loadDataRoom, 3000);
+        // Find the connected folder driving this data room's sync
+        if (!syncConnectionId) {
+          findSyncConnection();
+        }
+        setTimeout(() => loadDataRoom(), 3000);
       }
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load data room');
+      const httpStatus = err.response?.status;
+      const detail = err.response?.data?.detail;
+
+      // Permanent errors — don't retry
+      if (httpStatus === 403) {
+        setError('You do not have access to this data room. Please log in with the account that created it.');
+        return;
+      }
+      if (httpStatus === 404) {
+        setError('Data room not found. It may have been deleted.');
+        return;
+      }
+
+      // Transient errors (network, timeout, 5xx) — retry with backoff
+      if (retryCount < MAX_RETRIES) {
+        const delay = Math.min(2000 * Math.pow(2, retryCount), 32000);
+        console.warn(`[loadDataRoom] Retry ${retryCount + 1}/${MAX_RETRIES} in ${delay}ms...`);
+        setTimeout(() => loadDataRoom(initialLoad, retryCount + 1), delay);
+        return;
+      }
+
+      // All retries exhausted
+      if (err.request && !err.response) {
+        setError('Unable to reach the backend. The server may be busy processing files — please wait a moment and refresh.');
+      } else if (httpStatus) {
+        setError(detail || `Server error (${httpStatus}). Please try again.`);
+      } else {
+        setError(detail || 'Failed to load data room. Please try refreshing the page.');
+      }
     }
   };
+
+  const findSyncConnection = async () => {
+    const user = getCurrentUser();
+    if (!user) return;
+    try {
+      const result = await listConnectedFolders(user.id);
+      const match = result.folders.find(
+        f => f.data_room_id === dataRoomId &&
+          (f.sync_stage === 'discovering' || f.sync_stage === 'processing' ||
+           f.sync_stage === 'discovered' || f.sync_status === 'syncing')
+      );
+      if (match) {
+        setSyncConnectionId(match.id);
+      }
+    } catch {
+      // Silently fail — fall back to existing basic progress UI
+    }
+  };
+
+  const handleSyncComplete = useCallback(() => {
+    setSyncConnectionId(null);
+    setChatInputReady(true);
+    loadDataRoom();
+    loadDocuments();
+    // Clear the pulse animation class after it plays
+    setTimeout(() => setChatInputReady(false), 2000);
+  }, [dataRoomId]);
+
+  // Poll sync progress when a Google Drive connection is active
+  useEffect(() => {
+    if (!syncConnectionId) {
+      setSyncProgress(null);
+      return;
+    }
+    let active = true;
+    const poll = async () => {
+      if (!active) return;
+      try {
+        const data = await getFolderSyncProgress(syncConnectionId);
+        if (active) setSyncProgress(data);
+        if (data.sync_stage === 'complete') {
+          handleSyncComplete();
+        }
+      } catch { /* silent */ }
+    };
+    poll();
+    const interval = setInterval(poll, 2500);
+    return () => { active = false; clearInterval(interval); };
+  }, [syncConnectionId, handleSyncComplete]);
+
+  // Smooth count-up animation for document counter
+  // Always use dataRoom.parsed_documents (actual parsed count) as the source of truth,
+  // not syncProgress.processed_files (which tracks downloads, not parsing completion).
+  useEffect(() => {
+    const target = dataRoom?.parsed_documents ?? 0;
+    if (target === displayedParsed) return;
+
+    const start = displayedParsed;
+    const startTime = performance.now();
+    const duration = 400;
+
+    const animate = (now: number) => {
+      const elapsed = now - startTime;
+      const t = Math.min(elapsed / duration, 1);
+      const eased = 1 - Math.pow(1 - t, 3);
+      setDisplayedParsed(Math.round(start + (target - start) * eased));
+      if (t < 1) countAnimRef.current = requestAnimationFrame(animate);
+    };
+
+    countAnimRef.current = requestAnimationFrame(animate);
+    return () => cancelAnimationFrame(countAnimRef.current);
+  }, [dataRoom?.parsed_documents]);
+
+  // Rotating contextual messages
+  useEffect(() => {
+    if (!dataRoom || dataRoom.processing_status === 'complete' || dataRoom.processing_status === 'failed') {
+      return;
+    }
+
+    const messages = messagesByPhase[dataRoom.processing_status] || ['Processing...'];
+    const allMessages = [...messages];
+    if (syncProgress?.current_file) {
+      allMessages.push(`Processing ${syncProgress.current_file.file_name}...`);
+    }
+
+    messageIndexRef.current = 0;
+    setContextMessage(allMessages[0]);
+    setMessageExiting(false);
+
+    const interval = setInterval(() => {
+      setMessageExiting(true);
+      setTimeout(() => {
+        const isStalled = Date.now() - lastProgressChangeRef.current.time > 60_000;
+        if (isStalled) {
+          setContextMessage('Processing is taking longer than expected. Large or complex documents may need extra time...');
+        } else {
+          messageIndexRef.current = (messageIndexRef.current + 1) % allMessages.length;
+          setContextMessage(allMessages[messageIndexRef.current]);
+        }
+        setMessageExiting(false);
+      }, 300);
+    }, 3500);
+
+    return () => clearInterval(interval);
+  }, [dataRoom?.processing_status, syncProgress?.current_file?.file_name]);
 
   const loadHistory = async (filter?: 'team' | 'mine') => {
     if (!dataRoomId) return;
@@ -107,13 +380,25 @@ export default function ChatInterface() {
     setIsLoading(true);
 
     const questionText = inputValue.trim();
+    const tempId = `q_${Date.now()}`;
     setInputValue('');
+
+    // Immediately show the user's question on screen
+    const placeholderQuestion: Question = {
+      id: tempId,
+      question: questionText,
+      answer: '',
+      sources: [],
+      created_at: new Date().toISOString(),
+    };
+    setQuestions((prev) => [...prev, placeholderQuestion]);
+    setPendingQuestionId(tempId);
 
     try {
       const response = await askQuestion(dataRoomId, { question: questionText });
 
-      const newQuestion: Question = {
-        id: `q_${Date.now()}`,
+      const fullQuestion: Question = {
+        id: tempId,
         question: questionText,
         answer: response.answer,
         sources: response.sources || [],
@@ -121,14 +406,68 @@ export default function ChatInterface() {
         created_at: new Date().toISOString(),
         response_time_ms: response.response_time_ms,
         cost: response.cost,
+        charts: response.charts,
+        is_analytical: response.is_analytical,
       };
 
-      setQuestions((prev) => [...prev, newQuestion]);
+      // Transition from pending to streaming the answer
+      setPendingQuestionId(null);
+      setStreamingQuestionId(tempId);
+      setDisplayedAnswer('');
+      streamingFullQuestionRef.current = fullQuestion;
+
+      // Stream the answer with adaptive speed (~4s target duration)
+      const fullText = response.answer;
+      const TICK_MS = 30;
+      const charsPerTick = Math.max(3, Math.ceil(fullText.length / (4000 / TICK_MS)));
+      let charIndex = 0;
+
+      streamingIntervalRef.current = window.setInterval(() => {
+        charIndex = Math.min(charIndex + charsPerTick, fullText.length);
+        setDisplayedAnswer(fullText.slice(0, charIndex));
+
+        if (charIndex >= fullText.length) {
+          // Streaming complete — reveal full answer with metadata
+          if (streamingIntervalRef.current !== null) {
+            window.clearInterval(streamingIntervalRef.current);
+            streamingIntervalRef.current = null;
+          }
+          setQuestions((prev) => prev.map((q) => q.id === tempId ? fullQuestion : q));
+          setStreamingQuestionId(null);
+          setDisplayedAnswer('');
+          streamingFullQuestionRef.current = null;
+          setIsLoading(false);
+        }
+      }, TICK_MS);
+
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to get answer');
+      // Remove placeholder and restore input on error
+      setQuestions((prev) => prev.filter((q) => q.id !== tempId));
+      setPendingQuestionId(null);
+      setError(getErrorMessage(err));
       setInputValue(questionText);
-    } finally {
       setIsLoading(false);
+    }
+  };
+
+  const handleDeleteQuestion = async (questionId: string) => {
+    if (!dataRoomId) return;
+    try {
+      await deleteQuestion(dataRoomId, questionId);
+      setQuestions((prev) => prev.filter((q) => q.id !== questionId));
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to delete question');
+    }
+  };
+
+  const handleEditQuestion = async (question: Question) => {
+    if (!dataRoomId) return;
+    try {
+      await deleteQuestion(dataRoomId, question.id);
+      setQuestions((prev) => prev.filter((q) => q.id !== question.id));
+      setInputValue(question.question);
+    } catch (err: any) {
+      setError(err.response?.data?.detail || 'Failed to edit question');
     }
   };
 
@@ -137,7 +476,7 @@ export default function ChatInterface() {
     setIsPreviewOpen(true);
   };
 
-  const openPreviewFromTree = (doc: DocumentWithPath) => {
+  const openPreviewFromTree = useCallback((doc: DocumentWithPath) => {
     const documentForPreview: Document = {
       id: doc.id,
       data_room_id: dataRoomId!,
@@ -149,7 +488,7 @@ export default function ChatInterface() {
     };
     setSelectedDocument(documentForPreview);
     setIsPreviewOpen(true);
-  };
+  }, [dataRoomId]);
 
   const closePreview = () => {
     setIsPreviewOpen(false);
@@ -168,40 +507,47 @@ export default function ChatInterface() {
       failed: { badge: 'badge badge-error', label: 'Failed' },
     };
 
-    const config = statusConfig[dataRoom.processing_status];
+    const config = statusConfig[dataRoom.processing_status] || {
+      badge: 'badge badge-processing',
+      label: dataRoom.processing_status || 'Processing',
+    };
     const isFailed = dataRoom.processing_status === 'failed';
     const isProcessing = dataRoom.processing_status !== 'complete' && dataRoom.processing_status !== 'failed';
     const hasFailedDocs = dataRoom.failed_documents && dataRoom.failed_documents.length > 0;
 
     if (dataRoom.processing_status === 'complete' && !hasFailedDocs) return null;
 
+    const progress = dataRoom.progress_percent;
+    const milestoneIndex = getMilestoneIndex(dataRoom.processing_status);
+    const milestones = ['Upload', 'Parse', 'Index', 'Ready'];
+    const totalDocs = syncProgress?.total_files || dataRoom.total_documents;
+
     return (
-      <div
-        style={{
-          padding: '16px 20px',
-          background: isFailed ? 'var(--error-soft)' : 'var(--bg-tertiary)',
-          borderRadius: '12px',
-          marginBottom: '20px',
-          border: `1px solid ${isFailed ? 'rgba(244, 63, 94, 0.2)' : 'var(--border-subtle)'}`,
-        }}
-      >
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          {isProcessing && <div className="spinner spinner-sm" />}
-          {isFailed && <AlertCircle size={18} style={{ color: 'var(--error)' }} />}
-          <span className={config.badge}>{config.label}</span>
-          {isProcessing && (
-            <span style={{ fontSize: '13px', color: 'var(--text-secondary)' }}>
-              Processing documents...
+      <div className={`status-panel ${isFailed ? 'status-panel-error' : ''}`}>
+        {/* Header row: badge + doc count */}
+        <div className="status-header-row">
+          <div className="status-header-left">
+            {isProcessing && <div className="spinner spinner-sm" />}
+            {isFailed && <AlertCircle size={18} style={{ color: 'var(--error)' }} />}
+            <span className={config.badge}>{config.label}</span>
+          </div>
+          {isProcessing && totalDocs > 0 && (
+            <span className="status-doc-count">
+              <span className="status-count-number">{displayedParsed}</span>
+              {' of '}
+              <span className="status-count-number">{totalDocs}</span>
+              {' documents'}
             </span>
           )}
         </div>
 
+        {/* Error messages */}
         {isFailed && dataRoom.error_message && (
-          <p style={{ fontSize: '13px', color: 'var(--error)', marginTop: '12px' }}>{dataRoom.error_message}</p>
+          <p style={{ fontSize: '13px', color: 'var(--error)' }}>{dataRoom.error_message}</p>
         )}
 
         {hasFailedDocs && (
-          <div style={{ marginTop: '12px' }}>
+          <div>
             <p style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '8px' }}>
               Failed Documents:
             </p>
@@ -225,13 +571,59 @@ export default function ChatInterface() {
           </div>
         )}
 
+        {/* Milestone track */}
         {isProcessing && (
-          <div className="progress-wrapper" style={{ marginTop: '12px' }}>
-            <div className="progress-bar">
-              <div className="progress-fill" style={{ width: `${dataRoom.progress_percent}%` }} />
-            </div>
-            <span className="progress-text">{Math.round(dataRoom.progress_percent)}%</span>
+          <div className="milestone-track">
+            {milestones.map((label, i) => (
+              <Fragment key={label}>
+                {i > 0 && (
+                  <div className="milestone-line">
+                    <div
+                      className="milestone-line-fill"
+                      style={{ width: i <= milestoneIndex ? '100%' : '0%' }}
+                    />
+                  </div>
+                )}
+                <div className="milestone-node">
+                  <div className={`milestone-dot ${
+                    i < milestoneIndex ? 'milestone-dot-complete' :
+                    i === milestoneIndex ? 'milestone-dot-active' :
+                    'milestone-dot-pending'
+                  }`}>
+                    {i < milestoneIndex && <Check size={8} />}
+                  </div>
+                  <span className={`milestone-label ${i <= milestoneIndex ? 'milestone-label-active' : ''}`}>
+                    {label}
+                  </span>
+                </div>
+              </Fragment>
+            ))}
           </div>
+        )}
+
+        {/* Enhanced progress bar */}
+        {isProcessing && (
+          <div className="enhanced-progress-wrapper">
+            <div className="enhanced-progress-track">
+              <div
+                className="enhanced-progress-fill"
+                style={{
+                  width: `${progress}%`,
+                  '--end-color': getEndColor(progress),
+                } as React.CSSProperties}
+              >
+                {progress > 0 && <div className="enhanced-progress-spark" />}
+              </div>
+            </div>
+            <span className="enhanced-progress-pct">{Math.round(progress)}%</span>
+          </div>
+        )}
+
+        {/* Rotating contextual message */}
+        {isProcessing && contextMessage && (
+          <p className={`context-message ${messageExiting ? 'context-message-exit' : ''}`}>
+            {contextMessage}
+          </p>
         )}
       </div>
     );
@@ -260,155 +652,213 @@ export default function ChatInterface() {
     </div>
   );
 
-  const renderMessage = (question: Question, isLast: boolean) => (
-    <div key={question.id} style={{ marginBottom: '24px' }}>
-      {/* User Question */}
-      <div className="message message-user" ref={isLast ? lastQuestionRef : undefined}>
-        <div className="message-avatar">
-          {question.user_picture_url ? (
-            <img src={question.user_picture_url} alt="" style={{ width: '100%', height: '100%', borderRadius: '50%', objectFit: 'cover' }} />
-          ) : (
-            <User size={16} />
-          )}
-        </div>
-        <div className="message-bubble">
-          {questionFilter === 'team' && question.user_name && (
-            <span className="question-author">{question.user_name}</span>
-          )}
-          <p style={{ fontSize: '14px', margin: 0, lineHeight: 1.5 }}>{question.question}</p>
-        </div>
-      </div>
+  const renderMessage = (question: Question, isLast: boolean) => {
+    const isPending = question.id === pendingQuestionId;
+    const isStreaming = question.id === streamingQuestionId;
 
-      {/* AI Answer */}
-      <div className="message message-ai" style={{ marginTop: '12px' }}>
-        <div className="message-avatar">
-          <Sparkles size={16} />
-        </div>
-        <div style={{ flex: 1, minWidth: 0 }}>
-          <div className="message-bubble">
-            <div className="markdown">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>{question.answer}</ReactMarkdown>
-            </div>
+    return (
+      <div key={question.id} style={{ marginBottom: '24px' }}>
+        {/* User Question */}
+        <div className="message message-user" ref={isLast ? lastQuestionRef : undefined}>
+          <div className="message-avatar">
+            {question.user_picture_url ? (
+              <img src={question.user_picture_url} alt="" style={{ width: '100%', height: '100%', borderRadius: '50%', objectFit: 'cover' }} />
+            ) : (
+              <User size={16} />
+            )}
           </div>
-
-          {/* Sources */}
-          {question.sources && question.sources.length > 0 && (
-            <div style={{ marginTop: '12px', display: 'flex', flexDirection: 'column', gap: '8px' }}>
-              <span style={{ fontSize: '11px', fontWeight: 500, color: 'var(--text-tertiary)', textTransform: 'uppercase', letterSpacing: '0.05em' }}>
-                Sources
-              </span>
-              {question.sources.map((source, idx) => renderSource(source, idx))}
-            </div>
-          )}
-
-          {/* Metadata */}
-          <div className="message-meta" style={{ marginTop: '12px' }}>
-            {question.confidence_score && (
-              <span style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-                Confidence:
-                <span
+          <div className="message-bubble" style={{ position: 'relative' }}>
+            {questionFilter === 'team' && question.user_name && (
+              <span className="question-author">{question.user_name}</span>
+            )}
+            <p style={{ fontSize: '14px', margin: 0, lineHeight: 1.5, paddingRight: '48px' }}>{question.question}</p>
+            {questionFilter === 'mine' && !isPending && !isStreaming && (
+              <div className="question-actions" style={{
+                position: 'absolute', top: '8px', right: '8px',
+                display: 'flex', gap: '2px', opacity: 0, transition: 'opacity 0.15s',
+              }}>
+                <button
+                  onClick={() => handleEditQuestion(question)}
+                  title="Edit &amp; re-ask"
                   style={{
-                    display: 'inline-block',
-                    width: '40px',
-                    height: '4px',
-                    background: 'var(--bg-elevated)',
-                    borderRadius: '2px',
-                    overflow: 'hidden',
+                    background: 'none', border: 'none', cursor: 'pointer', padding: '4px',
+                    color: 'var(--text-tertiary)', borderRadius: '4px', display: 'flex',
                   }}
                 >
-                  <span
-                    style={{
-                      display: 'block',
-                      height: '100%',
-                      width: `${question.confidence_score * 100}%`,
-                      background: question.confidence_score > 0.7 ? 'var(--success)' : question.confidence_score > 0.4 ? 'var(--warning)' : 'var(--error)',
-                      borderRadius: '2px',
-                    }}
-                  />
-                </span>
-                {Math.round(question.confidence_score * 100)}%
-              </span>
+                  <Pencil size={13} />
+                </button>
+                <button
+                  onClick={() => handleDeleteQuestion(question.id)}
+                  title="Delete"
+                  style={{
+                    background: 'none', border: 'none', cursor: 'pointer', padding: '4px',
+                    color: 'var(--text-tertiary)', borderRadius: '4px', display: 'flex',
+                  }}
+                >
+                  <Trash2 size={13} />
+                </button>
+              </div>
             )}
-            {question.response_time_ms && <span>{(question.response_time_ms / 1000).toFixed(2)}s</span>}
-            {question.cost && <span>${question.cost.toFixed(4)}</span>}
           </div>
         </div>
-      </div>
-    </div>
-  );
 
-  // Loading State
-  if (!dataRoom) {
+        {/* AI Answer — pending (thinking), streaming, or complete */}
+        {isPending ? (
+          <div className="typing-indicator" style={{ marginTop: '12px' }}>
+            <div className="message-avatar" style={{ background: 'var(--bg-tertiary)', color: 'var(--accent-primary)' }}>
+              <Sparkles size={16} />
+            </div>
+            <div className="typing-bubble">
+              <div className="loading-dots">
+                <span />
+                <span />
+                <span />
+              </div>
+              <span className="typing-text">Noesis is thinking...</span>
+            </div>
+          </div>
+        ) : (
+          <div className="message message-ai" style={{ marginTop: '12px' }}>
+            <div className="message-avatar">
+              <Sparkles size={16} />
+            </div>
+            <div style={{ flex: 1, minWidth: 0 }}>
+              <div className="message-bubble">
+                <div className="markdown">
+                  <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                    {isStreaming ? displayedAnswer : question.answer}
+                  </ReactMarkdown>
+                </div>
+
+                {/* Inline Charts — only after streaming completes */}
+                {!isStreaming && question.charts && question.charts.length > 0 && (
+                  <div className="chat-charts">
+                    {question.charts.map((chart) => (
+                      <ChartRenderer key={chart.id} spec={chart} />
+                    ))}
+                  </div>
+                )}
+              </div>
+
+              {/* Metadata — only after streaming completes */}
+              {!isStreaming && (
+                <div className="message-meta" style={{ marginTop: '12px' }}>
+                  {question.response_time_ms && <span>{(question.response_time_ms / 1000).toFixed(2)}s</span>}
+                  {question.cost && <span>${question.cost.toFixed(4)}</span>}
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+      </div>
+    );
+  };
+
+  // Terminal error state (403, 404, retries exhausted) — show error page
+  if (!dataRoom && error) {
     return (
       <div className="empty-state" style={{ height: '60vh' }}>
-        {error ? (
-          <>
-            <div className="empty-icon" style={{ background: 'var(--error-soft)' }}>
-              <AlertCircle size={32} style={{ color: 'var(--error)' }} />
-            </div>
-            <h3 className="empty-title">Error Loading Data Room</h3>
-            <p className="empty-description">{error}</p>
-          </>
-        ) : (
-          <>
-            <div className="empty-icon">
-              <div className="spinner spinner-lg" />
-            </div>
-            <h3 className="empty-title">Loading Data Room</h3>
-            <p className="empty-description">Please wait while we load your documents...</p>
-          </>
-        )}
+        <div className="empty-icon" style={{ background: 'var(--error-soft)' }}>
+          <AlertCircle size={32} style={{ color: 'var(--error)' }} />
+        </div>
+        <h3 className="empty-title">Error Loading Data Room</h3>
+        <p className="empty-description">{error}</p>
       </div>
     );
   }
 
+  const isInitialLoading = !dataRoom && !error;
+
   return (
     <>
       <div style={{ display: 'flex', gap: '20px', height: 'calc(100vh - 140px)' }}>
-        {/* Documents Sidebar - only show on Q&A tab */}
-        {dataRoomId && activeTab === 'qa' && <DocumentTreeSidebar dataRoomId={dataRoomId} onDocumentClick={openPreviewFromTree} />}
+        {/* Documents Sidebar - always mounted, hidden when not on Q&A tab */}
+        {dataRoomId && (
+          <div style={{ display: activeTab === 'qa' ? 'contents' : 'none' }}>
+            <DocumentTreeSidebar dataRoomId={dataRoomId} onDocumentClick={openPreviewFromTree} processingStatus={dataRoom?.processing_status} />
+          </div>
+        )}
 
         {/* Main Chat Area */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           {/* Header */}
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
-            <h1
-              style={{
-                fontSize: '24px',
-                fontWeight: 600,
-                color: 'var(--text-primary)',
-                letterSpacing: '-0.02em',
-              }}
-            >
-              {dataRoom.company_name}
-            </h1>
-            <button
-              className="btn btn-secondary"
-              onClick={() => setShareDialogOpen(true)}
-              style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}
-            >
-              <UserPlus size={16} />
-              Add Team Member
-            </button>
+            {isInitialLoading ? (
+              <>
+                <div className="skeleton" style={{ height: '28px', width: '200px', borderRadius: '8px' }} />
+                <div className="skeleton" style={{ height: '38px', width: '160px', borderRadius: '12px' }} />
+              </>
+            ) : (
+              <>
+                <h1
+                  style={{
+                    fontSize: '24px',
+                    fontWeight: 600,
+                    color: 'var(--text-primary)',
+                    letterSpacing: '-0.02em',
+                  }}
+                >
+                  {dataRoom?.company_name || 'Loading...'}
+                </h1>
+                <button
+                  className="btn btn-secondary"
+                  onClick={() => setShareDialogOpen(true)}
+                  style={{ display: 'flex', alignItems: 'center', gap: '6px', flexShrink: 0 }}
+                >
+                  <UserPlus size={16} />
+                  Add Team Member
+                </button>
+              </>
+            )}
           </div>
 
           {/* Tabs */}
-          <div className="tabs-underline" style={{ marginBottom: '20px' }}>
-            <button className={`tab ${activeTab === 'qa' ? 'tab-active' : ''}`} onClick={() => setActiveTab('qa')}>
-              <MessageSquare size={16} style={{ marginRight: '8px' }} />
-              Q&A
-            </button>
-            <button className={`tab ${activeTab === 'memo' ? 'tab-active' : ''}`} onClick={() => setActiveTab('memo')}>
-              <FileEdit size={16} style={{ marginRight: '8px' }} />
-              Investment Memo
-            </button>
-          </div>
+          {isInitialLoading ? (
+            <div style={{ display: 'flex', gap: '0', borderBottom: '1px solid var(--border-default)', marginBottom: '20px' }}>
+              <div className="skeleton" style={{ height: '16px', width: '50px', margin: '14px 24px' }} />
+              <div className="skeleton" style={{ height: '16px', width: '120px', margin: '14px 24px' }} />
+            </div>
+          ) : (
+            <div className="tabs-underline" style={{ marginBottom: '20px' }}>
+              <button className={`tab ${activeTab === 'qa' ? 'tab-active' : ''}`} onClick={() => setActiveTab('qa')}>
+                <MessageSquare size={16} style={{ marginRight: '8px' }} />
+                Q&A
+              </button>
+              <button className={`tab ${activeTab === 'memo' ? 'tab-active' : ''}`} onClick={() => setActiveTab('memo')}>
+                <FileEdit size={16} style={{ marginRight: '8px' }} />
+                Investment Memo
+              </button>
+            </div>
+          )}
 
           {/* Status */}
-          {renderStatus()}
+          {isInitialLoading ? (
+            <div style={{
+              padding: '20px 24px',
+              background: 'var(--bg-tertiary)',
+              borderRadius: '14px',
+              marginBottom: '20px',
+              border: '1px solid var(--border-subtle)',
+              display: 'flex',
+              flexDirection: 'column',
+              gap: '12px',
+            }}>
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+                  <div className="spinner spinner-sm" />
+                  <div className="skeleton" style={{ height: '22px', width: '80px', borderRadius: '11px' }} />
+                </div>
+                <div className="skeleton" style={{ height: '16px', width: '120px' }} />
+              </div>
+              <div className="skeleton" style={{ height: '8px', width: '100%', borderRadius: '4px' }} />
+              <div className="skeleton" style={{ height: '14px', width: '220px', margin: '0 auto' }} />
+            </div>
+          ) : (
+            activeTab !== 'memo' && renderStatus()
+          )}
 
-          {activeTab === 'qa' ? (
-            <>
+          {/* Q&A Tab Content — always mounted, hidden when inactive */}
+          <div style={{ display: activeTab === 'qa' ? 'flex' : 'none', flexDirection: 'column', flex: 1, minHeight: 0 }}>
               {/* Error */}
               {error && (
                 <div
@@ -435,7 +885,7 @@ export default function ChatInterface() {
                   onClick={() => { setQuestionFilter('mine'); loadHistory('mine'); }}
                 >
                   <User size={14} />
-                  My Questions
+                  My Questions (private)
                 </button>
                 <button
                   className={`chat-filter-pill ${questionFilter === 'team' ? 'chat-filter-active' : ''}`}
@@ -463,49 +913,34 @@ export default function ChatInterface() {
 
                   {questions.map((q, idx) => renderMessage(q, idx === questions.length - 1))}
 
-                  {/* Typing Indicator */}
-                  {isLoading && (
-                    <div className="typing-indicator">
-                      <div className="message-avatar" style={{ background: 'var(--bg-tertiary)', color: 'var(--accent-primary)' }}>
-                        <Sparkles size={16} />
-                      </div>
-                      <div className="typing-bubble">
-                        <div className="loading-dots">
-                          <span />
-                          <span />
-                          <span />
-                        </div>
-                        <span className="typing-text">Noesis is thinking...</span>
-                      </div>
-                    </div>
-                  )}
-
                   <div ref={messagesEndRef} />
                 </div>
 
                 {/* Chat Input */}
-                <form onSubmit={handleSubmit} className="chat-input-wrapper">
+                <form onSubmit={handleSubmit} className={`chat-input-wrapper ${chatInputReady ? 'chat-input-ready' : ''}`}>
                   <input
                     type="text"
                     className="chat-input"
                     value={inputValue}
                     onChange={(e) => setInputValue(e.target.value)}
                     placeholder="Ask a question about the data room..."
-                    disabled={isLoading || dataRoom.processing_status !== 'complete'}
+                    disabled={isLoading || dataRoom?.processing_status !== 'complete'}
                   />
                   <button
                     type="submit"
                     className="chat-send-btn"
-                    disabled={isLoading || !inputValue.trim() || dataRoom.processing_status !== 'complete'}
+                    disabled={isLoading || !inputValue.trim() || dataRoom?.processing_status !== 'complete'}
                   >
                     {isLoading ? <Loader2 size={20} style={{ animation: 'spin 1s linear infinite' }} /> : <Send size={20} />}
                   </button>
                 </form>
               </div>
-            </>
-          ) : (
-            <InvestmentMemo dataRoomId={dataRoomId!} isReady={dataRoom.processing_status === 'complete'} />
-          )}
+          </div>
+
+          {/* Investment Memo Tab Content — always mounted, hidden when inactive */}
+          <div style={{ display: activeTab === 'memo' ? 'flex' : 'none', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+            <InvestmentMemo dataRoomId={dataRoomId!} isReady={dataRoom?.processing_status === 'complete'} />
+          </div>
         </div>
       </div>
 

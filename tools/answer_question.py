@@ -5,6 +5,7 @@ Answers analyst questions with citations from data room documents.
 
 import sys
 import os
+import re
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import json
@@ -13,7 +14,7 @@ from datetime import datetime
 from loguru import logger
 
 try:
-    from anthropic import Anthropic
+    from anthropic import Anthropic, APITimeoutError
     from dotenv import load_dotenv
 except ImportError:
     logger.error("Required packages not installed. Run: pip install anthropic python-dotenv")
@@ -55,6 +56,8 @@ class QuestionAnswerer:
         self.client = Anthropic(api_key=api_key)
         self.model = model
         self.max_context_chunks = max_context_chunks
+        self.max_tokens = 2048
+        self.api_timeout = 90  # seconds
 
         # Cost tracking
         self.total_input_tokens = 0
@@ -145,8 +148,9 @@ class QuestionAnswerer:
         try:
             response = self.client.messages.create(
                 model=self.model,
-                max_tokens=2048,
+                max_tokens=self.max_tokens,
                 temperature=0.3,
+                timeout=self.api_timeout,
                 messages=[{"role": "user", "content": prompt}]
             )
 
@@ -191,6 +195,16 @@ class QuestionAnswerer:
 
             return result
 
+        except APITimeoutError as e:
+            logger.error(f"Claude API timed out after {self.api_timeout}s: {e}")
+            return {
+                "question": question,
+                "answer": "The AI model took too long to respond. This can happen with complex questions or large context. Please try again or simplify your question.",
+                "sources": [],
+                "confidence_score": 0.0,
+                "error": "timeout",
+                "response_time_ms": int((time.time() - start_time) * 1000)
+            }
         except Exception as e:
             logger.error(f"Failed to generate answer: {e}")
             return {
@@ -462,13 +476,134 @@ Now answer the following question using both the extracted financial data above 
         return base_prompt
 
 
+# Keywords that indicate a question would benefit from rich analytics (charts/tables)
+ANALYTICAL_KEYWORDS = [
+    'compare', 'comparison', 'trend', 'trends', 'over time', 'year over year',
+    'yoy', 'qoq', 'quarter over quarter', 'month over month',
+    'growth rate', 'trajectory', 'chart', 'graph', 'plot', 'visualize',
+    'visualization', 'show me', 'breakdown', 'distribution', 'composition',
+    'top 5', 'top 10', 'ranking', 'rank', 'highest', 'lowest',
+    'revenue by', 'expenses by', 'margins by', 'split by',
+    'segment', 'cohort', 'per unit',
+    'scenario', 'forecast', 'projection', 'sensitivity',
+    'best case', 'worst case', 'base case',
+]
+
+
+def _is_analytical_question(question: str) -> bool:
+    """Detect if a question would benefit from rich analytics (charts/tables)."""
+    q_lower = question.lower()
+    return any(kw in q_lower for kw in ANALYTICAL_KEYWORDS)
+
+
+class AnalyticalQuestionAnswerer(FinancialQuestionAnswerer):
+    """
+    Extended Q&A with inline chart generation for analytical questions.
+    Uses Claude Opus for higher-quality data analysis and returns chart specs
+    alongside the text answer.
+    """
+
+    ANALYTICS_PROMPT_ADDITION = """
+
+## Charts & Visualizations
+When your answer involves numerical data that would benefit from a chart or graph
+(comparisons, trends, distributions, rankings), you MUST include a visualization.
+
+Output chart data in this exact tag format AFTER your text answer:
+
+<analytics_charts>
+{"charts": [{"id": "unique_id", "title": "Chart Title", "type": "bar", "x_key": "label", "y_key": "value", "x_label": "", "y_label": "", "y_format": "number", "color_key": "", "colors": "#9d174d", "data": [{"label": "A", "value": 100}]}]}
+</analytics_charts>
+
+Chart spec fields:
+- id: unique string (e.g. "revenue_trend", "margin_comparison")
+- title: descriptive chart title
+- type: "bar" | "horizontal_bar" | "line"
+- x_key, y_key: keys matching data point objects
+- x_label, y_label: axis labels (use empty string "" if not needed)
+- y_format: "currency" | "number" | "percent"
+- color_key: data key for per-bar coloring (use empty string "" if not needed)
+- colors: single hex color string OR object mapping color_key values to hex colors
+- data: array of objects with keys matching x_key, y_key, and color_key
+
+Use these colors: #9d174d (primary), #be185d, #e11d48, #881337.
+All numeric values must be raw numbers, not formatted strings (e.g. 1200000 not "$1.2M").
+If the user explicitly asks for a chart or visualization, you MUST always generate one. Otherwise, include charts only when the data genuinely warrants visualization.
+You may include multiple charts if the analysis covers different dimensions.
+"""
+
+    def __init__(
+        self,
+        anthropic_api_key: Optional[str] = None,
+        model: Optional[str] = None,
+        max_context_chunks: int = 15
+    ):
+        # Default to Opus for analytical questions
+        if model is None:
+            try:
+                from app.config import settings
+                model = settings.claude_opus_model
+            except Exception:
+                model = os.getenv("CLAUDE_OPUS_MODEL", "claude-opus-4-5-20251101")
+        super().__init__(anthropic_api_key, model, max_context_chunks)
+        self.max_tokens = 4096  # Larger limit for chart JSON output
+        self.api_timeout = 120  # Opus needs more time
+
+    def answer(
+        self,
+        question: str,
+        data_room_id: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        result = super().answer(question, data_room_id, conversation_history, filters)
+        result = self._parse_charts(result)
+        result['is_analytical'] = True
+        return result
+
+    def _build_prompt(
+        self,
+        question: str,
+        context_chunks: List[Dict[str, Any]],
+        conversation_history: Optional[List[Dict[str, str]]] = None
+    ) -> str:
+        base_prompt = super()._build_prompt(question, context_chunks, conversation_history)
+
+        # Inject analytics instructions before the question
+        parts = base_prompt.split("Question:")
+        if len(parts) == 2:
+            base_prompt = parts[0] + self.ANALYTICS_PROMPT_ADDITION + "\nQuestion:" + parts[1]
+
+        return base_prompt
+
+    def _parse_charts(self, result: Dict[str, Any]) -> Dict[str, Any]:
+        """Parse <analytics_charts> tags from answer and extract chart specs."""
+        answer_text = result.get('answer', '')
+        charts_match = re.search(
+            r'<analytics_charts>\s*(.*?)\s*</analytics_charts>',
+            answer_text, re.DOTALL
+        )
+        if charts_match:
+            try:
+                charts_json = json.loads(charts_match.group(1).strip())
+                if isinstance(charts_json, dict) and 'charts' in charts_json:
+                    result['charts'] = charts_json['charts']
+                    # Strip the tag from the displayed answer
+                    result['answer'] = answer_text[:charts_match.start()].strip()
+                    logger.info(f"Parsed {len(result['charts'])} chart(s) from analytical response")
+            except (json.JSONDecodeError, ValueError) as e:
+                logger.warning(f"Failed to parse analytics charts JSON: {e}")
+        return result
+
+
 def answer_question(
     question: str,
     data_room_id: str,
     conversation_history: Optional[List[Dict[str, str]]] = None,
     filters: Optional[Dict[str, Any]] = None,
     model: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
-    use_financial_context: bool = True
+    use_financial_context: bool = True,
+    enable_analytics: bool = True
 ) -> Dict[str, Any]:
     """
     Convenience function to answer a question.
@@ -480,9 +615,10 @@ def answer_question(
         filters: Optional search filters
         model: Claude model to use
         use_financial_context: Whether to include extracted financial data
+        enable_analytics: Whether to detect analytical questions and use Opus with charts
 
     Returns:
-        Answer with sources
+        Answer with sources (and optional charts for analytical questions)
 
     Example:
         >>> answer = answer_question(
@@ -493,6 +629,10 @@ def answer_question(
         >>> for source in answer['sources']:
         ...     print(f"Source: {source['file_name']}")
     """
+    if enable_analytics and _is_analytical_question(question):
+        answerer = AnalyticalQuestionAnswerer()
+        return answerer.answer(question, data_room_id, conversation_history, filters)
+
     if use_financial_context:
         answerer = FinancialQuestionAnswerer(model=model)
     else:

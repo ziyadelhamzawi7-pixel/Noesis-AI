@@ -16,6 +16,8 @@ import {
   Users,
   X,
   Sparkles,
+  HardDrive,
+  ArrowLeft,
 } from 'lucide-react';
 import {
   DriveFile,
@@ -82,6 +84,7 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
   const [selectedFiles, setSelectedFiles] = useState<DriveFile[]>([]);
   const [showFileConnectModal, setShowFileConnectModal] = useState(false);
   const [dataRoomName, setDataRoomName] = useState('');
+  const [folderHistory, setFolderHistory] = useState<(string | undefined)[]>([]);
 
   useEffect(() => {
     const currentUser = getCurrentUser();
@@ -121,6 +124,7 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
     setFolderPath([]);
     setIsSearching(false);
     setInsideSharedFolder(false);
+    setFolderHistory([]);
     if (user) loadFiles(user.id, undefined, mode);
   };
 
@@ -135,7 +139,14 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
     setSearchQuery('');
     setSearchInputValue('');
     setIsSearching(false);
-    if (user) loadFiles(user.id, viewMode === 'my_drive' ? currentFolderId : undefined, viewMode);
+    if (user) loadFiles(user.id, viewMode !== 'shared_with_me' ? currentFolderId : undefined, viewMode);
+  };
+
+  const handleBack = () => {
+    if (folderHistory.length === 0 || !user) return;
+    const previousFolderId = folderHistory[folderHistory.length - 1];
+    setFolderHistory(prev => prev.slice(0, -1));
+    loadFiles(user.id, previousFolderId, viewMode);
   };
 
   const handleFileClick = (file: DriveFile) => {
@@ -146,6 +157,7 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
           setSearchQuery('');
           setSearchInputValue('');
         }
+        setFolderHistory(prev => [...prev, currentFolderId]);
         const folderId = file.shortcutTargetId || file.id;
         loadFiles(user.id, folderId, viewMode);
       }
@@ -160,6 +172,7 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
       setIsSearching(false);
       setSearchQuery('');
       setSearchInputValue('');
+      setFolderHistory([]);
       loadFiles(user.id, folderId, viewMode);
     }
   };
@@ -282,14 +295,25 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
           </div>
         </div>
 
-        <button
-          className="btn btn-secondary"
-          onClick={() => user && loadFiles(user.id, currentFolderId, viewMode, searchQuery || undefined)}
-          disabled={loading}
-        >
-          <RefreshCw size={16} className={loading ? 'spinning' : ''} />
-          Refresh
-        </button>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <button
+            className="btn btn-secondary"
+            onClick={handleBack}
+            disabled={loading || folderHistory.length === 0}
+            title="Go back"
+          >
+            <ArrowLeft size={16} />
+            Back
+          </button>
+          <button
+            className="btn btn-secondary"
+            onClick={() => user && loadFiles(user.id, currentFolderId, viewMode, searchQuery || undefined)}
+            disabled={loading}
+          >
+            <RefreshCw size={16} className={loading ? 'spinning' : ''} />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {/* View Mode Tabs */}
@@ -310,6 +334,14 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
           <Users size={16} style={{ marginRight: '6px' }} />
           Shared with me
         </button>
+        <button
+          className={`tab ${viewMode === 'shared_drives' ? 'tab-active' : ''}`}
+          onClick={() => handleViewModeChange('shared_drives')}
+          disabled={loading}
+        >
+          <HardDrive size={16} style={{ marginRight: '6px' }} />
+          Shared Drives
+        </button>
       </div>
 
       {/* Search Bar */}
@@ -319,7 +351,7 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
           <input
             type="text"
             className="input"
-            placeholder={`Search in ${viewMode === 'my_drive' ? 'My Drive' : 'Shared with me'}...`}
+            placeholder={`Search in ${viewMode === 'my_drive' ? 'My Drive' : viewMode === 'shared_with_me' ? 'Shared with me' : 'Shared Drives'}...`}
             value={searchInputValue}
             onChange={(e) => setSearchInputValue(e.target.value)}
             disabled={loading}
@@ -390,8 +422,8 @@ export default function GoogleDriveBrowser({ onFolderConnected }: GoogleDriveBro
               fontWeight: 500,
             }}
           >
-            {viewMode === 'my_drive' ? <Home size={14} /> : <Users size={14} />}
-            {viewMode === 'my_drive' ? 'My Drive' : 'Shared with me'}
+            {viewMode === 'my_drive' ? <Home size={14} /> : viewMode === 'shared_with_me' ? <Users size={14} /> : <HardDrive size={14} />}
+            {viewMode === 'my_drive' ? 'My Drive' : viewMode === 'shared_with_me' ? 'Shared with me' : 'Shared Drives'}
           </button>
 
           {folderPath.map((folder, index) => (

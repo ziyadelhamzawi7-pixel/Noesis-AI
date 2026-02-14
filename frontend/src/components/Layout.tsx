@@ -179,6 +179,36 @@ export default function Layout({ children }: LayoutProps) {
                   Google Drive
                 </Link>
               )}
+              {['OneDrive', 'Dropbox', 'DocSend'].map((service) => (
+                <span
+                  key={service}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: '8px',
+                    fontSize: '14px',
+                    fontWeight: 500,
+                    color: 'var(--text-quaternary)',
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: '6px',
+                    cursor: 'default',
+                  }}
+                >
+                  {service}
+                  <span style={{
+                    fontSize: '10px',
+                    fontWeight: 600,
+                    padding: '2px 6px',
+                    borderRadius: '4px',
+                    background: 'var(--bg-tertiary)',
+                    color: 'var(--text-tertiary)',
+                    textTransform: 'uppercase',
+                    letterSpacing: '0.5px',
+                  }}>
+                    Soon
+                  </span>
+                </span>
+              ))}
             </nav>
           </div>
 

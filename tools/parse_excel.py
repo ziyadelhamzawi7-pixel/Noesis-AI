@@ -146,8 +146,15 @@ class ExcelParser:
                 """Process a single sheet — suitable for parallel execution."""
                 logger.info(f"Processing sheet: '{sheet_name}'")
                 try:
-                    header_row = self._detect_header_row(sheet_name)
-                    df = pd.read_excel(self.file_path, sheet_name=sheet_name, header=header_row)
+                    # Read sheet once with no header, then detect header from in-memory data
+                    df_raw = pd.read_excel(self.file_path, sheet_name=sheet_name, header=None)
+                    header_row = self._detect_header_row_from_df(df_raw)
+                    if header_row > 0:
+                        df = df_raw.iloc[header_row + 1:].reset_index(drop=True)
+                        df.columns = [str(c) if pd.notna(c) else f"Unnamed: {i}" for i, c in enumerate(df_raw.iloc[header_row])]
+                    else:
+                        df = df_raw.iloc[1:].reset_index(drop=True)
+                        df.columns = [str(c) if pd.notna(c) else f"Unnamed: {i}" for i, c in enumerate(df_raw.iloc[0])]
                     df = self._trim_to_data_boundaries(df)
                 except Exception as e:
                     logger.warning(f"Failed to read sheet '{sheet_name}': {e}")
@@ -180,7 +187,7 @@ class ExcelParser:
 
             # Process sheets in parallel
             sheet_names = excel_file.sheet_names
-            workers = min(4, len(sheet_names))
+            workers = min(8, len(sheet_names))
 
             if workers > 1:
                 with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -382,6 +389,36 @@ class ExcelParser:
 
         except Exception as e:
             logger.debug(f"Header detection failed for '{sheet_name}': {e}")
+            return 0
+
+    def _detect_header_row_from_df(self, df_raw: pd.DataFrame) -> int:
+        """
+        Detect header row from an already-loaded DataFrame (no disk re-read).
+
+        Args:
+            df_raw: DataFrame loaded with header=None
+
+        Returns:
+            0-indexed row number to use as header
+        """
+        try:
+            if df_raw.empty:
+                return 0
+
+            best_row = 0
+            best_score = 0
+
+            for row_idx in range(min(10, len(df_raw))):
+                row = df_raw.iloc[row_idx]
+                score = self._score_header_row(row)
+
+                if score > best_score:
+                    best_score = score
+                    best_row = row_idx
+
+            return best_row
+
+        except Exception:
             return 0
 
     def _score_header_row(self, row: pd.Series) -> int:

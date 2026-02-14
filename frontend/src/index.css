@@ -558,6 +558,8 @@ textarea.input {
   max-width: 1200px;
   height: 90vh;
   max-height: 900px;
+  display: flex;
+  flex-direction: column;
 }
 
 .modal-header {
@@ -731,8 +733,17 @@ textarea.input {
   height: 100%;
   background: var(--gradient-primary);
   border-radius: var(--radius-full);
-  transition: width var(--duration-slow) var(--ease-out-expo);
+  transition: width 0.8s var(--ease-out-expo);
   position: relative;
+}
+
+.progress-fill.progress-indeterminate {
+  animation: progressPulse 1.5s ease-in-out infinite;
+}
+
+@keyframes progressPulse {
+  0%, 100% { opacity: 0.6; }
+  50% { opacity: 1; }
 }
 
 /* Shine effect */
@@ -888,6 +899,9 @@ tr:hover td {
 .markdown {
   line-height: 1.8;
   color: var(--text-primary);
+  overflow-wrap: break-word;
+  word-break: break-word;
+  min-width: 0;
 }
 
 .markdown h1,
@@ -933,6 +947,7 @@ tr:hover td {
   overflow-x: auto;
   margin-bottom: var(--space-4);
   border: 1px solid var(--border-subtle);
+  max-width: 100%;
 }
 
 .markdown pre code {
@@ -970,6 +985,8 @@ tr:hover td {
   border-collapse: collapse;
   margin: var(--space-4) 0;
   font-size: var(--text-sm);
+  display: block;
+  overflow-x: auto;
 }
 
 .markdown th,
@@ -1189,6 +1206,7 @@ tr:hover td {
   display: flex;
   gap: var(--space-3);
   max-width: 85%;
+  min-width: 0;
 }
 
 .message-user {
@@ -1219,12 +1237,25 @@ tr:hover td {
 .message-bubble {
   padding: var(--space-4) var(--space-5);
   border-radius: var(--radius-xl);
+  overflow: hidden;
+  overflow-wrap: break-word;
+  word-break: break-word;
+  min-width: 0;
 }
 
 .message-user .message-bubble {
   background: var(--gradient-primary);
   color: white;
   border-bottom-right-radius: var(--radius-sm);
+}
+
+.message-user .message-bubble:hover .question-actions {
+  opacity: 1 !important;
+}
+
+.question-actions button:hover {
+  color: white !important;
+  background: rgba(255, 255, 255, 0.15) !important;
 }
 
 .message-ai .message-bubble {
@@ -1239,6 +1270,16 @@ tr:hover td {
   margin-top: var(--space-2);
   font-size: var(--text-xs);
   color: var(--text-tertiary);
+}
+
+/* Inline Chat Charts */
+.chat-charts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--border-subtle);
 }
 
 /* Typing Indicator */
@@ -1594,6 +1635,268 @@ tr:hover td {
 ::selection {
   background: var(--accent-glow-strong);
   color: var(--text-primary);
+}
+
+
+/* ============================================================================
+   Enhanced Progress Panel
+   ============================================================================ */
+
+/* Container */
+.status-panel {
+  padding: 20px 24px;
+  background: var(--bg-tertiary);
+  border-radius: 14px;
+  margin-bottom: 20px;
+  border: 1px solid var(--border-subtle);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  animation: fadeIn 0.4s var(--ease-out-expo);
+}
+
+.status-panel-error {
+  background: var(--error-soft);
+  border-color: rgba(244, 63, 94, 0.2);
+}
+
+/* Header row */
+.status-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.status-header-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.status-doc-count {
+  font-size: 13px;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.status-count-number {
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+/* --- Milestone Track --- */
+.milestone-track {
+  display: flex;
+  align-items: flex-start;
+  padding: 4px 0;
+}
+
+.milestone-node {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  z-index: 1;
+}
+
+.milestone-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 2px solid var(--border-default);
+  background: var(--bg-primary);
+  transition: all 0.5s var(--ease-out-expo);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.milestone-dot-complete {
+  border: none;
+  background: var(--accent-primary);
+  color: white;
+}
+
+.milestone-dot-active {
+  border-color: var(--accent-primary);
+  background: var(--bg-primary);
+  box-shadow: 0 0 0 3px var(--accent-glow);
+  animation: milestonePulse 2s ease-in-out infinite;
+}
+
+.milestone-dot-pending {
+  opacity: 0.4;
+}
+
+.milestone-label {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  transition: color 0.3s ease;
+}
+
+.milestone-label-active {
+  color: var(--text-secondary);
+}
+
+.milestone-line {
+  flex: 1;
+  height: 2px;
+  background: var(--border-default);
+  border-radius: 1px;
+  margin-top: 6px;
+  overflow: hidden;
+}
+
+.milestone-line-fill {
+  height: 100%;
+  background: var(--gradient-primary);
+  border-radius: 1px;
+  transition: width 0.8s var(--ease-out-expo);
+}
+
+@keyframes milestonePulse {
+  0%, 100% {
+    box-shadow: 0 0 0 3px var(--accent-glow);
+  }
+  50% {
+    box-shadow: 0 0 0 6px var(--accent-glow), 0 0 14px var(--accent-glow);
+  }
+}
+
+/* --- Enhanced Progress Bar --- */
+.enhanced-progress-wrapper {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.enhanced-progress-track {
+  flex: 1;
+  height: 8px;
+  background: var(--bg-elevated);
+  border-radius: var(--radius-full);
+  overflow: hidden;
+  position: relative;
+}
+
+.enhanced-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--accent-primary), var(--end-color, var(--accent-secondary)));
+  border-radius: var(--radius-full);
+  transition: width 0.8s var(--ease-out-expo);
+  position: relative;
+  overflow: visible;
+}
+
+/* Broad slow shimmer wave */
+.enhanced-progress-fill::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -150%;
+  width: 80%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    rgba(255, 255, 255, 0.12) 40%,
+    rgba(255, 255, 255, 0.22) 50%,
+    rgba(255, 255, 255, 0.12) 60%,
+    transparent 100%
+  );
+  animation: shimmerWaveSlow 3s ease-in-out infinite;
+}
+
+/* Narrow fast shimmer wave */
+.enhanced-progress-fill::after {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: -100%;
+  width: 40%;
+  height: 100%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    rgba(255, 255, 255, 0.28),
+    transparent
+  );
+  animation: shimmerWaveFast 1.8s ease-in-out infinite;
+}
+
+@keyframes shimmerWaveSlow {
+  0% { left: -150%; }
+  100% { left: 250%; }
+}
+
+@keyframes shimmerWaveFast {
+  0% { left: -100%; }
+  50%, 100% { left: 250%; }
+}
+
+/* Glowing spark at leading edge */
+.enhanced-progress-spark {
+  position: absolute;
+  right: -3px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.9);
+  box-shadow:
+    0 0 6px 1px var(--accent-glow-strong),
+    0 0 14px 3px var(--accent-glow);
+  animation: sparkPulse 1.5s ease-in-out infinite;
+  z-index: 2;
+}
+
+@keyframes sparkPulse {
+  0%, 100% {
+    transform: translateY(-50%) scale(1);
+    opacity: 1;
+  }
+  50% {
+    transform: translateY(-50%) scale(1.5);
+    opacity: 0.7;
+  }
+}
+
+.enhanced-progress-pct {
+  font-size: var(--text-xs);
+  font-weight: var(--font-semibold);
+  color: var(--text-secondary);
+  min-width: 36px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
+/* --- Rotating Context Message --- */
+.context-message {
+  font-size: 12px;
+  color: var(--text-tertiary);
+  min-height: 18px;
+  transition: opacity 0.3s ease;
+  text-align: center;
+  font-style: italic;
+}
+
+.context-message-exit {
+  opacity: 0;
+}
+
+/* Chat input pulse on completion */
+@keyframes inputReadyPulse {
+  0% { box-shadow: 0 0 0 0 var(--accent-glow-strong); }
+  50% { box-shadow: 0 0 0 6px var(--accent-glow); }
+  100% { box-shadow: 0 0 0 0 transparent; }
+}
+
+.chat-input-ready .chat-input {
+  animation: inputReadyPulse 1.5s ease 0.3s;
 }
 
 

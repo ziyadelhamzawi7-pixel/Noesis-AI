@@ -4,7 +4,9 @@ Extracts formulas, cell dependencies, sheet types, and financial structure.
 """
 
 import sys
+import io
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple, Set
 import json
@@ -29,6 +31,15 @@ class FinancialExcelParser:
     # Prevents hanging on large sparse Excel files
     # Lowered from 50k to 20k due to slow iter_rows() in read_only mode
     MAX_CELLS_FOR_FORMULA_SCAN = 20000  # ~20k cells max
+
+    # All supported ISO 4217 currency codes (used in detection patterns)
+    ALL_CURRENCY_CODES = [
+        'USD', 'CAD', 'BRL', 'MXN', 'ARS', 'CLP', 'COP', 'PEN',
+        'EUR', 'GBP', 'CHF', 'SEK', 'NOK', 'DKK', 'PLN', 'CZK', 'HUF', 'RUB', 'TRY', 'RON', 'BGN', 'HRK', 'UAH',
+        'AED', 'SAR', 'QAR', 'KWD', 'BHD', 'OMR', 'JOD', 'ILS', 'IQD', 'IRR', 'LBP',
+        'JPY', 'CNY', 'INR', 'KRW', 'TWD', 'HKD', 'SGD', 'AUD', 'NZD', 'THB', 'MYR', 'IDR', 'PHP', 'VND', 'PKR', 'BDT', 'LKR', 'MMK', 'KHR',
+        'NGN', 'GHS', 'KES', 'TZS', 'UGX', 'ZAR', 'EGP', 'MAD', 'XOF', 'XAF', 'ETB', 'RWF', 'ZMW', 'MWK', 'BWP', 'MZN', 'AOA', 'CDF', 'DZD', 'TND', 'LYD', 'SDG',
+    ]
 
     # Keywords for detecting sheet types
     PL_KEYWORDS = [
@@ -59,6 +70,102 @@ class FinancialExcelParser:
         'assumptions', 'inputs', 'parameters', 'drivers', 'scenarios',
         'sensitivity', 'variables'
     ]
+
+    # Pre-compiled currency detection patterns (compiled once at class definition time)
+    _CURRENCY_PATTERNS = {
+        # Americas
+        'USD': re.compile(r'US\s*\$|\bUSD\b|\bUS\s+dollars?', re.IGNORECASE),
+        'CAD': re.compile(r'\bCAD\b|C\$|canadian\s*dollars?', re.IGNORECASE),
+        'BRL': re.compile(r'R\$|\bBRL\b|\breais\b|\breals?\b', re.IGNORECASE),
+        'MXN': re.compile(r'\bMXN\b|mexican\s*pesos?', re.IGNORECASE),
+        'ARS': re.compile(r'\bARS\b|argentine\s*pesos?', re.IGNORECASE),
+        'CLP': re.compile(r'\bCLP\b|chilean\s*pesos?', re.IGNORECASE),
+        'COP': re.compile(r'\bCOP\b|colombian\s*pesos?', re.IGNORECASE),
+        'PEN': re.compile(r'\bPEN\b|\bsoles?\b|nuevos?\s*soles?', re.IGNORECASE),
+        # Europe
+        'EUR': re.compile(r'\u20ac|\bEUR\b|\beuros?\b', re.IGNORECASE),
+        'GBP': re.compile(r'\u00a3|\bGBP\b|pounds?\s*sterling', re.IGNORECASE),
+        'CHF': re.compile(r'\bCHF\b|swiss\s*francs?', re.IGNORECASE),
+        'SEK': re.compile(r'\bSEK\b|swedish\s*kron', re.IGNORECASE),
+        'NOK': re.compile(r'\bNOK\b|norwegian\s*kron', re.IGNORECASE),
+        'DKK': re.compile(r'\bDKK\b|danish\s*kron', re.IGNORECASE),
+        'PLN': re.compile(r'\bPLN\b|z\u0142|zloty', re.IGNORECASE),
+        'CZK': re.compile(r'\bCZK\b|czech\s*korun', re.IGNORECASE),
+        'HUF': re.compile(r'\bHUF\b|forints?', re.IGNORECASE),
+        'RUB': re.compile(r'\u20bd|\bRUB\b|rubles?', re.IGNORECASE),
+        'TRY': re.compile(r'\bTRY\b|\u20ba|turkish\s*lira', re.IGNORECASE),
+        'RON': re.compile(r'\bRON\b|romanian\s*lei', re.IGNORECASE),
+        'BGN': re.compile(r'\bBGN\b|bulgarian\s*lev', re.IGNORECASE),
+        'HRK': re.compile(r'\bHRK\b|kuna', re.IGNORECASE),
+        'UAH': re.compile(r'\u20b4|\bUAH\b|hryvnia', re.IGNORECASE),
+        # Middle East
+        'AED': re.compile(r'\bAED\b|\bdirhams?\b', re.IGNORECASE),
+        'SAR': re.compile(r'\bSAR\b|\briyals?\b', re.IGNORECASE),
+        'QAR': re.compile(r'\bQAR\b|qatari\s*riyals?', re.IGNORECASE),
+        'KWD': re.compile(r'\bKWD\b|kuwaiti\s*dinars?', re.IGNORECASE),
+        'BHD': re.compile(r'\bBHD\b|bahraini\s*dinars?', re.IGNORECASE),
+        'OMR': re.compile(r'\bOMR\b|omani\s*rials?', re.IGNORECASE),
+        'JOD': re.compile(r'\bJOD\b|jordanian\s*dinars?', re.IGNORECASE),
+        'ILS': re.compile(r'\u20aa|\bILS\b|shekels?', re.IGNORECASE),
+        'IQD': re.compile(r'\bIQD\b|iraqi\s*dinars?', re.IGNORECASE),
+        'IRR': re.compile(r'\bIRR\b|iranian\s*rials?', re.IGNORECASE),
+        'LBP': re.compile(r'\bLBP\b|lebanese\s*pounds?', re.IGNORECASE),
+        # Asia-Pacific
+        'JPY': re.compile(r'\u00a5|\bJPY\b|\byen\b', re.IGNORECASE),
+        'CNY': re.compile(r'CN\u00a5|\bCNY\b|\bRMB\b|\byuan\b|renminbi', re.IGNORECASE),
+        'INR': re.compile(r'\u20b9|\bINR\b|\brupees?\b', re.IGNORECASE),
+        'KRW': re.compile(r'\u20a9|\bKRW\b|\bwon\b', re.IGNORECASE),
+        'TWD': re.compile(r'\bTWD\b|NT\$|taiwan\s*dollars?', re.IGNORECASE),
+        'HKD': re.compile(r'\bHKD\b|HK\$|hong\s*kong\s*dollars?', re.IGNORECASE),
+        'SGD': re.compile(r'\bSGD\b|S\$|singapore\s*dollars?', re.IGNORECASE),
+        'AUD': re.compile(r'\bAUD\b|A\$|australian\s*dollars?', re.IGNORECASE),
+        'NZD': re.compile(r'\bNZD\b|NZ\$|new\s*zealand\s*dollars?', re.IGNORECASE),
+        'THB': re.compile(r'\u0e3f|\bTHB\b|\bbaht\b', re.IGNORECASE),
+        'MYR': re.compile(r'\bMYR\b|\bRM\b|ringgit', re.IGNORECASE),
+        'IDR': re.compile(r'\bIDR\b|indonesian\s*rupiah', re.IGNORECASE),
+        'PHP': re.compile(r'\bPHP\b|\u20b1|philippine\s*pesos?', re.IGNORECASE),
+        'VND': re.compile(r'\u20ab|\bVND\b|\bdong\b', re.IGNORECASE),
+        'PKR': re.compile(r'\bPKR\b|pakistani\s*rupees?', re.IGNORECASE),
+        'BDT': re.compile(r'\bBDT\b|\u09f3|taka', re.IGNORECASE),
+        'LKR': re.compile(r'\bLKR\b|sri\s*lankan\s*rupees?', re.IGNORECASE),
+        'MMK': re.compile(r'\bMMK\b|kyat', re.IGNORECASE),
+        'KHR': re.compile(r'\bKHR\b|cambodian\s*riels?', re.IGNORECASE),
+        # Africa
+        'NGN': re.compile(r'\u20a6|\bNGN\b|\bnaira\b', re.IGNORECASE),
+        'GHS': re.compile(r'GH\u20b5|\bGHS\b|\bcedis?\b', re.IGNORECASE),
+        'KES': re.compile(r'\bKES\b|KSh|kenyan\s*shillings?', re.IGNORECASE),
+        'TZS': re.compile(r'\bTZS\b|tanzanian\s*shillings?', re.IGNORECASE),
+        'UGX': re.compile(r'\bUGX\b|ugandan\s*shillings?', re.IGNORECASE),
+        'ZAR': re.compile(r'\bZAR\b|\brands?\b', re.IGNORECASE),
+        'EGP': re.compile(r'\bEGP\b|egyptian\s*pounds?', re.IGNORECASE),
+        'MAD': re.compile(r'\bMAD\b|moroccan\s*dirhams?', re.IGNORECASE),
+        'XOF': re.compile(r'\bXOF\b|\bCFA\b|francs?\s*CFA', re.IGNORECASE),
+        'XAF': re.compile(r'\bXAF\b|\bFCFA\b', re.IGNORECASE),
+        'ETB': re.compile(r'\bETB\b|\bbirr\b', re.IGNORECASE),
+        'RWF': re.compile(r'\bRWF\b|rwandan\s*francs?', re.IGNORECASE),
+        'ZMW': re.compile(r'\bZMW\b|zambian\s*kwacha', re.IGNORECASE),
+        'MWK': re.compile(r'\bMWK\b|malawian\s*kwacha', re.IGNORECASE),
+        'BWP': re.compile(r'\bBWP\b|\bpula\b', re.IGNORECASE),
+        'MZN': re.compile(r'\bMZN\b|metical|meticais', re.IGNORECASE),
+        'AOA': re.compile(r'\bAOA\b|kwanza', re.IGNORECASE),
+        'CDF': re.compile(r'\bCDF\b|congolese\s*francs?', re.IGNORECASE),
+        'DZD': re.compile(r'\bDZD\b|algerian\s*dinars?', re.IGNORECASE),
+        'TND': re.compile(r'\bTND\b|tunisian\s*dinars?', re.IGNORECASE),
+        'LYD': re.compile(r'\bLYD\b|libyan\s*dinars?', re.IGNORECASE),
+        'SDG': re.compile(r'\bSDG\b|sudanese\s*pounds?', re.IGNORECASE),
+    }
+
+    # Pre-compiled explicit currency declaration patterns
+    _CODES_PATTERN = '|'.join(ALL_CURRENCY_CODES)
+    _EXPLICIT_CURRENCY_PATTERNS = [
+        re.compile(rf'\bcurrency\s*[:\-–]\s*({_CODES_PATTERN})\b', re.IGNORECASE),
+        re.compile(rf'\b(?:all\s+)?(?:figures|values|amounts)\s+in\s+({_CODES_PATTERN})\b', re.IGNORECASE),
+        re.compile(rf'\bin\s+({_CODES_PATTERN})\s*[\'\u2019]?\s*000', re.IGNORECASE),
+        re.compile(rf'\(({_CODES_PATTERN})\s*[\'\u2019]?\s*(?:000|mn|m|millions?|billions?|bn)?\)', re.IGNORECASE),
+        re.compile(rf'\b({_CODES_PATTERN})\s*[\'\u2019]\s*000', re.IGNORECASE),
+    ]
+    _CONTROLS_CURRENCY_PATTERN = re.compile(rf'Currency\s+Selection[^A-Z]*({_CODES_PATTERN})\b', re.IGNORECASE)
+    _CONTROLS_CONVERSION_PATTERN = re.compile(rf'Conversion\s+Rate[^\d]*([\d,.]+)\s*[^\w]*({_CODES_PATTERN})\s+to\s+({_CODES_PATTERN})', re.IGNORECASE)
 
     def __init__(self, file_path: Path):
         self.file_path = Path(file_path)
@@ -105,15 +212,18 @@ class FinancialExcelParser:
         }
 
         try:
+            # Read file bytes once to avoid multiple disk reads
+            file_bytes = self.file_path.read_bytes()
+
             # Load workbook with formulas (not computed values)
             # Using read_only=True for faster loading on large files
-            wb = openpyxl.load_workbook(self.file_path, data_only=False, read_only=True)
+            wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=True)
             result["sheet_names"] = wb.sheetnames
             logger.debug("Loaded workbook for formulas (read_only=True)")
 
             # Also load with data_only to get computed values
             # Note: read_only + data_only gives fastest read performance
-            wb_values = openpyxl.load_workbook(self.file_path, data_only=True, read_only=True)
+            wb_values = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=True)
             logger.debug("Loaded workbook for values (read_only=True, data_only=True)")
 
             # Fallback: if read_only mode can't determine dimensions, reopen without it
@@ -123,18 +233,50 @@ class FinancialExcelParser:
                     logger.warning("read_only=True returned None dimensions, falling back to read_only=False")
                     wb.close()
                     wb_values.close()
-                    wb = openpyxl.load_workbook(self.file_path, data_only=False, read_only=False)
+                    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=False, read_only=False)
                     result["sheet_names"] = wb.sheetnames
-                    wb_values = openpyxl.load_workbook(self.file_path, data_only=True, read_only=False)
+                    wb_values = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True, read_only=False)
 
-            # Parse each sheet
+            # Free the file bytes now that workbooks are loaded
+            del file_bytes
+
+            # Pre-read worksheet data in main thread (read_only iterators are NOT thread-safe)
+            sheet_data_inputs = []
             for sheet_name in wb.sheetnames:
                 ws = wb[sheet_name]
                 ws_values = wb_values[sheet_name]
+                max_row = ws.max_row or 0
+                max_col = ws.max_column or 0
+                # Materialize rows into plain Python lists for thread-safe access
+                formula_rows = list(ws.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)) if max_row > 0 and max_col > 0 else []
+                value_rows = list(ws_values.iter_rows(min_row=1, max_row=max_row, min_col=1, max_col=max_col)) if max_row > 0 and max_col > 0 else []
+                sheet_data_inputs.append((sheet_name, max_row, max_col, formula_rows, value_rows))
 
-                sheet_data = self._parse_sheet(ws, ws_values, sheet_name)
+            # Parse sheets in parallel
+            workers = min(8, len(sheet_data_inputs))
+            sheet_results = {}
 
-                if sheet_data["rows"] > 0:  # Skip empty sheets
+            if workers > 1:
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    futures = {
+                        executor.submit(self._parse_sheet_from_rows, name, max_r, max_c, f_rows, v_rows): name
+                        for name, max_r, max_c, f_rows, v_rows in sheet_data_inputs
+                    }
+                    for future in as_completed(futures):
+                        name = futures[future]
+                        try:
+                            sheet_results[name] = future.result()
+                        except Exception as e:
+                            logger.warning(f"Failed to parse sheet '{name}': {e}")
+                            sheet_results[name] = None
+            else:
+                for name, max_r, max_c, f_rows, v_rows in sheet_data_inputs:
+                    sheet_results[name] = self._parse_sheet_from_rows(name, max_r, max_c, f_rows, v_rows)
+
+            # Reassemble results in original sheet order (must be sequential — updates shared state)
+            for sheet_name in wb.sheetnames:
+                sheet_data = sheet_results.get(sheet_name)
+                if sheet_data and sheet_data["rows"] > 0:
                     result["sheets"].append(sheet_data)
                     result["total_rows"] += sheet_data["rows"]
                     result["total_columns"] = max(result["total_columns"], sheet_data["columns"])
@@ -157,17 +299,22 @@ class FinancialExcelParser:
             # Detect time periods
             self._detect_time_periods(result)
 
-            # Detect currency (Controls sheet first, then regex fallback)
+            # Detect currency: explicit declarations > Controls sheet > regex fallback
             currency_settings = self._detect_currency_from_controls(result["sheets"])
             result["model_structure"]["currency_settings"] = currency_settings
 
+            explicit_currency = self._detect_explicit_currency(result["sheets"])
             base_currency = self._detect_currency(result["sheets"])
+            # Priority: explicit declaration on any sheet > Controls sheet > regex counting
+            if explicit_currency:
+                base_currency = explicit_currency
             if currency_settings and currency_settings.get("display_currency"):
                 base_currency = currency_settings["display_currency"]
             result["model_structure"]["base_currency"] = base_currency
 
             result["model_structure"]["per_sheet_currencies"] = self._assign_per_sheet_currencies(
-                result["sheets"], currency_settings, base_currency
+                result["sheets"], currency_settings, base_currency,
+                has_explicit_currency=explicit_currency is not None
             )
 
             # Close workbooks to release file handles
@@ -277,6 +424,114 @@ class FinancialExcelParser:
                             cell_dependencies[coord] = deps
         else:
             # Sheet is too large - skip formula extraction to prevent hanging
+            logger.warning(
+                f"Sheet '{sheet_name}' has {total_cells:,} cells (max: {self.MAX_CELLS_FOR_FORMULA_SCAN:,}). "
+                f"Skipping formula extraction to prevent slow processing."
+            )
+            formula_scan_skipped = True
+
+        # Detect sheet type
+        sheet_type = self._detect_sheet_type(row_labels, headers)
+
+        # Detect time periods from headers
+        time_periods = self._extract_time_periods(headers)
+
+        # Extract financial metrics from this sheet
+        financial_metrics = self._extract_sheet_metrics(row_labels, data, headers)
+
+        return {
+            "sheet_name": sheet_name,
+            "sheet_type": sheet_type,
+            "rows": max_row - header_row,
+            "columns": max_col,
+            "headers": headers,
+            "row_labels": row_labels,
+            "data": data,
+            "formulas": formulas,
+            "cell_dependencies": cell_dependencies,
+            "time_periods": time_periods,
+            "financial_metrics": financial_metrics,
+            "formula_count": len(formulas),
+            "header_row": header_row,
+            "formula_scan_skipped": formula_scan_skipped
+        }
+
+    def _parse_sheet_from_rows(
+        self,
+        sheet_name: str,
+        max_row: int,
+        max_col: int,
+        formula_rows: list,
+        value_rows: list,
+    ) -> Dict[str, Any]:
+        """Parse a single sheet from pre-materialized row data (thread-safe)."""
+
+        if max_row == 0 or max_col == 0 or not value_rows:
+            return {
+                "sheet_name": sheet_name,
+                "sheet_type": "empty",
+                "rows": 0,
+                "columns": 0,
+                "headers": [],
+                "row_labels": [],
+                "data": [],
+                "formulas": {},
+                "cell_dependencies": {},
+                "time_periods": [],
+                "financial_metrics": {}
+            }
+
+        # Extract headers (first row with content)
+        headers = []
+        header_row = 1
+        for row_idx, row in enumerate(value_rows[:min(10, len(value_rows))], start=1):
+            row_has_content = any(cell.value for cell in row)
+            if row_has_content:
+                header_row = row_idx
+                break
+
+        # Extract header values from the identified header row
+        header_row_cells = value_rows[header_row - 1] if header_row <= len(value_rows) else []
+        for col_idx, cell in enumerate(header_row_cells, start=1):
+            headers.append(str(cell.value) if cell.value else f"Col{col_idx}")
+
+        # Extract row labels and data (values only)
+        row_labels = []
+        data = []
+        for row in value_rows[header_row:]:
+            row_data = []
+            first_cell_value = None
+            for col_idx, cell in enumerate(row):
+                value = cell.value
+                if col_idx == 0:
+                    first_cell_value = value
+                if isinstance(value, (int, float)):
+                    row_data.append(value)
+                elif value is None:
+                    row_data.append(None)
+                else:
+                    row_data.append(str(value))
+            row_labels.append(str(first_cell_value) if first_cell_value else "")
+            data.append(row_data)
+
+        # Extract formulas (with cell limit to prevent hanging on large sparse sheets)
+        formulas = {}
+        cell_dependencies = {}
+        total_cells = max_row * max_col
+        formula_scan_skipped = False
+
+        if total_cells <= self.MAX_CELLS_FOR_FORMULA_SCAN:
+            for row in formula_rows:
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+                        coord = cell.coordinate
+                        formula = cell.value
+                        formulas[coord] = formula
+
+                        deps = self._parse_formula_dependencies(formula)
+                        if deps:
+                            cell_dependencies[coord] = deps
+        else:
             logger.warning(
                 f"Sheet '{sheet_name}' has {total_cells:,} cells (max: {self.MAX_CELLS_FOR_FORMULA_SCAN:,}). "
                 f"Skipping formula extraction to prevent slow processing."
@@ -567,90 +822,7 @@ class FinancialExcelParser:
 
     def _detect_currency(self, sheets: List[Dict[str, Any]]) -> Optional[str]:
         """Try to detect the currency used in the model by counting pattern matches across all sheets."""
-        currency_patterns = {
-            # Americas
-            'USD': r'\$|USD|dollars?',
-            'CAD': r'CAD|C\$|canadian\s*dollars?',
-            'BRL': r'R\$|BRL|reais|reals?',
-            'MXN': r'MXN|mexican\s*pesos?',
-            'ARS': r'ARS|argentine\s*pesos?',
-            'CLP': r'CLP|chilean\s*pesos?',
-            'COP': r'COP|colombian\s*pesos?',
-            'PEN': r'PEN|soles?|nuevos?\s*soles?',
-            # Europe
-            'EUR': r'\u20ac|EUR|euros?',
-            'GBP': r'\u00a3|GBP|pounds?\s*sterling',
-            'CHF': r'CHF|swiss\s*francs?',
-            'SEK': r'SEK|swedish\s*kron',
-            'NOK': r'NOK|norwegian\s*kron',
-            'DKK': r'DKK|danish\s*kron',
-            'PLN': r'PLN|z\u0142|zloty',
-            'CZK': r'CZK|czech\s*korun',
-            'HUF': r'HUF|forints?',
-            'RUB': r'\u20bd|RUB|rubles?',
-            'TRY': r'TRY|\u20ba|turkish\s*lira',
-            'RON': r'RON|romanian\s*lei',
-            'BGN': r'BGN|bulgarian\s*lev',
-            'HRK': r'HRK|kuna',
-            'UAH': r'\u20b4|UAH|hryvnia',
-            # Middle East
-            'AED': r'AED|dirhams?',
-            'SAR': r'SAR|riyals?',
-            'QAR': r'QAR|qatari\s*riyals?',
-            'KWD': r'KWD|kuwaiti\s*dinars?',
-            'BHD': r'BHD|bahraini\s*dinars?',
-            'OMR': r'OMR|omani\s*rials?',
-            'JOD': r'JOD|jordanian\s*dinars?',
-            'ILS': r'\u20aa|ILS|shekels?',
-            'IQD': r'IQD|iraqi\s*dinars?',
-            'IRR': r'IRR|iranian\s*rials?',
-            'LBP': r'LBP|lebanese\s*pounds?',
-            # Asia-Pacific
-            'JPY': r'\u00a5|JPY|yen',
-            'CNY': r'CN\u00a5|CNY|RMB|yuan|renminbi',
-            'INR': r'\u20b9|INR|rupees?',
-            'KRW': r'\u20a9|KRW|won',
-            'TWD': r'TWD|NT\$|taiwan\s*dollars?',
-            'HKD': r'HKD|HK\$|hong\s*kong\s*dollars?',
-            'SGD': r'SGD|S\$|singapore\s*dollars?',
-            'AUD': r'AUD|A\$|australian\s*dollars?',
-            'NZD': r'NZD|NZ\$|new\s*zealand\s*dollars?',
-            'THB': r'\u0e3f|THB|baht',
-            'MYR': r'MYR|RM|ringgit',
-            'IDR': r'IDR|indonesian\s*rupiah',
-            'PHP': r'PHP|\u20b1|pesos?',
-            'VND': r'\u20ab|VND|dong',
-            'PKR': r'PKR|pakistani\s*rupees?',
-            'BDT': r'BDT|\u09f3|taka',
-            'LKR': r'LKR|sri\s*lankan\s*rupees?',
-            'MMK': r'MMK|kyat',
-            'KHR': r'KHR|cambodian\s*riels?',
-            # Africa
-            'NGN': r'\u20a6|NGN|naira',
-            'GHS': r'GH\u20b5|GHS|cedis?',
-            'KES': r'KES|KSh|kenyan\s*shillings?',
-            'TZS': r'TZS|tanzanian\s*shillings?',
-            'UGX': r'UGX|ugandan\s*shillings?',
-            'ZAR': r'ZAR|rands?',
-            'EGP': r'EGP|egyptian\s*pounds?',
-            'MAD': r'MAD|moroccan\s*dirhams?',
-            'XOF': r'XOF|CFA|francs?\s*CFA',
-            'XAF': r'XAF|FCFA',
-            'ETB': r'ETB|birr',
-            'RWF': r'RWF|rwandan\s*francs?',
-            'ZMW': r'ZMW|zambian\s*kwacha',
-            'MWK': r'MWK|malawian\s*kwacha',
-            'BWP': r'BWP|pula',
-            'MZN': r'MZN|metical|meticais',
-            'AOA': r'AOA|kwanza',
-            'CDF': r'CDF|congolese\s*francs?',
-            'DZD': r'DZD|algerian\s*dinars?',
-            'TND': r'TND|tunisian\s*dinars?',
-            'LYD': r'LYD|libyan\s*dinars?',
-            'SDG': r'SDG|sudanese\s*pounds?',
-        }
-
-        match_counts: Dict[str, int] = {c: 0 for c in currency_patterns}
+        match_counts: Dict[str, int] = {c: 0 for c in self._CURRENCY_PATTERNS}
 
         for sheet in sheets:
             all_text = ' '.join(
@@ -659,9 +831,14 @@ class FinancialExcelParser:
                 [str(v) for row in sheet.get("data", []) for v in row if isinstance(v, str)]
             )
 
-            for currency, pattern in currency_patterns.items():
-                matches = re.findall(pattern, all_text, re.IGNORECASE)
+            for currency, compiled_re in self._CURRENCY_PATTERNS.items():
+                matches = compiled_re.findall(all_text)
                 match_counts[currency] += len(matches)
+
+            # Early exit: if one currency has 3+ matches and no other has any, skip remaining sheets
+            non_zero = [(c, n) for c, n in match_counts.items() if n > 0]
+            if len(non_zero) == 1 and non_zero[0][1] >= 3:
+                return non_zero[0][0]
 
         best = max(match_counts, key=match_counts.get)
         if match_counts[best] > 0:
@@ -669,9 +846,27 @@ class FinancialExcelParser:
 
         return None
 
-    def _detect_currency_single_sheet(self, sheet: Dict[str, Any]) -> Optional[str]:
-        """Detect the dominant currency for a single sheet."""
-        return self._detect_currency([sheet])
+    def _detect_explicit_currency(self, sheets: List[Dict[str, Any]]) -> Optional[str]:
+        """
+        Scan all sheets for explicit currency declarations like
+        "Currency: EGP", "in EGP '000", "Figures in EGP", "(EGP)", etc.
+        Prioritizes the first sheet (cover/summary pages often state the currency).
+        Returns the currency code if found, else None.
+        """
+        for sheet in sheets:
+            all_text = ' '.join(
+                sheet.get("headers", []) +
+                sheet.get("row_labels", []) +
+                [str(v) for row in sheet.get("data", []) for v in row if isinstance(v, str)]
+            )
+            for compiled_re in self._EXPLICIT_CURRENCY_PATTERNS:
+                match = compiled_re.search(all_text)
+                if match:
+                    currency = match.group(1).upper()
+                    logger.info(f"Explicit currency declaration found on sheet '{sheet.get('sheet_name')}': {currency}")
+                    return currency
+
+        return None
 
     def _detect_currency_from_controls(self, sheets: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """
@@ -690,10 +885,8 @@ class FinancialExcelParser:
                 [str(v) for row in sheet.get("data", []) for v in row if v is not None]
             )
 
-            # Look for "Currency Selection" followed by a currency code
-            cs_match = re.search(r'Currency\s+Selection[^A-Z]*(USD|NGN|EUR|GBP|CAD|AUD|JPY|CNY|INR|ZAR|KES|GHS|BRL|AED|SAR)\b', all_text, re.IGNORECASE)
-            # Look for "Conversion Rate" with a number and currency pair
-            cr_match = re.search(r'Conversion\s+Rate[^\d]*([\d,.]+)\s*[^\w]*(NGN|USD|EUR|GBP|CAD|AUD|JPY|CNY|INR|ZAR|KES|GHS|BRL|AED|SAR)\s+to\s+(NGN|USD|EUR|GBP|CAD|AUD|JPY|CNY|INR|ZAR|KES|GHS|BRL|AED|SAR)', all_text, re.IGNORECASE)
+            cs_match = self._CONTROLS_CURRENCY_PATTERN.search(all_text)
+            cr_match = self._CONTROLS_CONVERSION_PATTERN.search(all_text)
 
             if cs_match or cr_match:
                 result = {"display_currency": None, "local_currency": None, "conversion_rate": None, "has_conversion": False}
@@ -719,10 +912,11 @@ class FinancialExcelParser:
 
         return None
 
-    def _assign_per_sheet_currencies(self, sheets: List[Dict[str, Any]], currency_settings: Optional[Dict[str, Any]], base_currency: Optional[str]) -> Dict[str, Optional[str]]:
+    def _assign_per_sheet_currencies(self, sheets: List[Dict[str, Any]], currency_settings: Optional[Dict[str, Any]], base_currency: Optional[str], has_explicit_currency: bool = False) -> Dict[str, Optional[str]]:
         """
         Assign currency to each sheet based on Controls settings and sheet name patterns.
         Historical sheets get local_currency, projection sheets get display_currency.
+        When has_explicit_currency is True, skip unreliable per-sheet regex detection.
         """
         per_sheet = {}
 
@@ -744,9 +938,9 @@ class FinancialExcelParser:
                     # Projection/summary/highlight sheets → display currency
                     per_sheet[name] = display
             else:
-                # No conversion info — try per-sheet regex detection, fall back to base
-                detected = self._detect_currency_single_sheet(sheet)
-                per_sheet[name] = detected or base_currency
+                # Use base_currency directly when we have a high-confidence explicit
+                # declaration. Per-sheet regex is unreliable (e.g. "expense" → PEN).
+                per_sheet[name] = base_currency
 
         return per_sheet
 

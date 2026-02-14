@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import {
   Folder,
@@ -45,6 +45,15 @@ export default function ConnectedFolders() {
   const [error, setError] = useState<string | null>(null);
   const [actionLoading, setActionLoading] = useState<string | null>(null);
 
+  // Track highest-seen progress per folder to prevent backward jumps
+  const progressHighWaterMark = useRef<Record<string, number>>({});
+  const getMonotonicProgress = (folderId: string, rawProgress: number): number => {
+    const current = progressHighWaterMark.current[folderId] ?? 0;
+    const clamped = Math.max(current, rawProgress);
+    progressHighWaterMark.current[folderId] = clamped;
+    return clamped;
+  };
+
   useEffect(() => {
     const currentUser = getCurrentUser();
     if (!currentUser) {
@@ -90,13 +99,19 @@ export default function ConnectedFolders() {
     return () => clearInterval(pollInterval);
   }, [connectedFiles, user]);
 
+  const initialLoadDone = useRef(false);
+
   const loadFolders = async (userId: string) => {
-    setLoading(true);
+    // Only show loading spinner on initial load, not during polling
+    if (!initialLoadDone.current) {
+      setLoading(true);
+    }
     setError(null);
 
     try {
       const result = await listConnectedFolders(userId);
       setFolders(result.folders);
+      initialLoadDone.current = true;
     } catch (err: any) {
       setError(err.response?.data?.detail || 'Failed to load connected folders');
     } finally {
@@ -126,6 +141,8 @@ export default function ConnectedFolders() {
 
   const handleSync = async (folderId: string) => {
     setActionLoading(folderId);
+    // Reset high-water mark for fresh sync
+    delete progressHighWaterMark.current[folderId];
     try {
       await triggerFolderSync(folderId);
       if (user) loadFolders(user.id);
@@ -487,28 +504,33 @@ export default function ConnectedFolders() {
                     {/* Progress Bar */}
                     {(folder.sync_status === 'syncing' ||
                       folder.sync_stage === 'discovering' ||
-                      folder.sync_stage === 'processing') && (
+                      folder.sync_stage === 'processing') && (() => {
+                      const isDiscovering = folder.sync_stage === 'discovering';
+                      // Map progress to match backend: discovery=0-10%, processing=10-100%
+                      const rawProgress = isDiscovering
+                        ? 8
+                        : (folder.total_files > 0
+                            ? Math.min(10 + (folder.processed_files / folder.total_files) * 90, 100)
+                            : 10);
+                      // Always apply monotonic clamping to prevent backward jumps
+                      const displayProgress = getMonotonicProgress(folder.id, rawProgress);
+                      return (
                       <div className="sync-progress">
                         <div className="progress-bar">
                           <div
-                            className="progress-fill"
-                            style={{
-                              width: `${folder.total_files > 0
-                                ? (folder.sync_stage === 'discovering'
-                                    ? Math.min((folder.discovered_files / folder.total_files) * 100, 100)
-                                    : Math.min((folder.processed_files / folder.total_files) * 100, 100))
-                                : 0}%`
-                            }}
+                            className={`progress-fill${isDiscovering ? ' progress-indeterminate' : ''}`}
+                            style={{ width: `${displayProgress}%` }}
                           />
                         </div>
                         <span className="progress-text">
-                          {folder.sync_stage === 'discovering'
-                            ? `${folder.discovered_files} files found`
-                            : `${folder.processed_files} of ${folder.total_files} (${folder.total_files > 0 ? Math.round((folder.processed_files / folder.total_files) * 100) : 0}%)`
+                          {isDiscovering
+                            ? `Scanning... ${folder.discovered_files} files found`
+                            : `${folder.processed_files} of ${folder.total_files} (${folder.total_files > 0 ? Math.round(displayProgress) : 0}%)`
                           }
                         </span>
-                      </div>
-                    )}
+                      </div>);
+                    })()
+                    }
                   </div>
                 </div>
 
@@ -925,7 +947,7 @@ export default function ConnectedFolders() {
           height: 100%;
           background: #4285f4;
           border-radius: 3px;
-          transition: width 0.3s ease;
+          transition: width 0.8s cubic-bezier(0.16, 1, 0.3, 1);
         }
 
         .progress-text {

@@ -9,6 +9,7 @@ Features:
 """
 
 import asyncio
+import collections
 import threading
 import time
 from typing import Optional, List, Dict, Any
@@ -34,7 +35,7 @@ class SyncService:
         self,
         sync_interval_seconds: int = 300,
         max_parallel_downloads: int = settings.drive_sync_max_parallel_downloads,
-        max_parallel_processing: int = 3
+        max_parallel_processing: int = 5
     ):
         """
         Initialize sync service with parallel processing capabilities.
@@ -56,11 +57,6 @@ class SyncService:
             max_requests=settings.drive_sync_max_downloads_per_minute,
             window_seconds=60
         )
-        self._processing_rate_limiter = RateLimiter(
-            max_requests=settings.drive_sync_max_processing_per_minute,
-            window_seconds=60
-        )
-
         # Per-folder locks to prevent concurrent syncs of the same folder
         self._folder_locks: Dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
@@ -77,7 +73,7 @@ class SyncService:
 
         logger.info(
             f"SyncService initialized: downloads={settings.drive_sync_max_downloads_per_minute}/min, "
-            f"processing={settings.drive_sync_max_processing_per_minute}/min"
+            f"parallel_downloads={max_parallel_downloads}"
         )
 
     def start(self):
@@ -167,6 +163,11 @@ class SyncService:
             return
 
         try:
+            # Skip folders that have already completed syncing
+            if folder.get('sync_stage') == 'complete':
+                logger.debug(f"Folder already complete, skipping: {folder_name}")
+                return
+
             logger.info(f"Starting staged sync for folder: {folder_name}")
 
             # Update status to syncing
@@ -180,14 +181,14 @@ class SyncService:
             # Update data room to show sync has started
             data_room_id = folder.get('data_room_id')
             if data_room_id:
-                db.update_data_room_status(data_room_id, 'parsing', progress=5)
+                db.update_data_room_status(data_room_id, 'parsing', progress=2)
             self._discovery_phase(folder, drive_service)
 
             # Stage 2: Processing — only starts after discovery is fully complete
             db.update_connected_folder_stage(folder_id, sync_stage='processing')
             # Update data room to show processing is starting
             if data_room_id:
-                db.update_data_room_status(data_room_id, 'parsing', progress=15)
+                db.update_data_room_status(data_room_id, 'parsing', progress=10)
             self._processing_phase(folder, drive_service)
 
             # Downloads enqueued — worker pool will process and mark folder active
@@ -242,7 +243,7 @@ class SyncService:
     def _discovery_phase(self, folder: Dict[str, Any], drive_service: GoogleDriveService):
         """
         Stage 1: Discover all folders and files without downloading.
-        Uses breadth-first search to scan all subfolders.
+        Uses parallel breadth-first search to scan multiple subfolders concurrently.
 
         Args:
             folder: Connected folder record
@@ -266,7 +267,7 @@ class SyncService:
             unscanned = db.get_unscanned_inventory_folders(folder_id)
             if unscanned:
                 logger.info(f"Resuming partial discovery: {len(unscanned)} folders remaining")
-                folders_to_scan = [
+                initial_items = [
                     (f['drive_folder_id'], f.get('folder_path') or '', f.get('parent_folder_id'))
                     for f in unscanned
                 ]
@@ -274,86 +275,141 @@ class SyncService:
                 discovered_files = db.count_pending_synced_files(folder_id)
                 existing_inventory = db.get_folder_inventory(folder_id)
                 discovered_folders = len(existing_inventory)
-                # Jump to the BFS loop below (skip clearing inventory)
             else:
-                # Discovery was in progress but all folders scanned — treat as fresh
                 db.delete_folder_inventory(folder_id)
-                folders_to_scan = [(drive_folder_id, '', None)]
+                initial_items = [(drive_folder_id, '', None)]
                 discovered_files = 0
                 discovered_folders = 0
         else:
-            # Fresh discovery — clear old data
             db.delete_folder_inventory(folder_id)
-            folders_to_scan = [(drive_folder_id, '', None)]
+            initial_items = [(drive_folder_id, '', None)]
             discovered_files = 0
             discovered_folders = 0
 
-        while folders_to_scan:
-            if self._stop_event.is_set():
-                break
+        # Thread-safe queue and counters for parallel scanning
+        scan_queue = collections.deque(initial_items)
+        queue_lock = threading.Lock()
+        counter_lock = threading.Lock()
 
-            current_drive_id, current_path, parent_id = folders_to_scan.pop(0)
-            current_folder_name = current_path.split('/')[-1] if current_path else folder_name
+        max_scan_workers = settings.drive_scan_max_workers
 
-            # Update current folder being scanned
-            db.update_connected_folder_stage(
-                folder_id,
-                sync_stage='discovering',
-                current_folder_path=current_path or 'Root'
-            )
+        # Thread-local storage so each worker reuses one DriveService
+        _thread_local = threading.local()
 
-            try:
-                # Scan this folder (without downloading)
-                contents = drive_service.list_folder_contents_only(current_drive_id)
+        def _get_thread_drive():
+            """Get or create a per-thread DriveService instance."""
+            if not hasattr(_thread_local, 'drive_service'):
+                _thread_local.drive_service = self._get_drive_service(folder)
+            return _thread_local.drive_service
 
-                # Create inventory record for this folder
-                inventory_id = db.create_folder_inventory(
-                    connected_folder_id=folder_id,
-                    drive_folder_id=current_drive_id,
-                    folder_name=current_folder_name,
-                    folder_path=current_path,
-                    parent_folder_id=parent_id
-                )
+        def _scan_one_folder(drive_id, path, parent_inv_id):
+            """Scan a single folder: API call + batch DB writes."""
+            nonlocal discovered_files, discovered_folders
 
-                # Update inventory with file counts
-                db.update_folder_inventory_counts(
-                    inventory_id,
-                    file_count=contents['file_count'],
-                    total_size_bytes=contents['total_size']
-                )
+            thread_drive = _get_thread_drive()
+            current_name = path.split('/')[-1] if path else folder_name
 
-                # Create synced_file records for discovered files (status='pending')
+            contents = thread_drive.list_folder_contents_only(drive_id)
+
+            # Batch-insert the inventory record
+            inv_ids = db.create_and_update_folder_inventory_batch([{
+                'connected_folder_id': folder_id,
+                'drive_folder_id': drive_id,
+                'folder_name': current_name,
+                'folder_path': path,
+                'parent_folder_id': parent_inv_id,
+                'file_count': contents['file_count'],
+                'total_size_bytes': contents['total_size'],
+            }])
+            inventory_id = inv_ids[0] if inv_ids else None
+
+            # Batch-insert discovered files
+            if contents['files']:
+                file_records = []
                 for file in contents['files']:
-                    file_path = f"{current_path}/{file['name']}" if current_path else file['name']
-                    db.create_synced_file(
-                        connected_folder_id=folder_id,
-                        drive_file_id=file['id'],
-                        file_name=file['name'],
-                        file_path=file_path,
-                        mime_type=file.get('mimeType'),
-                        file_size=file.get('size'),
-                        drive_modified_time=file.get('modifiedTime')
-                    )
+                    file_path = f"{path}/{file['name']}" if path else file['name']
+                    file_records.append({
+                        'connected_folder_id': folder_id,
+                        'drive_file_id': file['id'],
+                        'file_name': file['name'],
+                        'file_path': file_path,
+                        'mime_type': file.get('mimeType'),
+                        'file_size': file.get('size'),
+                        'drive_modified_time': file.get('modifiedTime'),
+                    })
+                db.create_synced_files_batch(file_records)
 
+            # Enqueue subfolders for scanning
+            new_subfolders = []
+            for subfolder in contents['subfolders']:
+                sub_path = f"{path}/{subfolder['name']}" if path else subfolder['name']
+                new_subfolders.append((subfolder['id'], sub_path, inventory_id))
+
+            with queue_lock:
+                scan_queue.extend(new_subfolders)
+
+            # Log skipped files for visibility
+            if contents.get('skipped_count', 0) > 0:
+                skipped_names = ', '.join(f['name'] for f in contents['skipped_files'][:5])
+                suffix = f" (and {contents['skipped_count'] - 5} more)" if contents['skipped_count'] > 5 else ""
+                logger.warning(f"Skipped {contents['skipped_count']} unsupported files in {current_name}: {skipped_names}{suffix}")
+
+            # Update shared counters
+            with counter_lock:
                 discovered_files += contents['file_count']
                 discovered_folders += len(contents['subfolders'])
 
-                # Queue subfolders for scanning
-                for subfolder in contents['subfolders']:
-                    sub_path = f"{current_path}/{subfolder['name']}" if current_path else subfolder['name']
-                    folders_to_scan.append((subfolder['id'], sub_path, inventory_id))
+            return contents['file_count'], len(contents['subfolders'])
 
-                # Update progress
-                db.update_connected_folder_stage(
-                    folder_id,
-                    sync_stage='discovering',
-                    discovered_files=discovered_files,
-                    discovered_folders=discovered_folders
-                )
+        # Parallel BFS loop
+        with ThreadPoolExecutor(max_workers=max_scan_workers, thread_name_prefix="discovery") as executor:
+            futures = {}
+            last_progress_update = time.time()
 
-            except Exception as e:
-                logger.error(f"Error scanning folder {current_path or 'Root'}: {e}")
-                # Continue with other folders even if one fails
+            while True:
+                if self._stop_event.is_set():
+                    break
+
+                # Submit work from the queue
+                with queue_lock:
+                    while scan_queue and len(futures) < max_scan_workers:
+                        drive_id, path, parent_inv_id = scan_queue.popleft()
+                        fut = executor.submit(_scan_one_folder, drive_id, path, parent_inv_id)
+                        futures[fut] = path
+
+                if not futures:
+                    # No active work and nothing in queue — we're done
+                    break
+
+                # Wait for at least one future to complete (timeout prevents deadlock)
+                done_futures = set()
+                try:
+                    for fut in as_completed(futures, timeout=1.0):
+                        done_futures.add(fut)
+                        path = futures[fut]
+                        try:
+                            fut.result()
+                        except Exception as e:
+                            logger.error(f"Error scanning folder {path or 'Root'}: {e}")
+                except TimeoutError:
+                    pass  # Timeout just means no more futures completed yet; loop back
+
+                for fut in done_futures:
+                    del futures[fut]
+
+                # Throttle progress updates to at most once per second
+                now = time.time()
+                if now - last_progress_update >= 1.0:
+                    with counter_lock:
+                        cur_files = discovered_files
+                        cur_folders = discovered_folders
+                    db.update_connected_folder_stage(
+                        folder_id,
+                        sync_stage='discovering',
+                        discovered_files=cur_files,
+                        discovered_folders=cur_folders
+                    )
+                    last_progress_update = now
 
         # Mark discovery complete
         db.update_connected_folder_stage(
@@ -409,6 +465,9 @@ class SyncService:
             self._download_and_enqueue_file(folder, file_record, thread_drive_service)
 
         futures = {}
+        status_update_interval = 10  # Only write status every N downloads
+        last_status_count = 0
+
         with ThreadPoolExecutor(
             max_workers=self.max_parallel_downloads,
             thread_name_prefix="drive_download"
@@ -428,12 +487,14 @@ class SyncService:
                     logger.error(f"Download failed for {file_rec['file_name']}: {e}")
                     failed_count += 1
 
-                # Only update sync_status, not processed_files
-                # processed_files is updated by workers based on actual completion count
-                db.update_connected_folder_status(
-                    folder_id,
-                    sync_status='syncing'
-                )
+                # Throttle status updates: write every N downloads instead of every one
+                completed = downloaded_count + failed_count
+                if completed - last_status_count >= status_update_interval or completed == total_files:
+                    db.update_connected_folder_status(
+                        folder_id,
+                        sync_status='syncing'
+                    )
+                    last_status_count = completed
 
         logger.info(
             f"Download phase complete: {downloaded_count} enqueued, "
@@ -470,8 +531,8 @@ class SyncService:
 
         db.update_synced_file_status(synced_file_id, sync_status='downloading')
 
-        if not self._download_rate_limiter.acquire(timeout=60):
-            logger.warning(f"Download rate limit hit for {file_name}, proceeding anyway")
+        if not self._download_rate_limiter.acquire(timeout=120):
+            raise RuntimeError(f"Download rate limit timeout for {file_name} after 120s")
 
         # Memory check — wait if below threshold, skip if critically low
         available_mb = get_available_memory_mb()
@@ -503,7 +564,8 @@ class SyncService:
                     delay = base_delay * (2 ** (attempt - 1))
                     logger.info(f"Retry {attempt}/{max_retries-1} for {file_name}, waiting {delay}s")
                     time.sleep(delay)
-                drive_service.download_file(drive_file_id, str(local_path))
+                actual_path = drive_service.download_file(drive_file_id, str(local_path))
+                local_path = Path(actual_path)  # may have extension appended for Google Docs
                 break
             except requests_lib.HTTPError as e:
                 status_code = e.response.status_code if e.response else 0
@@ -540,7 +602,7 @@ class SyncService:
                 file_name=file_name,
                 file_path=str(local_path),
                 file_size=file_size,
-                file_type=Path(file_name).suffix.lower().replace('.', '')
+                file_type=local_path.suffix.lower().replace('.', '')
             )
 
         # Enqueue for processing by the worker pool
@@ -643,7 +705,8 @@ class SyncService:
                     logger.info(f"Retry {attempt}/{max_retries-1} for {file_name}, waiting {delay}s")
                     time.sleep(delay)
 
-                drive_service.download_file(drive_file_id, str(local_path))
+                actual_path = drive_service.download_file(drive_file_id, str(local_path))
+                local_path = Path(actual_path)  # may have extension appended for Google Docs
 
                 return {
                     'synced_file_id': synced_file_id,
@@ -781,7 +844,8 @@ class SyncService:
             local_filename = f"{drive_file_id}_{file_name}"
             local_path = download_dir / local_filename
 
-            drive_service.download_file(drive_file_id, str(local_path))
+            actual_path = drive_service.download_file(drive_file_id, str(local_path))
+            local_path = Path(actual_path)  # may have extension appended for Google Docs
 
             # Update status to processing
             db.update_synced_file_status(
@@ -850,38 +914,17 @@ class SyncService:
         )
 
         # Import processing tools
-        from tools.parse_pdf import parse_pdf
-        from tools.parse_excel import parse_excel
-        from tools.parse_pptx import parse_pptx
+        from tools.ingest_data_room import parse_file_by_type
         from tools.chunk_documents import chunk_documents
         from tools.generate_embeddings import generate_embeddings
         from tools.index_to_vectordb import index_to_vectordb
 
         try:
-            # Parse based on file type
-            file_ext = Path(file_path).suffix.lower()
-
-            if file_ext == '.pdf':
-                parsed = parse_pdf(file_path)
-            elif file_ext in ['.xlsx', '.xls', '.csv']:
-                parsed = parse_excel(file_path)
-            elif file_ext in ['.pptx', '.ppt']:
-                parsed = parse_pptx(file_path)
-            elif file_ext in ['.docx', '.doc']:
-                from docx import Document
-                doc = Document(file_path)
-                text_content = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-                parsed = {
-                    "file_name": file_name,
-                    "text": text_content,
-                    "page_count": 1,
-                    "pages": [{"page_number": 1, "text": text_content}]
-                }
-            else:
-                raise ValueError(f"Unsupported file type: {file_ext}")
+            # Parse using shared dispatcher (handles all file types)
+            parsed = parse_file_by_type(file_path)
 
             # Chunk the document
-            chunks = chunk_documents(parsed)
+            chunks = chunk_documents(parsed, chunk_size=settings.max_chunk_size, overlap=settings.chunk_overlap)
 
             if not chunks:
                 raise ValueError("No content extracted from document")

@@ -6,12 +6,15 @@ Provides API endpoints for data room processing, Q&A, and memo generation.
 import sys
 import os
 import time
+import json
 import asyncio
+import hashlib
+import secrets
 from pathlib import Path
 from typing import List, Optional, Dict
 import uuid
 from datetime import datetime
-from threading import Semaphore
+from threading import Semaphore, Lock
 import psutil
 
 # Add parent directory to path to import tools
@@ -82,10 +85,109 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- Access Password Protection ---
+# When ACCESS_PASSWORD is set, all routes are gated behind a login page.
+# A signed session token is stored in a cookie to maintain the session.
+_access_password = settings.access_password
+_auth_secret = os.getenv("AUTH_SECRET", secrets.token_hex(32))
+
+def _make_session_token() -> str:
+    """Create a signed session token for the access password."""
+    return hashlib.sha256(f"{_auth_secret}:authenticated".encode()).hexdigest()
+
+if _access_password:
+    from starlette.middleware.base import BaseHTTPMiddleware
+
+    _LOGIN_PAGE_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Noesis AI — Login</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0f; color: #e0e0e0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+  .card { background: #14141f; border: 1px solid #2a2a3a; border-radius: 12px; padding: 40px; width: 100%; max-width: 400px; }
+  h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
+  p.sub { font-size: 14px; color: #888; margin-bottom: 24px; }
+  label { display: block; font-size: 13px; color: #aaa; margin-bottom: 6px; }
+  input { width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid #2a2a3a; background: #0a0a0f; color: #fff; font-size: 15px; outline: none; }
+  input:focus { border-color: #6c63ff; }
+  button { width: 100%; padding: 11px; margin-top: 20px; border: none; border-radius: 8px; background: #6c63ff; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #5a52d5; }
+  .error { color: #ff6b6b; font-size: 13px; margin-top: 12px; display: none; }
+</style>
+</head>
+<body>
+<div class="card">
+  <h1>Noesis AI</h1>
+  <p class="sub">Enter the access password to continue.</p>
+  <form method="POST" action="/login">
+    <label for="password">Password</label>
+    <input type="password" id="password" name="password" placeholder="Access password" autofocus required>
+    <button type="submit">Sign in</button>
+    <p class="error" id="err">Incorrect password. Please try again.</p>
+  </form>
+  <script>
+    if (new URLSearchParams(window.location.search).get('error')) {
+      document.getElementById('err').style.display = 'block';
+    }
+  </script>
+</div>
+</body>
+</html>"""
+
+    class AccessPasswordMiddleware(BaseHTTPMiddleware):
+        async def dispatch(self, request: Request, call_next):
+            path = request.url.path
+            # Allow login page, health check, and static login assets through
+            if path in ("/login", "/api/health"):
+                return await call_next(request)
+            # Check session cookie
+            token = request.cookies.get("noesis_session")
+            if token == _make_session_token():
+                return await call_next(request)
+            # Not authenticated — redirect browsers, reject API calls
+            if path.startswith("/api/"):
+                return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+            return RedirectResponse(url="/login", status_code=302)
+
+    app.add_middleware(AccessPasswordMiddleware)
+
+    @app.get("/login")
+    async def login_page():
+        """Serve the login page."""
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content=_LOGIN_PAGE_HTML)
+
+    @app.post("/login")
+    async def login_submit(request: Request):
+        """Validate the access password and set a session cookie."""
+        form = await request.form()
+        password = form.get("password", "")
+        if password == _access_password:
+            response = RedirectResponse(url="/", status_code=302)
+            response.set_cookie(
+                key="noesis_session",
+                value=_make_session_token(),
+                httponly=True,
+                samesite="lax",
+                max_age=60 * 60 * 24 * 7,  # 7 days
+            )
+            return response
+        return RedirectResponse(url="/login?error=1", status_code=302)
+
+    logger.info("Access password protection is ENABLED")
+
 # Processing semaphore to limit concurrent background jobs
 # Prevents memory exhaustion from too many simultaneous file processing tasks
 _processing_semaphore = Semaphore(settings.max_concurrent_jobs)
 _active_processing_count = 0  # Track for health endpoint
+
+# Track data rooms actively processed by BackgroundTasks (not via job_queue).
+# Used by stall guard to avoid killing legitimate in-progress processing.
+_active_background_tasks: set = set()
+_active_background_tasks_lock = Lock()
 
 # Validate configuration on startup
 @app.on_event("startup")
@@ -99,11 +201,17 @@ async def startup_event():
     else:
         logger.success("Configuration validated successfully")
 
-    # Recover any stale jobs from previous run
+    # Cancel stale running jobs from previous run (they caused OOM crashes)
     try:
-        recovered = job_queue.recover_stale_jobs(timeout_minutes=5)
-        if recovered > 0:
-            logger.info(f"Recovered {recovered} stale jobs from previous run")
+        import sqlite3 as _sqlite3
+        _conn = _sqlite3.connect(settings.database_path, timeout=30.0)
+        stale_count = _conn.execute(
+            "UPDATE job_queue SET status = 'cancelled' WHERE status = 'running'"
+        ).rowcount
+        _conn.commit()
+        _conn.close()
+        if stale_count > 0:
+            logger.info(f"Cancelled {stale_count} stale running jobs from previous run")
 
         # Clean up orphaned connected_folders and jobs (referencing deleted data rooms)
         import sqlite3
@@ -159,19 +267,220 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"Failed to cleanup orphaned data rooms: {e}")
 
-    # Start sync service for Google Drive auto-sync
+    # Reset ALL orphaned 'running' jobs back to 'pending'.
+    # No workers survived the server restart, so every 'running' job is orphaned.
+    # This must happen BEFORE the worker pool starts so the jobs can be picked up.
     try:
-        sync_service.start()
-        logger.info("Google Drive sync service started")
+        recovered = job_queue.recover_stale_jobs(timeout_minutes=0)
+        if recovered > 0:
+            logger.info(f"[startup] Reset {recovered} orphaned running jobs back to pending")
     except Exception as e:
-        logger.warning(f"Failed to start sync service: {e}")
+        logger.warning(f"[startup] Failed to recover orphaned jobs: {e}")
 
-    # Start worker pool to process Google Drive sync jobs
+    # Recover stalled data rooms — re-trigger processing instead of killing them
+    try:
+        import sqlite3 as _sqlite3_recovery
+        import threading as _threading_recovery
+        _rconn = _sqlite3_recovery.connect(settings.database_path, timeout=30.0)
+        _rconn.row_factory = _sqlite3_recovery.Row
+        try:
+            _rcur = _rconn.cursor()
+            # Find data rooms with pending documents but no active jobs.
+            # (all running jobs were already reset to pending/failed above).
+            # Exclude pending jobs that have exhausted their attempts — they
+            # can never be claimed by claim_job and shouldn't block recovery.
+            _rcur.execute("""
+                SELECT dr.id
+                FROM data_rooms dr
+                WHERE dr.processing_status IN ('parsing', 'indexing', 'extracting')
+                AND EXISTS (
+                    SELECT 1 FROM documents d
+                    WHERE d.data_room_id = dr.id
+                    AND d.parse_status = 'pending'
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM job_queue jq
+                    WHERE jq.data_room_id = dr.id
+                    AND jq.status IN ('pending', 'running')
+                    AND jq.attempts < jq.max_attempts
+                )
+            """)
+            rooms_to_reprocess = [row['id'] for row in _rcur.fetchall()]
+        finally:
+            _rconn.close()
+
+        if rooms_to_reprocess:
+            logger.info(f"Found {len(rooms_to_reprocess)} data rooms needing re-processing after restart")
+
+            async def _delayed_reprocess():
+                await asyncio.sleep(60)  # Wait for server to fully stabilize
+                for room_id in rooms_to_reprocess:
+                    try:
+                        documents = db.get_documents_by_data_room(room_id)
+                        file_paths = []
+                        for doc in documents:
+                            if doc['parse_status'] == 'pending':
+                                fp = os.path.join(settings.data_rooms_path, room_id, "raw", doc['file_name'])
+                                if Path(fp).exists():
+                                    file_paths.append(fp)
+
+                        if file_paths:
+                            logger.info(
+                                f"[startup-recovery] Re-triggering processing for {room_id}: "
+                                f"{len(file_paths)} pending files"
+                            )
+                            t = _threading_recovery.Thread(
+                                target=process_data_room_background,
+                                args=(room_id, file_paths),
+                                name=f"recovery-{room_id[:8]}",
+                                daemon=True
+                            )
+                            t.start()
+                        else:
+                            # No files on disk — mark as complete with error
+                            logger.warning(
+                                f"[startup-recovery] No files found on disk for {room_id}, marking complete"
+                            )
+                            db.update_data_room_status(
+                                room_id, "complete", progress=100,
+                                completed_at=datetime.now().isoformat(),
+                                error_message="Some files were lost during restart; re-upload to retry"
+                            )
+                    except Exception as e:
+                        logger.error(f"[startup-recovery] Failed to re-process {room_id}: {e}")
+
+            asyncio.create_task(_delayed_reprocess())
+
+    except Exception as e:
+        logger.warning(f"Startup recovery failed: {e}")
+
+    # Start worker pool first (before sync, so sync jobs have workers)
     try:
         worker_pool.start()
         logger.info("Worker pool started for file processing")
     except Exception as e:
         logger.warning(f"Failed to start worker pool: {e}")
+
+    # Periodic stall detection — recover data rooms stuck in processing with no active jobs
+    async def _stall_detection_loop():
+        import asyncio
+        import sqlite3 as _sqlite3_stall
+        await asyncio.sleep(60)  # Wait 1 minute before first check (after startup recovery settles)
+        while True:
+            try:
+                # Recover jobs stuck in 'running' for >5 minutes (crashed/hung workers)
+                recovered = job_queue.recover_stale_jobs(timeout_minutes=5)
+                if recovered > 0:
+                    logger.info(f"[stall-guard] Recovered {recovered} stale running jobs")
+
+                _sconn = _sqlite3_stall.connect(settings.database_path, timeout=30.0)
+                _sconn.row_factory = _sqlite3_stall.Row
+                try:
+                    _scur = _sconn.cursor()
+                    # Find data rooms stuck in processing for >5 minutes with no active jobs.
+                    # Treat jobs running for >5 minutes as effectively dead (crashed workers).
+                    # Exclude pending jobs that have exhausted their attempts — they can
+                    # never be claimed (claim_job requires attempts < max_attempts) and
+                    # would otherwise permanently block stall detection.
+                    _scur.execute("""
+                        SELECT dr.id
+                        FROM data_rooms dr
+                        WHERE dr.processing_status IN ('parsing', 'indexing', 'extracting')
+                        AND dr.created_at < datetime('now', '-5 minutes')
+                        AND EXISTS (SELECT 1 FROM documents d WHERE d.data_room_id = dr.id)
+                        AND NOT EXISTS (
+                            SELECT 1 FROM job_queue jq
+                            WHERE jq.data_room_id = dr.id
+                            AND (
+                                (jq.status = 'pending' AND jq.attempts < jq.max_attempts)
+                                 OR (jq.status = 'running' AND jq.started_at > datetime('now', '-5 minutes'))
+                            )
+                        )
+                    """)
+                    stalled_ids = [row['id'] for row in _scur.fetchall()]
+
+                    # Exclude data rooms actively processed by BackgroundTasks
+                    with _active_background_tasks_lock:
+                        active_bg = set(_active_background_tasks)
+                    skipped = [rid for rid in stalled_ids if rid in active_bg]
+                    if skipped:
+                        logger.debug(f"[stall-guard] Skipping {len(skipped)} data rooms with active BackgroundTasks")
+                    stalled_ids = [rid for rid in stalled_ids if rid not in active_bg]
+
+                    for room_id in stalled_ids:
+                        _scur.execute("""
+                            UPDATE documents
+                            SET parse_status = 'failed',
+                                error_message = 'Processing interrupted - use Reprocess to retry'
+                            WHERE data_room_id = ? AND parse_status IN ('pending', 'parsing')
+                        """, (room_id,))
+
+                        _scur.execute(
+                            "SELECT COUNT(*) as cnt FROM documents WHERE data_room_id = ?",
+                            (room_id,)
+                        )
+                        doc_count = _scur.fetchone()['cnt']
+
+                        _scur.execute("""
+                            UPDATE data_rooms
+                            SET processing_status = 'complete',
+                                progress_percent = 100,
+                                total_documents = ?,
+                                completed_at = datetime('now')
+                            WHERE id = ?
+                        """, (doc_count, room_id))
+
+                        logger.info(f"[stall-guard] Recovered stalled data room {room_id} ({doc_count} docs)")
+
+                    if stalled_ids:
+                        _sconn.commit()
+
+                    # Also check for complete data rooms with chunks but 0 embeddings
+                    _scur.execute("""
+                        SELECT dr.id
+                        FROM data_rooms dr
+                        WHERE dr.processing_status = 'complete'
+                        AND EXISTS (
+                            SELECT 1 FROM chunks c
+                            WHERE c.data_room_id = dr.id AND c.embedding_id IS NULL
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM chunks c2
+                            WHERE c2.data_room_id = dr.id AND c2.embedding_id IS NOT NULL
+                        )
+                    """)
+                    needs_reembed = [row['id'] for row in _scur.fetchall()]
+                finally:
+                    _sconn.close()
+
+                # Trigger reembed in a background thread so the event loop stays free
+                for room_id in needs_reembed:
+                    try:
+                        logger.info(f"[stall-guard] Data room {room_id} has chunks but 0 embeddings — auto-triggering reembed")
+                        from tools.ingest_data_room import reembed_data_room
+                        reembed_result = await asyncio.to_thread(reembed_data_room, room_id)
+                        logger.info(f"[stall-guard] Reembed result for {room_id}: {reembed_result}")
+                    except Exception as e:
+                        logger.error(f"[stall-guard] Reembed failed for {room_id}: {e}")
+
+            except Exception as e:
+                logger.warning(f"[stall-guard] Check failed: {e}")
+
+            await asyncio.sleep(60)
+
+    import asyncio
+    asyncio.create_task(_stall_detection_loop())
+
+    # Start sync service with a delay so the server can respond to requests first
+    async def _delayed_sync_start():
+        await asyncio.sleep(30)  # 30s delay before first sync
+        try:
+            sync_service.start()
+            logger.info("Google Drive sync service started (delayed)")
+        except Exception as e:
+            logger.warning(f"Failed to start sync service: {e}")
+
+    asyncio.create_task(_delayed_sync_start())
 
     # Log server info
     logger.info(f"API server: http://{settings.host}:{settings.port}")
@@ -480,6 +789,8 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
         logger.info(f"[{data_room_id}] Acquired processing slot, starting...")
 
     _active_processing_count += 1
+    with _active_background_tasks_lock:
+        _active_background_tasks.add(data_room_id)
     start_time = time.time()
 
     try:
@@ -493,9 +804,7 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
         # Import processing tools with detailed error logging
         try:
             logger.info(f"[{data_room_id}] Importing processing tools...")
-            from tools.parse_pdf import parse_pdf
-            from tools.parse_excel_financial import parse_excel_financial
-            from tools.parse_pptx import parse_pptx
+            from tools.ingest_data_room import parse_file_by_type
             from tools.chunk_documents import chunk_documents
             from tools.generate_embeddings import generate_embeddings
             from tools.index_to_vectordb import index_to_vectordb, VectorDBIndexer
@@ -523,41 +832,29 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
             file_path_obj = Path(file_path)
             file_type = file_path_obj.suffix.lower()
 
-            # Find document record
-            documents = db.get_documents_by_data_room(data_room_id)
-            document_id = None
-            for doc in documents:
-                if doc['file_name'] == file_path_obj.name:
-                    document_id = doc['id']
-                    break
+            # Find document record with resilient matching and auto-create fallback
+            document_id = db.find_document_by_filename(
+                data_room_id=data_room_id,
+                target_filename=file_path_obj.name,
+                create_if_missing=True,
+                file_path=str(file_path_obj),
+                file_size=file_path_obj.stat().st_size,
+            )
 
             if not document_id:
-                raise FileNotFoundError(f"Document record not found for: {file_path_obj.name}")
+                raise FileNotFoundError(
+                    f"Document record not found and auto-creation failed for: {file_path_obj.name}"
+                )
 
             db.update_document_status(document_id, "parsing")
 
-            # Parse with type dispatch
-            if file_type == '.pdf':
-                parsed = parse_pdf(file_path, use_ocr=True, max_ocr_pages=settings.max_ocr_pages)
-            elif file_type in ['.xlsx', '.xls', '.csv']:
-                parsed = parse_excel_financial(file_path)
-            elif file_type in ['.pptx', '.ppt']:
-                parsed = parse_pptx(file_path)
-            elif file_type in ['.docx', '.doc']:
-                from docx import Document as DocxDocument
-                doc = DocxDocument(file_path)
-                text_content = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-                parsed = {
-                    "file_name": file_path_obj.name,
-                    "file_path": str(file_path_obj.absolute()),
-                    "text": text_content,
-                    "page_count": 1,
-                    "total_chars": len(text_content),
-                    "pages": [{"page_number": 1, "text": text_content}]
-                }
-            else:
-                db.update_document_status(document_id, "failed", error_message=f"Unsupported file type: {file_type}")
-                raise ValueError(f"Unsupported file type: {file_type}")
+            # Parse using shared dispatcher (handles all file types including .doc/.ppt/.txt)
+            parsed = parse_file_by_type(
+                file_path,
+                use_ocr=True,
+                max_ocr_pages=settings.max_ocr_pages,
+                use_financial_excel=True,
+            )
 
             # Check parse errors
             if parsed.get('error'):
@@ -566,7 +863,7 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
                 raise RuntimeError(error_msg)
 
             # Chunk
-            chunks = chunk_documents(parsed)
+            chunks = chunk_documents(parsed, chunk_size=settings.max_chunk_size, overlap=settings.chunk_overlap)
             if not chunks:
                 if parsed.get('needs_ocr'):
                     error_msg = "Document appears to be image-based with no extractable text. OCR failed or Tesseract not installed (brew install tesseract)"
@@ -629,7 +926,7 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
             nonlocal total_embedded
             try:
                 pending_chunks = []
-                batch_size = settings.batch_size or 2048
+                batch_size = settings.streaming_batch_size or 256
                 consecutive_timeouts = 0
                 max_consecutive_timeouts = 60  # Exit after 60 seconds of no data
 
@@ -681,10 +978,11 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
                 for batch in generate_embeddings_streaming(
                     chunks_batch,
                     model=settings.openai_embedding_model,
+                    batch_size=settings.streaming_batch_size,
                     max_concurrent=settings.embedding_max_concurrent
                 ):
                     index_to_vectordb(data_room_id=data_room_id, chunks_with_embeddings=batch, indexer=shared_indexer)
-                    db.create_chunks(batch)
+                    db.create_chunks_batch_optimized(batch)
                     successfully_embedded = sum(1 for c in batch if c.get('embedding') is not None and not c.get('embedding_failed'))
                     total_embedded += successfully_embedded
                     # Collect error messages from failed chunks
@@ -736,17 +1034,22 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
                     failed_files.append({"file": fname, "error": error_msg})
                     # Mark the document as failed in the database
                     try:
-                        documents = db.get_documents_by_data_room(data_room_id)
-                        for doc in documents:
-                            if doc['file_name'] == fname:
-                                db.update_document_status(doc['id'], "failed", error_message=error_msg)
-                                break
+                        doc_id = db.find_document_by_filename(data_room_id, fname)
+                        if doc_id:
+                            db.update_document_status(doc_id, "failed", error_message=error_msg)
                     except Exception:
                         pass
                 except Exception as e:
                     error_msg = str(e)
-                    logger.error(f"[{data_room_id}] Failed to parse {fname}: {error_msg}")
+                    logger.error(f"[{data_room_id}] Failed to parse {fname}: {error_msg}", exc_info=True)
                     failed_files.append({"file": fname, "error": error_msg})
+                    # Mark the document as failed if we can find it
+                    try:
+                        doc_id = db.find_document_by_filename(data_room_id, fname)
+                        if doc_id:
+                            db.update_document_status(doc_id, "failed", error_message=error_msg[:500])
+                    except Exception:
+                        pass
 
         # Signal embedding consumer that parsing is done, then wait for it with timeout
         chunk_queue.put(_SENTINEL)
@@ -797,19 +1100,55 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
                                     error_details=error_msg)
             return
 
-        # Mark as complete
+        # Mark as complete (with error summary if some files failed)
         duration_ms = int((time.time() - start_time) * 1000)
-        db.update_data_room_status(
-            data_room_id,
-            "complete",
-            progress=100,
-            completed_at=datetime.now().isoformat()
-        )
-        db.log_processing_stage("processing", "completed", data_room_id=data_room_id,
-                                message=f"Processed {parsed_docs} files, {total_embedded} chunks",
-                                duration_ms=duration_ms)
+        if failed_files:
+            error_summary = f"{len(failed_files)}/{len(file_paths)} files failed: " + \
+                ", ".join(f['file'] for f in failed_files[:5])
+            if len(failed_files) > 5:
+                error_summary += f" (and {len(failed_files) - 5} more)"
+            db.update_data_room_status(
+                data_room_id,
+                "complete",
+                progress=100,
+                completed_at=datetime.now().isoformat(),
+                error_message=error_summary,
+                total_chunks=total_embedded,
+                total_documents=parsed_docs,
+            )
+            db.log_processing_stage("processing", "completed", data_room_id=data_room_id,
+                                    message=f"Processed {parsed_docs} files, {total_embedded} chunks. {error_summary}",
+                                    duration_ms=duration_ms)
+            logger.warning(f"[{data_room_id}] Processing complete with errors in {duration_ms}ms: {parsed_docs} files, {total_embedded} chunks. {error_summary}")
+        else:
+            db.update_data_room_status(
+                data_room_id,
+                "complete",
+                progress=100,
+                completed_at=datetime.now().isoformat(),
+                total_chunks=total_embedded,
+                total_documents=parsed_docs,
+            )
+            db.log_processing_stage("processing", "completed", data_room_id=data_room_id,
+                                    message=f"Processed {parsed_docs} files, {total_embedded} chunks",
+                                    duration_ms=duration_ms)
+            logger.success(f"[{data_room_id}] Processing complete in {duration_ms}ms: {parsed_docs} files, {total_embedded} chunks")
 
-        logger.success(f"[{data_room_id}] Processing complete in {duration_ms}ms: {parsed_docs} files, {total_embedded} chunks")
+        # Safety net: verify embeddings exist in database (don't trust in-memory counter)
+        # This catches race conditions where the embedding thread timed out or failed silently
+        try:
+            missing = db.get_chunks_without_embeddings(data_room_id)
+            if missing and len(missing) > 0:
+                total_db_chunks = len(missing)
+                logger.warning(
+                    f"[{data_room_id}] Post-completion check: {total_db_chunks} chunks "
+                    f"missing embeddings — auto-triggering reembed"
+                )
+                from tools.ingest_data_room import reembed_data_room
+                reembed_result = reembed_data_room(data_room_id)
+                logger.info(f"[{data_room_id}] Auto-reembed result: {reembed_result}")
+        except Exception as e:
+            logger.error(f"[{data_room_id}] Post-completion embedding check failed: {e}")
 
         # Auto-trigger financial analysis for Excel files if enabled
         if settings.enable_auto_financial_analysis:
@@ -876,6 +1215,8 @@ def process_data_room_background(data_room_id: str, file_paths: List[str]):
         # Always release the semaphore and decrement counter
         _active_processing_count -= 1
         _processing_semaphore.release()
+        with _active_background_tasks_lock:
+            _active_background_tasks.discard(data_room_id)
         logger.debug(f"[{data_room_id}] Released processing slot (active jobs: {_active_processing_count})")
 
 
@@ -1023,22 +1364,22 @@ async def stream_upload_file(
 
 @app.post("/api/data-room/create")
 async def create_data_room(
-    background_tasks: BackgroundTasks,
     company_name: str = Form(...),
     analyst_name: str = Form(...),
     analyst_email: Optional[str] = Form(None),
     security_level: str = Form("local_only"),
-    files: List[UploadFile] = File(...),
+    total_documents: int = Form(0),
+    files: List[UploadFile] = File(default=[]),
     identity: Dict = Depends(get_user_identity)
 ):
     """
-    Create a new data room and upload files.
+    Create a new data room, optionally with files.
 
-    This endpoint:
-    1. Validates uploaded files (size, content type, filename)
-    2. Creates a data room record
-    3. Saves uploaded files
-    4. Starts background processing (parsing, chunking, embedding, indexing)
+    When called without files (total_documents > 0), creates the record immediately
+    so the frontend can navigate to the data room. Files are then uploaded separately
+    via POST /api/data-room/{id}/upload-files.
+
+    When called with files, behaves as before (upload + enqueue processing).
 
     Returns:
         Data room ID and initial status
@@ -1053,17 +1394,45 @@ async def create_data_room(
         logger.info(f"Creating data room {data_room_id} for {company_name}")
 
         # ============================================================
-        # Phase 1: Create directory for streaming uploads
+        # Phase 1: Create directory and data room record up front
         # ============================================================
         data_room_path = Path(f"{settings.data_rooms_path}/{data_room_id}/raw")
         data_room_path.mkdir(parents=True, exist_ok=True)
 
-        max_size_bytes = settings.max_file_size_mb * 1024 * 1024
-        uploaded_files = []
+        # Use file count if files provided, otherwise use the declared total_documents
+        total_files = len(files) if files else total_documents
+
+        db.create_data_room(
+            data_room_id=data_room_id,
+            company_name=company_name,
+            analyst_name=analyst_name,
+            analyst_email=analyst_email,
+            security_level=security_level,
+            total_documents=total_files,
+            user_id=None  # Upload-page data rooms are unowned ("legacy") — accessible without login
+        )
+        db.update_data_room_status(data_room_id, "uploading", progress=0)
+
+        # If no files provided, return immediately — files will be uploaded separately
+        if not files:
+            logger.info(f"Data room {data_room_id} created (metadata only, expecting {total_files} files)")
+            return {
+                "data_room_id": data_room_id,
+                "company_name": company_name,
+                "total_documents": total_files,
+                "status": "uploading",
+                "message": "Data room created. Upload files to begin processing."
+            }
 
         # ============================================================
-        # Phase 2: Stream files to disk (memory-efficient)
+        # Phase 2: Stream each file to disk, create its document
+        # record, and enqueue it for processing immediately.
+        # Files start parsing while subsequent files are still uploading.
         # ============================================================
+        max_size_bytes = settings.max_file_size_mb * 1024 * 1024
+        uploaded_count = 0
+        from app.job_queue import JobType
+
         for file in files:
             original_filename = file.filename
             safe_filename = sanitize_filename(original_filename)
@@ -1095,53 +1464,40 @@ async def create_data_room(
                 file_path.unlink()
                 raise HTTPException(status_code=400, detail=error_msg)
 
-            uploaded_files.append({
-                'filename': safe_filename,
-                'path': str(file_path),
-                'size': file_info['size']
-            })
-            logger.info(f"Streamed file: {safe_filename} ({file_info['size']} bytes)")
-
-        logger.info(f"Uploaded {len(uploaded_files)} files for data room {data_room_id}")
-
-        # ============================================================
-        # Phase 3: Create database records
-        # ============================================================
-        db.create_data_room(
-            data_room_id=data_room_id,
-            company_name=company_name,
-            analyst_name=analyst_name,
-            analyst_email=analyst_email,
-            security_level=security_level,
-            total_documents=len(uploaded_files),
-            user_id=identity["user_id"]
-        )
-
-        for file_info in uploaded_files:
-            file_type = Path(file_info['filename']).suffix.lower().replace('.', '')
-            db.create_document(
+            # Create document record immediately
+            file_type = Path(safe_filename).suffix.lower().replace('.', '')
+            document_id = db.create_document(
                 data_room_id=data_room_id,
-                file_name=file_info['filename'],
-                file_path=file_info['path'],
+                file_name=safe_filename,
+                file_path=str(file_path),
                 file_size=file_info['size'],
                 file_type=file_type
             )
 
-        # ============================================================
-        # Phase 4: Start background processing
-        # ============================================================
-        background_tasks.add_task(
-            process_data_room_background,
-            data_room_id,
-            [f['path'] for f in uploaded_files]
-        )
+            # Enqueue for processing right away — workers start parsing
+            # while remaining files are still uploading
+            job_queue.enqueue(
+                job_type=JobType.PROCESS_FILE.value,
+                payload={
+                    'data_room_id': data_room_id,
+                    'document_id': document_id,
+                    'file_path': str(file_path),
+                    'file_name': safe_filename,
+                    'upload_total_files': total_files,
+                },
+                data_room_id=data_room_id,
+                file_name=safe_filename
+            )
 
-        logger.success(f"Data room {data_room_id} created with {len(uploaded_files)} files")
+            uploaded_count += 1
+            logger.info(f"Streamed & enqueued file {uploaded_count}/{total_files}: {safe_filename} ({file_info['size']} bytes)")
+
+        logger.success(f"Data room {data_room_id} created with {uploaded_count} files — processing started")
 
         return {
             "data_room_id": data_room_id,
             "company_name": company_name,
-            "total_documents": len(uploaded_files),
+            "total_documents": uploaded_count,
             "status": "uploading",
             "message": "Data room created. Processing will begin shortly."
         }
@@ -1181,13 +1537,112 @@ async def create_data_room(
         raise HTTPException(status_code=500, detail=f"Failed to create data room: {str(e)}")
 
 
+@app.post("/api/data-room/{data_room_id}/upload-files")
+async def upload_files_to_data_room(
+    data_room_id: str,
+    files: List[UploadFile] = File(...),
+    identity: Dict = Depends(get_user_identity)
+):
+    """
+    Upload files to an existing data room and enqueue them for processing.
+
+    Used after creating a data room via POST /api/data-room/create (without files)
+    so the frontend can navigate to the data room immediately while files upload
+    in the background.
+    """
+    try:
+        data_room = db.get_data_room(data_room_id)
+        if not data_room:
+            raise HTTPException(status_code=404, detail="Data room not found")
+
+        data_room_path = Path(f"{settings.data_rooms_path}/{data_room_id}/raw")
+        data_room_path.mkdir(parents=True, exist_ok=True)
+
+        max_size_bytes = settings.max_file_size_mb * 1024 * 1024
+        batch_size = len(files)
+        uploaded_count = 0
+        from app.job_queue import JobType
+
+        # Use the data room's total_documents (set during creation) as the real total,
+        # since files may arrive in multiple batches from the frontend.
+        real_total = data_room.get('total_documents') or batch_size
+
+        async def _save_file(file: UploadFile):
+            """Stream a single file to disk and return its info."""
+            original_filename = file.filename
+            safe_filename = sanitize_filename(original_filename)
+            if safe_filename != original_filename:
+                logger.warning(f"Sanitized filename: '{original_filename}' -> '{safe_filename}'")
+            dest = data_room_path / safe_filename
+            file_info = await stream_upload_file(file=file, destination=dest, max_size_bytes=max_size_bytes)
+            return safe_filename, dest, file_info
+
+        # Save all files in this batch concurrently
+        saved_files = await asyncio.gather(*[_save_file(f) for f in files])
+
+        for safe_filename, file_path, file_info in saved_files:
+            if file_info['size'] == 0:
+                file_path.unlink()
+                logger.warning(f"Skipping empty file: {safe_filename}")
+                continue
+
+            is_valid, error_msg = validate_file_content(file_info['header_bytes'], safe_filename)
+            if not is_valid:
+                file_path.unlink()
+                logger.warning(f"Skipping invalid file {safe_filename}: {error_msg}")
+                continue
+
+            file_type = Path(safe_filename).suffix.lower().replace('.', '')
+            document_id = db.create_document(
+                data_room_id=data_room_id,
+                file_name=safe_filename,
+                file_path=str(file_path),
+                file_size=file_info['size'],
+                file_type=file_type
+            )
+
+            job_queue.enqueue(
+                job_type=JobType.PROCESS_FILE.value,
+                payload={
+                    'data_room_id': data_room_id,
+                    'document_id': document_id,
+                    'file_path': str(file_path),
+                    'file_name': safe_filename,
+                    'upload_total_files': real_total,
+                },
+                data_room_id=data_room_id,
+                file_name=safe_filename
+            )
+
+            uploaded_count += 1
+            logger.info(f"[upload-files] Streamed & enqueued file {uploaded_count}/{batch_size}: {safe_filename} ({file_info['size']} bytes)")
+
+        logger.success(f"[upload-files] {uploaded_count} files uploaded to data room {data_room_id}")
+
+        return {
+            "data_room_id": data_room_id,
+            "uploaded_count": uploaded_count,
+            "total_files": batch_size,
+            "message": f"{uploaded_count} files uploaded. Processing started."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to upload files to data room {data_room_id}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Failed to upload files: {str(e)}")
+
+
 @app.get("/api/data-room/{data_room_id}/status")
-async def get_data_room_status(
+def get_data_room_status(
     data_room_id: str,
     identity: Dict = Depends(get_user_identity)
 ):
     """
     Get processing status for a data room.
+
+    Note: This is a sync def (not async) so FastAPI runs it in a threadpool,
+    preventing synchronous DB calls from blocking the event loop.
 
     Returns:
         Current status, progress, metadata, and error details if failed
@@ -1201,7 +1656,7 @@ async def get_data_room_status(
             if data_room:
                 break
             if attempt < 2:
-                await asyncio.sleep(0.1)
+                time.sleep(0.1)
 
         if not data_room:
             raise HTTPException(
@@ -1313,29 +1768,39 @@ async def ask_question(
         # Import answer_question tool
         from tools.answer_question import answer_question
 
-        # Generate answer
-        result = answer_question(
+        # Run blocking Q&A in a thread so we don't block the async event loop.
+        # Without this, the synchronous OpenAI + Claude API calls freeze the
+        # entire server, making it unresponsive to all other requests.
+        result = await asyncio.to_thread(
+            answer_question,
             question=request.question,
             data_room_id=data_room_id,
             filters=request.filters,
-            model=settings.claude_model
+            model=settings.claude_model,
         )
 
         # Calculate response time
         response_time_ms = int((time.time() - start_time) * 1000)
 
-        # Save to queries table
-        db.save_query(
-            data_room_id=data_room_id,
-            question=request.question,
-            answer=result['answer'],
-            sources=result.get('sources', []),
-            confidence_score=result.get('confidence'),
-            response_time_ms=response_time_ms,
-            tokens_used=result.get('tokens_used'),
-            cost=result.get('cost'),
-            user_id=identity["user_id"]
-        )
+        # Save to queries table (non-blocking: don't lose the answer if DB write fails)
+        try:
+            db.save_query(
+                data_room_id=data_room_id,
+                question=request.question,
+                answer=result['answer'],
+                sources=result.get('sources', []),
+                confidence_score=result.get('confidence_score'),
+                response_time_ms=response_time_ms,
+                tokens_used=result.get('tokens_used'),
+                cost=result.get('cost'),
+                user_id=identity["user_id"]
+            )
+        except Exception as e:
+            logger.error(f"Failed to save query to database (answer still returned): {e}")
+
+        # Normalize confidence key for frontend compatibility
+        if 'confidence_score' in result and 'confidence' not in result:
+            result['confidence'] = result['confidence_score']
 
         return result
 
@@ -1349,6 +1814,21 @@ async def ask_question(
     except Exception as e:
         logger.error(f"Failed to answer question: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/api/data-room/{data_room_id}/questions/{question_id}")
+def delete_question(
+    data_room_id: str,
+    question_id: str,
+    identity: Dict = Depends(get_user_identity)
+):
+    """Delete a question. Only the owner can delete their own question."""
+    if not identity.get("user_id"):
+        raise HTTPException(status_code=401, detail="User identity required")
+    deleted = db.delete_question(question_id, identity["user_id"])
+    if not deleted:
+        raise HTTPException(status_code=404, detail="Question not found or not owned by you")
+    return {"status": "deleted"}
 
 
 @app.post("/api/data-room/{data_room_id}/reembed")
@@ -1453,7 +1933,7 @@ async def reprocess_data_room_endpoint(data_room_id: str, background_tasks: Back
 
 
 @app.get("/api/data-rooms")
-async def list_data_rooms(
+def list_data_rooms(
     limit: int = 50,
     identity: Dict = Depends(get_user_identity)
 ):
@@ -1491,7 +1971,7 @@ async def list_data_rooms(
 # ============================================================================
 
 @app.get("/api/data-room/{data_room_id}/members")
-async def get_data_room_members(
+def get_data_room_members(
     data_room_id: str,
     identity: Dict = Depends(get_user_identity)
 ):
@@ -1641,7 +2121,7 @@ async def accept_data_room_invite(
 
 
 @app.delete("/api/data-room/{data_room_id}")
-async def delete_data_room_endpoint(
+def delete_data_room_endpoint(
     data_room_id: str,
     identity: Dict = Depends(get_user_identity)
 ):
@@ -1698,7 +2178,7 @@ async def delete_data_room_endpoint(
 
 
 @app.get("/api/data-room/{data_room_id}/documents")
-async def get_documents(data_room_id: str):
+def get_documents(data_room_id: str):
     """
     Get all documents for a data room.
 
@@ -1808,7 +2288,7 @@ def build_document_tree(documents: list, target_path: Optional[str] = None) -> d
 
 
 @app.get("/api/data-room/{data_room_id}/document-tree", response_model=DocumentTreeResponse)
-async def get_document_tree(
+def get_document_tree(
     data_room_id: str,
     folder_path: Optional[str] = None
 ):
@@ -1893,8 +2373,12 @@ async def get_document_file(
                 detail=f"Document not found: {document_id}"
             )
 
-        # Build file path
-        file_path = Path(f"{settings.data_rooms_path}/{data_room_id}/raw/{document['file_name']}")
+        # Build file path — use stored path for Drive-synced files, fall back to raw/ for uploads
+        stored_path = document.get('file_path')
+        if stored_path:
+            file_path = Path(stored_path)
+        else:
+            file_path = Path(f"{settings.data_rooms_path}/{data_room_id}/raw/{document['file_name']}")
 
         if not file_path.exists():
             raise HTTPException(
@@ -1938,7 +2422,7 @@ async def get_document_file(
 
 
 @app.get("/api/data-room/{data_room_id}/document/{document_id}/preview", response_model=DocumentPreview)
-async def get_document_preview(
+def get_document_preview(
     data_room_id: str,
     document_id: str,
     sheet: Optional[str] = None,
@@ -1981,8 +2465,12 @@ async def get_document_preview(
                 detail=f"Document not found: {document_id}"
             )
 
-        # Build file path
-        file_path = Path(f"{settings.data_rooms_path}/{data_room_id}/raw/{document['file_name']}")
+        # Build file path — use stored path for Drive-synced files, fall back to raw/ for uploads
+        stored_path = document.get('file_path')
+        if stored_path:
+            file_path = Path(stored_path)
+        else:
+            file_path = Path(f"{settings.data_rooms_path}/{data_room_id}/raw/{document['file_name']}")
 
         if not file_path.exists():
             raise HTTPException(
@@ -2052,7 +2540,7 @@ async def get_document_preview(
 
 
 @app.get("/api/data-room/{data_room_id}/questions")
-async def get_question_history(
+def get_question_history(
     data_room_id: str,
     limit: int = 50,
     filter: Optional[str] = Query(None, description="Filter: 'mine' for user's questions, 'team' or omit for all"),
@@ -2192,19 +2680,28 @@ async def generate_memo(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+def _serialize_memo(memo: dict) -> dict:
+    """Parse JSON text fields in a memo dict so the response is properly typed."""
+    if not memo:
+        return memo
+    for field in ("metadata", "valuation_methods"):
+        raw = memo.get(field)
+        if raw and isinstance(raw, str):
+            try:
+                memo[field] = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                pass
+    return memo
+
+
 @app.get("/api/data-room/{data_room_id}/memo")
-async def get_memo(data_room_id: str):
+def get_memo(data_room_id: str):
     """Get the latest memo for a data room."""
     try:
         from app.database import get_latest_memo
 
         memo = get_latest_memo(data_room_id)
-        if memo and memo.get("metadata"):
-            try:
-                memo["metadata"] = json.loads(memo["metadata"])
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return {"data_room_id": data_room_id, "memo": memo}
+        return {"data_room_id": data_room_id, "memo": _serialize_memo(memo) if memo else None}
 
     except Exception as e:
         logger.error(f"Failed to get memo: {e}")
@@ -2212,7 +2709,7 @@ async def get_memo(data_room_id: str):
 
 
 @app.get("/api/data-room/{data_room_id}/memo/{memo_id}/status")
-async def get_memo_status(data_room_id: str, memo_id: str):
+def get_memo_status(data_room_id: str, memo_id: str):
     """Get memo generation status by ID."""
     try:
         from app.database import get_memo_by_id
@@ -2220,12 +2717,7 @@ async def get_memo_status(data_room_id: str, memo_id: str):
         memo = get_memo_by_id(memo_id)
         if not memo:
             raise HTTPException(status_code=404, detail="Memo not found")
-        if memo.get("metadata"):
-            try:
-                memo["metadata"] = json.loads(memo["metadata"])
-            except (json.JSONDecodeError, TypeError):
-                pass
-        return memo
+        return _serialize_memo(memo)
 
     except HTTPException:
         raise
@@ -2375,16 +2867,20 @@ async def memo_chat(data_room_id: str, memo_id: str, request: MemoChatRequest):
             "Use markdown formatting (tables, bold, bullet points) to make your responses clear.\n\n"
 
             "## Editing Memo Sections\n"
-            "If the user requests ANY change to a memo section, you MUST:\n"
-            "1. Briefly explain what you changed\n"
-            "2. Output the COMPLETE updated section in this tag:\n\n"
+            "If the user requests ANY change, addition, or update to the memo, you MUST immediately "
+            "produce the updated section content — do NOT just describe what you would do or say you will add it. "
+            "Actually write the content and output it in the required tag.\n\n"
+            "Steps:\n"
+            "1. Briefly explain what you changed (1-2 sentences)\n"
+            "2. Output the COMPLETE updated section in this EXACT tag format:\n\n"
             "<updated_section key=\"section_key\">\n"
             "[Full updated section content - the ENTIRE section, not just changes]\n"
             "</updated_section>\n\n"
             "Valid section keys: proposed_investment_terms, executive_summary, market_analysis, team_assessment, "
             "product_technology, financial_analysis, valuation_analysis, risks_concerns, outcome_scenario_analysis, "
             "investment_recommendation.\n"
-            "The tag is REQUIRED for any modification — without it, the memo won't update.\n\n"
+            "CRITICAL: The <updated_section> tag is REQUIRED for any modification — without it, the memo won't update. "
+            "Never just say you will update — always include the tag with the full content.\n\n"
 
             "## Charts & Visualizations\n"
             + (
@@ -2418,14 +2914,17 @@ async def memo_chat(data_room_id: str, memo_id: str, request: MemoChatRequest):
             )
         )
 
-        prompt = f"{system_prompt}\n\n---\n\nCurrent Investment Memo:\n\n{memo_context}{chart_context}{document_context}\n\n---\n\nUser: {request.message}"
+        user_prompt = f"Current Investment Memo:\n\n{memo_context}{chart_context}{document_context}\n\n---\n\nUser: {request.message}"
 
         client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-        response = client.messages.create(
+        # Run blocking API call in a thread to avoid freezing the event loop
+        response = await asyncio.to_thread(
+            client.messages.create,
             model=settings.claude_model,
-            max_tokens=4000,
+            max_tokens=16000,
             temperature=0.3,
-            messages=[{"role": "user", "content": prompt}],
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_prompt}],
         )
 
         answer_text = response.content[0].text
@@ -2509,7 +3008,7 @@ async def memo_chat(data_room_id: str, memo_id: str, request: MemoChatRequest):
 
 
 @app.get("/api/data-room/{data_room_id}/memo/{memo_id}/chat-history")
-async def get_memo_chat_history(data_room_id: str, memo_id: str, limit: int = 100):
+def get_memo_chat_history(data_room_id: str, memo_id: str, limit: int = 100):
     """Get chat history for a memo."""
     try:
         from app.database import get_memo_by_id, get_memo_chat_history
@@ -2535,11 +3034,63 @@ async def get_memo_chat_history(data_room_id: str, memo_id: str, limit: int = 10
         raise HTTPException(status_code=500, detail=str(e))
 
 
+async def _rewrite_section_with_deal_terms(
+    existing_content: str,
+    ticket_size: float | None,
+    post_money_valuation: float | None,
+) -> str | None:
+    """
+    Rewrite the proposed_investment_terms section with updated deal term numbers.
+    Uses Claude for a fast rewrite. Returns updated markdown or None on failure.
+    """
+    from anthropic import Anthropic
+
+    deal_parts = []
+    if ticket_size:
+        deal_parts.append(f"- Investment Amount (Ticket Size): ${ticket_size:,.0f}")
+    if post_money_valuation:
+        deal_parts.append(f"- Post-Money Valuation: ${post_money_valuation:,.0f}")
+    if ticket_size and post_money_valuation:
+        ownership_pct = (ticket_size / post_money_valuation) * 100
+        deal_parts.append(f"- Implied Ownership: {ownership_pct:.2f}%")
+
+    if not deal_parts:
+        return None
+
+    deal_params_text = "\n".join(deal_parts)
+
+    prompt = (
+        'You are updating the "Proposed Investment Terms" section of a VC investment memo.\n\n'
+        f"The analyst has changed the deal parameters to:\n{deal_params_text}\n\n"
+        f"Here is the current section content:\n\n{existing_content}\n\n"
+        "Rewrite this section with the updated deal parameters. Rules:\n"
+        "1. Keep the EXACT same structure, formatting, and markdown table layout\n"
+        "2. Update ALL references to investment amount, ticket size, post-money valuation, and ownership percentage to match the new values\n"
+        "3. Do NOT add new rows, remove existing rows, or change the analysis/commentary\n"
+        "4. Do NOT add any preamble or explanation - output ONLY the updated section content\n"
+        "5. If the section contains a markdown table, preserve the table format exactly, only changing the numeric values"
+    )
+
+    client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
+    response = await asyncio.to_thread(
+        client.messages.create,
+        model=settings.claude_model,
+        max_tokens=2048,
+        temperature=0.1,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    if response.content and response.content[0].text.strip():
+        return response.content[0].text.strip()
+
+    return None
+
+
 @app.put("/api/data-room/{data_room_id}/memo/{memo_id}/deal-terms")
 async def update_deal_terms(data_room_id: str, memo_id: str, request: dict):
-    """Update deal terms on an existing memo."""
+    """Update deal terms on an existing memo and regenerate the proposed terms section."""
     try:
-        from app.database import get_memo_by_id, update_memo_deal_terms
+        from app.database import get_memo_by_id, update_memo_deal_terms, update_memo_section
 
         memo = get_memo_by_id(memo_id)
         if not memo:
@@ -2551,6 +3102,20 @@ async def update_deal_terms(data_room_id: str, memo_id: str, request: dict):
         post_money_valuation = request.get("post_money_valuation")
 
         update_memo_deal_terms(memo_id, ticket_size, post_money_valuation)
+
+        # Regenerate proposed_investment_terms section with new deal values
+        existing_section = memo.get("proposed_investment_terms")
+        if existing_section and existing_section.strip():
+            try:
+                new_content = await _rewrite_section_with_deal_terms(
+                    existing_content=existing_section,
+                    ticket_size=ticket_size,
+                    post_money_valuation=post_money_valuation,
+                )
+                if new_content:
+                    update_memo_section(memo_id, "proposed_investment_terms", new_content, 0, 0.0)
+            except Exception as e:
+                logger.warning(f"Failed to regenerate proposed_investment_terms: {e}")
 
         # Return updated memo
         updated_memo = get_memo_by_id(memo_id)
@@ -2612,7 +3177,7 @@ async def export_memo_docx(data_room_id: str, memo_id: str):
 # Utility Endpoints
 
 @app.get("/api/costs")
-async def get_costs(days: int = 30, data_room_id: Optional[str] = None):
+def get_costs(days: int = 30, data_room_id: Optional[str] = None):
     """
     Get API cost report.
 
@@ -3516,7 +4081,7 @@ async def _process_connected_file(
 
 
 @app.get("/api/drive/{user_id}/connected-files")
-async def list_connected_files(user_id: str):
+def list_connected_files(user_id: str):
     """
     List all connected files for a user.
 
@@ -3555,7 +4120,7 @@ async def list_connected_files(user_id: str):
 
 
 @app.get("/api/drive/file/{connection_id}")
-async def get_connected_file_status(connection_id: str):
+def get_connected_file_status(connection_id: str):
     """
     Get status of a connected file.
 
@@ -3664,7 +4229,7 @@ async def retry_connected_file(connection_id: str, background_tasks: BackgroundT
 
 
 @app.get("/api/drive/{user_id}/connected")
-async def list_connected_folders(user_id: str):
+def list_connected_folders(user_id: str):
     """
     List all connected folders for a user.
 
@@ -3711,7 +4276,7 @@ async def list_connected_folders(user_id: str):
 
 
 @app.get("/api/drive/folder/{connection_id}")
-async def get_connected_folder_status(connection_id: str):
+def get_connected_folder_status(connection_id: str):
     """
     Get status of a connected folder.
 
@@ -3770,6 +4335,47 @@ async def get_connected_folder_status(connection_id: str):
         raise
     except Exception as e:
         logger.error(f"Failed to get folder status: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/drive/folder/{connection_id}/progress")
+def get_folder_sync_progress(connection_id: str):
+    """
+    Lightweight sync progress endpoint for the progress UI.
+    Returns only the data needed for the animated progress panel,
+    avoiding the overhead of returning all synced files.
+    """
+    try:
+        folder = db.get_connected_folder(connection_id)
+        if not folder:
+            raise HTTPException(status_code=404, detail="Connected folder not found")
+
+        recent = db.get_recently_completed_synced_files(connection_id, limit=5)
+        type_counts = db.get_synced_file_type_counts(connection_id)
+        current = db.get_current_processing_file(connection_id)
+
+        return {
+            "sync_stage": folder.get('sync_stage', 'idle'),
+            "sync_status": folder['sync_status'],
+            "discovered_files": folder.get('discovered_files', 0),
+            "discovered_folders": folder.get('discovered_folders', 0),
+            "total_files": folder.get('total_files', 0),
+            "processed_files": folder.get('processed_files', 0),
+            "file_type_counts": type_counts,
+            "recently_completed": [
+                {"file_name": f['file_name'], "mime_type": f.get('mime_type')}
+                for f in recent
+            ],
+            "current_file": {
+                "file_name": current['file_name'],
+                "sync_status": current['sync_status']
+            } if current else None,
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get folder sync progress: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
@@ -4044,7 +4650,7 @@ async def trigger_financial_analysis(
 
 
 @app.get("/api/data-room/{data_room_id}/document/{document_id}/financial-analysis")
-async def get_financial_analysis(data_room_id: str, document_id: str):
+def get_financial_analysis(data_room_id: str, document_id: str):
     """
     Get financial analysis results for a document.
 
@@ -4080,7 +4686,7 @@ async def get_financial_analysis(data_room_id: str, document_id: str):
 
 
 @app.get("/api/data-room/{data_room_id}/financial-summary")
-async def get_financial_summary(data_room_id: str):
+def get_financial_summary(data_room_id: str):
     """
     Get aggregated financial summary across all analyzed documents.
 
@@ -4164,7 +4770,7 @@ async def get_financial_summary(data_room_id: str):
 
 
 @app.get("/api/data-room/{data_room_id}/financial-metrics")
-async def get_financial_metrics(
+def get_financial_metrics(
     data_room_id: str,
     category: Optional[str] = None,
     metric_name: Optional[str] = None
@@ -4317,26 +4923,11 @@ async def agent_get_file_text(user_id: str, file_id: str):
         # Extract text based on file type
         text = ""
         try:
-            if file_ext == '.pdf':
-                from tools.parse_pdf import parse_pdf
-                parsed = parse_pdf(tmp_path)
+            from tools.ingest_data_room import parse_file_by_type
+            try:
+                parsed = parse_file_by_type(tmp_path)
                 text = parsed.get('text', '')
-            elif file_ext in ['.xlsx', '.xls', '.csv']:
-                from tools.parse_excel import parse_excel
-                parsed = parse_excel(tmp_path)
-                text = parsed.get('text', '')
-            elif file_ext in ['.pptx', '.ppt']:
-                from tools.parse_pptx import parse_pptx
-                parsed = parse_pptx(tmp_path)
-                text = parsed.get('text', '')
-            elif file_ext in ['.docx', '.doc']:
-                from docx import Document
-                doc = Document(tmp_path)
-                text = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-            elif file_ext == '.txt':
-                with open(tmp_path, 'r', errors='replace') as f:
-                    text = f.read()
-            else:
+            except ValueError:
                 raise HTTPException(status_code=400, detail=f"Unsupported file type: {file_ext}")
         finally:
             try:

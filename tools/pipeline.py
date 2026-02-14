@@ -273,50 +273,15 @@ class DocumentPipeline:
         Returns parsed document data or None on failure.
         """
         try:
-            path = Path(file_path)
-            ext = path.suffix.lower()
-
-            if ext == '.pdf':
-                from tools.parse_pdf import parse_pdf
-                return parse_pdf(file_path)
-
-            elif ext in ['.xlsx', '.xls']:
-                from tools.parse_excel_financial import parse_excel_financial
-                return parse_excel_financial(file_path)
-
-            elif ext == '.pptx':
-                from tools.parse_pptx import parse_pptx
-                return parse_pptx(file_path)
-
-            elif ext == '.docx':
-                from docx import Document
-                doc = Document(file_path)
-                text = "\n".join(p.text for p in doc.paragraphs)
-                return {
-                    "file_path": file_path,
-                    "file_name": path.name,
-                    "text": text,
-                    "page_count": 1,
-                    "file_type": "docx"
-                }
-
-            elif ext in ['.txt', '.md', '.csv']:
-                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                    text = f.read()
-                return {
-                    "file_path": file_path,
-                    "file_name": path.name,
-                    "text": text,
-                    "page_count": 1,
-                    "file_type": ext.lstrip('.')
-                }
-
-            else:
-                logger.warning(f"Unsupported file type: {ext}")
+            from tools.ingest_data_room import parse_file_by_type
+            result = parse_file_by_type(file_path, use_financial_excel=True)
+            if result and result.get("error"):
+                logger.warning(f"Parse returned error for {file_path}: {result['error']}")
                 return None
+            return result
 
         except Exception as e:
-            logger.error(f"Parse error {file_path}: {e}")
+            logger.error(f"Parse error {file_path}: {e}", exc_info=True)
             return None
 
     async def _chunk_stage(

@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from 'react';
 import { Loader2, AlertCircle, RefreshCw, Send, X, Sparkles, Check, Circle, Download, Pencil, StopCircle } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
-import { BarChart, Bar, LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from 'recharts';
+import ChartRenderer from './ChartRenderer';
 import { generateMemo, getMemo, getMemoStatus, cancelMemoGeneration, sendMemoChat, getMemoChatHistory, exportMemoDocx, updateMemoDealTerms, MemoResponse, MemoGenerateParams, ChartSpec } from '../api/client';
 
 const SECTION_ORDER = [
@@ -27,100 +27,6 @@ const VALUATION_METHODS = [
 
 type SectionKey = (typeof SECTION_ORDER)[number]['key'];
 
-function formatValue(value: number, format: string): string {
-  if (format === 'currency') {
-    if (Math.abs(value) >= 1_000_000) return `$${(value / 1_000_000).toFixed(1)}M`;
-    if (Math.abs(value) >= 1_000) return `$${(value / 1_000).toFixed(0)}K`;
-    return `$${value.toLocaleString()}`;
-  }
-  if (format === 'percent') return `${value}%`;
-  if (Math.abs(value) >= 1_000_000) return `${(value / 1_000_000).toFixed(1)}M`;
-  if (Math.abs(value) >= 1_000) return `${(value / 1_000).toFixed(0)}K`;
-  return value.toLocaleString();
-}
-
-function formatTooltipValue(value: number, format: string): string {
-  if (format === 'currency') return `$${value.toLocaleString()}`;
-  if (format === 'percent') return `${value}%`;
-  return value.toLocaleString();
-}
-
-function MemoChart({ spec }: { spec: ChartSpec }) {
-  const getColor = (entry: Record<string, any>, index: number): string => {
-    if (spec.color_key && typeof spec.colors === 'object' && spec.color_key in (entry || {})) {
-      return (spec.colors as Record<string, string>)[entry[spec.color_key]] || '#6366f1';
-    }
-    if (typeof spec.colors === 'string') return spec.colors;
-    return '#6366f1';
-  };
-
-  const yFmt = spec.y_format || 'number';
-
-  return (
-    <div style={{
-      flex: '1 1 340px',
-      background: 'var(--bg-tertiary)',
-      borderRadius: '12px',
-      padding: '20px',
-      minWidth: '300px',
-    }}>
-      <h4 style={{ margin: '0 0 16px', fontSize: '14px', fontWeight: 600, color: 'var(--text-secondary)' }}>
-        {spec.title}
-      </h4>
-      <ResponsiveContainer width="100%" height={220}>
-        {spec.type === 'line' ? (
-          <LineChart data={spec.data} margin={{ top: 5, right: 10, left: 10, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.06)" />
-            <XAxis dataKey={spec.x_key} tick={{ fontSize: 12 }} />
-            <YAxis tick={{ fontSize: 11 }} tickFormatter={(v: number) => formatValue(v, yFmt)} />
-            <Tooltip
-              formatter={(value) => [formatTooltipValue(Number(value), yFmt), spec.y_label || spec.y_key]}
-              contentStyle={{ fontSize: '12px', borderRadius: '8px' }}
-            />
-            <Line
-              type="monotone"
-              dataKey={spec.y_key}
-              stroke={typeof spec.colors === 'string' ? spec.colors : '#6366f1'}
-              strokeWidth={2}
-              dot={{ r: 4 }}
-            />
-          </LineChart>
-        ) : spec.type === 'horizontal_bar' ? (
-          <BarChart data={spec.data} margin={{ top: 5, right: 10, left: 10, bottom: 5 }} layout="vertical">
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.06)" />
-            <XAxis type="number" tick={{ fontSize: 11 }} tickFormatter={(v: number) => formatValue(v, yFmt)} />
-            <YAxis type="category" dataKey={spec.x_key} tick={{ fontSize: 12 }} width={90} />
-            <Tooltip
-              formatter={(value) => [formatTooltipValue(Number(value), yFmt), spec.y_label || spec.y_key]}
-              contentStyle={{ fontSize: '12px', borderRadius: '8px' }}
-            />
-            <Bar dataKey={spec.y_key} radius={[0, 4, 4, 0]}>
-              {spec.data.map((entry, i) => (
-                <Cell key={i} fill={getColor(entry, i)} />
-              ))}
-            </Bar>
-          </BarChart>
-        ) : (
-          <BarChart data={spec.data} margin={{ top: 5, right: 10, left: 10, bottom: 5 }}>
-            <CartesianGrid strokeDasharray="3 3" stroke="rgba(0,0,0,0.06)" />
-            <XAxis dataKey={spec.x_key} tick={{ fontSize: 12 }} />
-            <YAxis tick={{ fontSize: 11 }} tickFormatter={(v: number) => formatValue(v, yFmt)} />
-            <Tooltip
-              formatter={(value) => [formatTooltipValue(Number(value), yFmt), spec.y_label || spec.y_key]}
-              contentStyle={{ fontSize: '12px', borderRadius: '8px' }}
-            />
-            <Bar dataKey={spec.y_key} radius={[4, 4, 0, 0]}>
-              {spec.data.map((entry, i) => (
-                <Cell key={i} fill={getColor(entry, i)} />
-              ))}
-            </Bar>
-          </BarChart>
-        )}
-      </ResponsiveContainer>
-    </div>
-  );
-}
-
 interface Props {
   dataRoomId: string;
   isReady: boolean;
@@ -141,7 +47,6 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
   const [ticketSize, setTicketSize] = useState<string>('');
   const [postMoneyValuation, setPostMoneyValuation] = useState<string>('');
   const [dealParamsError, setDealParamsError] = useState<string | null>(null);
-  const [dontAskAgain, setDontAskAgain] = useState(false);
   const [isDownloading, setIsDownloading] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [valuationMethods, setValuationMethods] = useState<string[]>(['vc_method']);
@@ -150,24 +55,6 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
   const [editPostMoneyValuation, setEditPostMoneyValuation] = useState('');
   const [editDealError, setEditDealError] = useState<string | null>(null);
   const [isSavingDealTerms, setIsSavingDealTerms] = useState(false);
-
-  // Load saved deal preferences from localStorage
-  useEffect(() => {
-    const saved = localStorage.getItem(`deal_params_${dataRoomId}`);
-    if (saved) {
-      try {
-        const parsed = JSON.parse(saved);
-        if (parsed.dontAskAgain) {
-          setDontAskAgain(true);
-          if (parsed.ticketSize) setTicketSize(parsed.ticketSize);
-          if (parsed.postMoneyValuation) setPostMoneyValuation(parsed.postMoneyValuation);
-          if (parsed.valuationMethods) setValuationMethods(parsed.valuationMethods);
-        }
-      } catch {
-        // Invalid stored data, ignore
-      }
-    }
-  }, [dataRoomId]);
 
   useEffect(() => {
     loadMemo();
@@ -216,30 +103,33 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
     loadChatHistory();
   }, [memo?.id, dataRoomId]);
 
-  const loadMemo = async () => {
+  const loadMemo = async (retries = 2) => {
     setLoading(true);
-    try {
-      const result = await getMemo(dataRoomId);
-      if (result.memo) {
-        setMemo(result.memo);
-        if (result.memo.status === 'generating') {
-          setMemoId(result.memo.id);
-          setIsGenerating(true);
+    setError(null);
+    for (let attempt = 0; attempt <= retries; attempt++) {
+      try {
+        const result = await getMemo(dataRoomId);
+        if (result.memo) {
+          setMemo(result.memo);
+          if (result.memo.status === 'generating') {
+            setMemoId(result.memo.id);
+            setIsGenerating(true);
+          }
+        }
+        setLoading(false);
+        return;
+      } catch (err) {
+        console.error(`Failed to load memo (attempt ${attempt + 1}/${retries + 1}):`, err);
+        if (attempt < retries) {
+          await new Promise(r => setTimeout(r, 1000 * (attempt + 1)));
         }
       }
-    } catch {
-      // No memo yet
-    } finally {
-      setLoading(false);
     }
+    setError('Failed to load memo. Please try refreshing the page.');
+    setLoading(false);
   };
 
   const openDealModal = () => {
-    // If "don't ask again" is set, auto-generate with saved/empty params
-    if (dontAskAgain) {
-      handleGenerateWithParams(ticketSize, postMoneyValuation, valuationMethods);
-      return;
-    }
     setShowDealModal(true);
   };
 
@@ -306,16 +196,6 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
     }
 
     setDealParamsError(null);
-
-    // Save preference if "don't ask again" is checked
-    if (dontAskAgain) {
-      localStorage.setItem(`deal_params_${dataRoomId}`, JSON.stringify({
-        dontAskAgain: true,
-        ticketSize,
-        postMoneyValuation,
-        valuationMethods
-      }));
-    }
 
     await handleGenerateWithParams(ticketSize, postMoneyValuation, valuationMethods);
   };
@@ -396,7 +276,7 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
         ticket_size: parsedTicket,
         post_money_valuation: parsedValuation,
       });
-      setMemo((prev) => prev ? { ...prev, ticket_size: parsedTicket ?? undefined, post_money_valuation: parsedValuation ?? undefined } : prev);
+      setMemo((prev) => prev ? { ...prev, ...updated, ticket_size: parsedTicket ?? undefined, post_money_valuation: parsedValuation ?? undefined } : prev);
       setIsEditingDealTerms(false);
     } catch (err) {
       setEditDealError('Failed to save deal terms');
@@ -668,25 +548,6 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
               </div>
             )}
 
-            <label
-              style={{
-                display: 'flex',
-                alignItems: 'center',
-                gap: '8px',
-                marginTop: '16px',
-                cursor: 'pointer',
-                fontSize: '13px',
-                color: 'var(--text-secondary)',
-              }}
-            >
-              <input
-                type="checkbox"
-                checked={dontAskAgain}
-                onChange={(e) => setDontAskAgain(e.target.checked)}
-                style={{ width: '16px', height: '16px', cursor: 'pointer' }}
-              />
-              Don't ask me again
-            </label>
           </div>
 
           <div className="modal-footer">
@@ -910,7 +771,7 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
                       </button>
                       <button className="btn btn-primary" onClick={saveDealTerms} disabled={isSavingDealTerms} style={{ padding: '6px 14px', fontSize: '12px' }}>
                         {isSavingDealTerms ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <Check size={12} />}
-                        Save
+                        {isSavingDealTerms ? 'Updating memo...' : 'Save'}
                       </button>
                     </div>
                   </div>
@@ -1147,7 +1008,7 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
                       {section.key === 'financial_analysis' && memo.metadata?.chart_data?.charts && memo.metadata.chart_data.charts.length > 0 && (
                         <div style={{ display: 'flex', gap: '24px', marginTop: '24px', flexWrap: 'wrap' }}>
                           {memo.metadata.chart_data.charts.map((chart) => (
-                            <MemoChart key={chart.id} spec={chart} />
+                            <ChartRenderer key={chart.id} spec={chart} />
                           ))}
                         </div>
                       )}

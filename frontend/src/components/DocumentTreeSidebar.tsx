@@ -1,13 +1,14 @@
-import { useState, useEffect, useCallback } from 'react';
+import { useState, useEffect, useCallback, memo } from 'react';
 import { ChevronRight, ChevronDown, Folder, FileText, Table, File, Eye, Upload, Loader2, AlertTriangle } from 'lucide-react';
 import { getDocumentTree, DocumentTreeResponse, FolderNode, DocumentWithPath } from '../api/client';
 
 interface DocumentTreeSidebarProps {
   dataRoomId: string;
   onDocumentClick: (doc: DocumentWithPath) => void;
+  processingStatus?: string;
 }
 
-export default function DocumentTreeSidebar({ dataRoomId, onDocumentClick }: DocumentTreeSidebarProps) {
+function DocumentTreeSidebar({ dataRoomId, onDocumentClick, processingStatus }: DocumentTreeSidebarProps) {
   const [rootTree, setRootTree] = useState<DocumentTreeResponse | null>(null);
   const [expandedFolders, setExpandedFolders] = useState<Set<string>>(new Set());
   const [folderContents, setFolderContents] = useState<Map<string, DocumentTreeResponse>>(new Map());
@@ -17,6 +18,24 @@ export default function DocumentTreeSidebar({ dataRoomId, onDocumentClick }: Doc
   useEffect(() => {
     loadRootTree();
   }, [dataRoomId]);
+
+  // Poll for document status updates while data room is still processing
+  useEffect(() => {
+    if (!processingStatus || processingStatus === 'complete' || processingStatus === 'failed') {
+      return;
+    }
+    const interval = setInterval(() => {
+      loadRootTree();
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [dataRoomId, processingStatus]);
+
+  // Final refresh when processing completes
+  useEffect(() => {
+    if (processingStatus === 'complete') {
+      loadRootTree();
+    }
+  }, [processingStatus]);
 
   const loadRootTree = async () => {
     try {
@@ -224,3 +243,5 @@ export default function DocumentTreeSidebar({ dataRoomId, onDocumentClick }: Doc
     </div>
   );
 }
+
+export default memo(DocumentTreeSidebar);

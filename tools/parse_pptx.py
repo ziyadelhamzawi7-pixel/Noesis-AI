@@ -1,9 +1,10 @@
 """
 PowerPoint parsing tool with text extraction from slides, notes, and shapes.
-Supports .pptx files using python-pptx library.
+Supports .pptx files using python-pptx library, and legacy .ppt via fallback.
 """
 
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 import json
@@ -13,9 +14,10 @@ try:
     from pptx import Presentation
     from pptx.util import Inches, Pt
     from pptx.enum.shapes import MSO_SHAPE_TYPE
+    PPTX_AVAILABLE = True
 except ImportError:
-    logger.error("Required package not installed. Run: pip install python-pptx")
-    sys.exit(1)
+    PPTX_AVAILABLE = False
+    logger.warning("python-pptx not available. Install with: pip install python-pptx")
 
 
 class PowerPointParser:
@@ -43,6 +45,7 @@ class PowerPointParser:
             "text": "",
             "tables": [],
             "metadata": {},
+            "file_type": "pptx",
             "method": "python-pptx",
             "slide_count": 0,
             "has_notes": False,
@@ -78,26 +81,68 @@ class PowerPointParser:
             all_text = []
             all_tables = []
 
-            # Process each slide
-            for slide_num, slide in enumerate(prs.slides, start=1):
-                slide_data = self._extract_slide_content(slide, slide_num)
-                result["slides"].append(slide_data)
+            # Process slides in parallel for large decks, sequential for small ones
+            slides_list = list(prs.slides)
+            if len(slides_list) > 3:
+                try:
+                    workers = min(8, len(slides_list))
+                    slide_results = {}
+                    with ThreadPoolExecutor(max_workers=workers) as executor:
+                        futures = {
+                            executor.submit(self._extract_slide_content, slide, slide_num): slide_num
+                            for slide_num, slide in enumerate(slides_list, start=1)
+                        }
+                        for future in as_completed(futures):
+                            slide_num = futures[future]
+                            slide_results[slide_num] = future.result()
 
-                # Collect text
-                if slide_data.get("text"):
-                    all_text.append(f"--- Slide {slide_num} ---\n{slide_data['text']}")
-
-                # Collect notes
-                if slide_data.get("notes"):
-                    all_text.append(f"[Notes for Slide {slide_num}]\n{slide_data['notes']}")
-                    result["has_notes"] = True
-
-                # Collect tables
-                if slide_data.get("tables"):
-                    for table in slide_data["tables"]:
-                        table["slide_number"] = slide_num
-                        all_tables.append(table)
-                    result["has_tables"] = True
+                    # Reassemble in slide order
+                    for slide_num in sorted(slide_results.keys()):
+                        slide_data = slide_results[slide_num]
+                        result["slides"].append(slide_data)
+                        if slide_data.get("text"):
+                            all_text.append(f"--- Slide {slide_num} ---\n{slide_data['text']}")
+                        if slide_data.get("notes"):
+                            all_text.append(f"[Notes for Slide {slide_num}]\n{slide_data['notes']}")
+                            result["has_notes"] = True
+                        if slide_data.get("tables"):
+                            for table in slide_data["tables"]:
+                                table["slide_number"] = slide_num
+                                all_tables.append(table)
+                            result["has_tables"] = True
+                except Exception as e:
+                    # Fallback to sequential processing if parallel fails
+                    logger.warning(f"Parallel slide processing failed, falling back to sequential: {e}")
+                    result["slides"] = []
+                    all_text = []
+                    all_tables = []
+                    for slide_num, slide in enumerate(slides_list, start=1):
+                        slide_data = self._extract_slide_content(slide, slide_num)
+                        result["slides"].append(slide_data)
+                        if slide_data.get("text"):
+                            all_text.append(f"--- Slide {slide_num} ---\n{slide_data['text']}")
+                        if slide_data.get("notes"):
+                            all_text.append(f"[Notes for Slide {slide_num}]\n{slide_data['notes']}")
+                            result["has_notes"] = True
+                        if slide_data.get("tables"):
+                            for table in slide_data["tables"]:
+                                table["slide_number"] = slide_num
+                                all_tables.append(table)
+                            result["has_tables"] = True
+            else:
+                for slide_num, slide in enumerate(slides_list, start=1):
+                    slide_data = self._extract_slide_content(slide, slide_num)
+                    result["slides"].append(slide_data)
+                    if slide_data.get("text"):
+                        all_text.append(f"--- Slide {slide_num} ---\n{slide_data['text']}")
+                    if slide_data.get("notes"):
+                        all_text.append(f"[Notes for Slide {slide_num}]\n{slide_data['notes']}")
+                        result["has_notes"] = True
+                    if slide_data.get("tables"):
+                        for table in slide_data["tables"]:
+                            table["slide_number"] = slide_num
+                            all_tables.append(table)
+                        result["has_tables"] = True
 
             result["text"] = "\n\n".join(all_text)
             result["tables"] = all_tables
@@ -267,12 +312,110 @@ class PowerPointParser:
         return "\n".join(lines)
 
 
-def parse_pptx(file_path: str) -> Dict[str, Any]:
+def _extract_ppt_fallback(file_path: Path) -> Dict[str, Any]:
     """
-    Convenience function to parse a PowerPoint file.
+    Extract text from a legacy .ppt file using subprocess fallback.
 
     Args:
-        file_path: Path to PowerPoint file (.pptx)
+        file_path: Path to the .ppt file
+
+    Returns:
+        Dictionary with extracted content
+    """
+    import subprocess
+    import shutil
+    import tempfile
+
+    result = {
+        "file_name": file_path.name,
+        "file_path": str(file_path.absolute()),
+        "file_size": file_path.stat().st_size,
+        "text": "",
+        "slides": [],
+        "tables": [],
+        "metadata": {},
+        "file_type": "ppt",
+        "method": "fallback",
+        "slide_count": 0,
+        "has_notes": False,
+        "has_tables": False,
+    }
+
+    # Try converting .ppt to .pptx with LibreOffice, then parse with python-pptx
+    if shutil.which("libreoffice") and PPTX_AVAILABLE:
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                proc = subprocess.run(
+                    ["libreoffice", "--headless", "--convert-to", "pptx", "--outdir", tmp_dir, str(file_path)],
+                    capture_output=True, text=True, timeout=120
+                )
+                if proc.returncode == 0:
+                    pptx_file = Path(tmp_dir) / (file_path.stem + ".pptx")
+                    if pptx_file.exists():
+                        parser = PowerPointParser(pptx_file)
+                        converted = parser.parse()
+                        converted["file_name"] = file_path.name
+                        converted["file_path"] = str(file_path.absolute())
+                        converted["file_size"] = file_path.stat().st_size
+                        converted["file_type"] = "ppt"
+                        converted["method"] = "libreoffice+python-pptx"
+                        return converted
+        except Exception as e:
+            logger.debug(f"libreoffice .ppt conversion failed: {e}")
+
+    text = ""
+
+    # macOS fallback: textutil
+    if shutil.which("textutil"):
+        try:
+            proc = subprocess.run(
+                ["textutil", "-convert", "txt", "-stdout", str(file_path)],
+                capture_output=True, text=True, timeout=60
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                text = proc.stdout
+                result["method"] = "textutil"
+        except Exception as e:
+            logger.debug(f"textutil failed for .ppt: {e}")
+
+    # Plain text fallback with LibreOffice
+    if not text and shutil.which("libreoffice"):
+        try:
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                proc = subprocess.run(
+                    ["libreoffice", "--headless", "--convert-to", "txt:Text", "--outdir", tmp_dir, str(file_path)],
+                    capture_output=True, text=True, timeout=120
+                )
+                if proc.returncode == 0:
+                    txt_file = Path(tmp_dir) / (file_path.stem + ".txt")
+                    if txt_file.exists():
+                        text = txt_file.read_text(encoding="utf-8", errors="replace")
+                        result["method"] = "libreoffice-txt"
+        except Exception as e:
+            logger.debug(f"libreoffice txt conversion failed: {e}")
+
+    if not text:
+        result["error"] = (
+            "Cannot parse legacy .ppt file. Install LibreOffice "
+            "(apt install libreoffice / brew install --cask libreoffice) "
+            "or convert to .pptx format."
+        )
+        logger.error(f"No .ppt extraction tool available for: {file_path}")
+        return result
+
+    result["text"] = text.strip()
+    result["total_chars"] = len(result["text"])
+    result["total_tables"] = 0
+
+    return result
+
+
+def parse_pptx(file_path: str) -> Dict[str, Any]:
+    """
+    Parse a PowerPoint file (.pptx or legacy .ppt).
+
+    Args:
+        file_path: Path to PowerPoint file (.pptx or .ppt)
 
     Returns:
         Dictionary with parsed content
@@ -281,6 +424,30 @@ def parse_pptx(file_path: str) -> Dict[str, Any]:
         >>> result = parse_pptx("pitch_deck.pptx")
         >>> print(f"Extracted {len(result['text'])} characters from {result['slide_count']} slides")
     """
+    file_path_obj = Path(file_path)
+    suffix = file_path_obj.suffix.lower()
+
+    if suffix == ".ppt":
+        logger.info(f"Parsing legacy .ppt: {file_path_obj.name}")
+        return _extract_ppt_fallback(file_path_obj)
+
+    if not PPTX_AVAILABLE:
+        return {
+            "file_name": file_path_obj.name,
+            "file_path": str(file_path_obj.absolute()),
+            "file_size": file_path_obj.stat().st_size,
+            "text": "",
+            "slides": [],
+            "tables": [],
+            "metadata": {},
+            "file_type": "pptx",
+            "method": "none",
+            "error": "python-pptx is not installed. Run: pip install python-pptx",
+            "slide_count": 0,
+            "total_chars": 0,
+            "total_tables": 0,
+        }
+
     parser = PowerPointParser(file_path)
     return parser.parse()
 

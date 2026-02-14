@@ -102,8 +102,11 @@ class PDFParser:
                 result["error"] = "No PDF library available"
                 return result
 
-            # OCR fallback - only trigger when essentially zero text extracted
-            if len(result["text"].strip()) == 0:
+            # OCR fallback - trigger when extracted text is negligible for the document size
+            text_len = len(result["text"].strip())
+            page_count = result.get("page_count", 1) or 1
+            chars_per_page = text_len / page_count
+            if chars_per_page < 50:
                 if use_ocr:
                     logger.info("Low text content detected, attempting OCR...")
                     ocr_text = self._extract_text_with_ocr(max_pages=max_ocr_pages)
@@ -396,7 +399,7 @@ class PDFParser:
             batch_size = 10
             batches = [(s, min(s + batch_size - 1, total_pages))
                        for s in range(1, total_pages + 1, batch_size)]
-            ocr_workers = min(4, len(batches))
+            ocr_workers = min(8, len(batches))
 
             with ThreadPoolExecutor(max_workers=ocr_workers) as executor:
                 futures = [executor.submit(_ocr_page_batch, s, e) for s, e in batches]

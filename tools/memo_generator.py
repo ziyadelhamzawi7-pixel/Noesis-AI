@@ -40,10 +40,14 @@ SECTIONS = [
         "system_prompt": (
             "Write a concise Proposed Investment Terms section for a VC investment memo. "
             "Present the key deal terms in a clean markdown table with two columns (Term, Details). "
-            "Include rows for: Round Type, Investment Amount, Pre-Money Valuation, Post-Money Valuation, "
-            "Investor Ownership %, Investment Vehicle (SAFE/Convertible Note/Priced Round), Key Terms "
-            "(discount, cap, preferences), Investment Date, and Lead Investor if known. "
-            "Only include terms that are found in the data room documents. Keep it factual, no analysis."
+            "Include rows for: Round Type, Total Round Size, Investment Amount, Post-Money Valuation, "
+            "Investor Ownership %, Investment Vehicle (SAFE/Convertible Note/Priced Round), and Lead Investor if known. "
+            "If the analyst provided deal parameters (Investment Amount or Post-Money Valuation), "
+            "use those exact values in the table instead of values from the data room. "
+            "IMPORTANT: Include exactly ONE row for Post-Money Valuation showing only the single latest number. "
+            "Data rooms often contain terms from multiple funding rounds — look at dates, round labels (e.g. Series A vs Seed), "
+            "and document recency to identify the most recent round. Do not list prior-round valuations. "
+            "Only include terms that are found in the data room documents or provided by the analyst. Keep it factual, no analysis."
         ),
         "use_opus": False,
     },
@@ -193,12 +197,66 @@ SECTIONS = [
         "system_prompt": (
             "Write the Investment Recommendation section of a VC investment memo. "
             "Synthesize all the analysis from prior sections into a clear recommendation. "
-            "Cover: investment thesis, key strengths, key concerns, suggested next steps, "
-            "and overall recommendation (invest / pass / more info needed)."
+            "Cover: investment thesis, key strengths, key concerns, "
+            "and overall recommendation (invest / pass / more info needed). "
+            "Do NOT include a 'Suggested Next Steps' subsection."
         ),
         "use_opus": True,
     },
 ]
+
+class SonnetTokenTracker:
+    """
+    Thread-safe tracker for Sonnet API input token usage within a rolling
+    60-second window. Calculates the minimum cooldown needed before making
+    additional Sonnet calls without exceeding the rate limit.
+    """
+
+    WINDOW_SECONDS = 60
+    RATE_LIMIT = 30_000          # input tokens per minute
+    SAFETY_MARGIN_SECONDS = 5
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._calls: List[Tuple[float, int]] = []
+
+    def record(self, input_tokens: int) -> None:
+        """Record a Sonnet API call that just completed."""
+        with self._lock:
+            self._calls.append((time.time(), input_tokens))
+
+    def required_wait(self) -> float:
+        """
+        Return the number of seconds to sleep before the next Sonnet call.
+        Prunes expired entries, then checks if the rolling window has capacity.
+        """
+        with self._lock:
+            now = time.time()
+            cutoff = now - self.WINDOW_SECONDS
+            self._calls = [(ts, tok) for ts, tok in self._calls if ts > cutoff]
+
+            if not self._calls:
+                return 0.0
+
+            total_in_window = sum(tok for _, tok in self._calls)
+            if total_in_window < self.RATE_LIMIT:
+                return 0.0
+
+            # Find the earliest call whose expiry brings us under the limit
+            calls_sorted = sorted(self._calls, key=lambda x: x[0])
+            tokens_to_shed = total_in_window - self.RATE_LIMIT
+            shed = 0
+            wait_until = now
+
+            for ts, tok in calls_sorted:
+                shed += tok
+                wait_until = ts + self.WINDOW_SECONDS
+                if shed >= tokens_to_shed:
+                    break
+
+            wait = wait_until - now + self.SAFETY_MARGIN_SECONDS
+            return max(wait, 0.0)
+
 
 # Model pricing (per 1M tokens)
 PRICING = {
@@ -307,6 +365,7 @@ class MemoGenerator:
         self.total_tokens = 0
         self.total_cost = 0.0
         self._stats_lock = threading.Lock()
+        self._sonnet_tracker = SonnetTokenTracker()
 
     def _get_client(self) -> Anthropic:
         """Get a thread-local Anthropic client (httpx.Client is not thread-safe)."""
@@ -365,12 +424,15 @@ class MemoGenerator:
                     )
                     opus_futures[future] = section_def
 
-                # Cooldown before Sonnet sections if previous phase had Sonnet calls.
-                # Sonnet rate limit is 30,000 input tokens/min — need time for
-                # previous calls to age out of the rolling window.
+                # Smart cooldown: only wait if this phase has Sonnet sections
+                # AND there are recent Sonnet tokens in the rolling window.
                 if phase > 1 and sonnet_sections:
-                    logger.info(f"Rate limit cooldown before phase {phase} Sonnet sections (60s)")
-                    time.sleep(60)
+                    wait = self._sonnet_tracker.required_wait()
+                    if wait > 0:
+                        logger.info(f"Rate limit cooldown before phase {phase} Sonnet sections ({wait:.0f}s)")
+                        time.sleep(wait)
+                    else:
+                        logger.info(f"No cooldown needed before phase {phase} — Sonnet token window has capacity")
 
                 # Run Sonnet sections sequentially (rate limit too low for parallel)
                 for section_def in sonnet_sections:
@@ -639,7 +701,7 @@ class MemoGenerator:
 
         # 4. Build deal parameters context (for outcomes and financial sections)
         deal_context = ""
-        sections_with_deal_params = ["outcome_scenario_analysis", "financial_analysis", "investment_recommendation", "valuation_analysis"]
+        sections_with_deal_params = ["proposed_investment_terms", "outcome_scenario_analysis", "financial_analysis", "investment_recommendation", "valuation_analysis"]
         if deal_params and section_def["key"] in sections_with_deal_params:
             deal_parts = []
             if deal_params.get("ticket_size"):
@@ -683,6 +745,10 @@ Write the "{section_def['label']}" section now."""
         )
         elapsed = time.time() - start
 
+        # Track Sonnet token usage for rate-limit-aware cooldowns
+        if not section_def.get("use_opus"):
+            self._sonnet_tracker.record(input_tokens)
+
         total_tokens = input_tokens + output_tokens
 
         pricing = PRICING.get(model, {"input": 3.0, "output": 15.0})
@@ -712,7 +778,7 @@ Write the "{section_def['label']}" section now."""
             method_instructions.append("""
 ### VC Method
 1. Estimate exit value from projected revenue/ARR at exit (5-7 years) with an appropriate exit multiple
-2. Work backwards to implied pre-money valuation using a target IRR (25-35%)
+2. Work backwards to implied valuation using a target IRR (25-35%)
 3. Provide a valuation range based on different exit scenarios
 """)
 

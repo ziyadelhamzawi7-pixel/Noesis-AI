@@ -10,6 +10,7 @@ Provides reliable job processing with:
 import threading
 import time
 import traceback
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, Any, Callable, Optional
 from loguru import logger
@@ -18,6 +19,15 @@ from app.config import settings
 from app.job_queue import JobQueue, JobType, job_queue
 from app.utils import can_process_file, get_memory_usage_mb
 from app import database as db
+
+
+# In-memory progress tracker to avoid repeated COUNT queries per file completion
+_folder_progress_lock = threading.Lock()
+_folder_progress: Dict[str, Dict[str, int]] = {}  # folder_id → {processed, total}
+
+# In-memory progress tracker for multi-file uploads (same pattern as folder progress)
+_upload_progress_lock = threading.Lock()
+_upload_progress: Dict[str, Dict[str, int]] = {}  # data_room_id → {processed, total}
 
 
 class JobWorker:
@@ -52,6 +62,7 @@ class JobWorker:
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._handlers: Dict[str, Callable] = {}
+        self._indexer = None  # Lazy-initialized VectorDBIndexer, reused across files
 
         # Register default handlers
         self._register_default_handlers()
@@ -162,21 +173,187 @@ class JobWorker:
             logger.error(f"[{job_id}] Job failed: {e}")
             self.queue.fail_job(job_id, error_msg, retry=True)
 
+            # Only mark as permanently failed if no retries remain
+            job_info = self.queue.get_job(job_id)
+            is_permanent_failure = job_info and job_info['status'] == 'failed'
+
+            # Update document parse_status so the sidebar shows failure instead of a spinner
+            document_id = payload.get('document_id')
+            if document_id and is_permanent_failure:
+                db.update_document_status(document_id, 'failed', error_message=str(e)[:500])
+
             # Update synced_file status if this came from Drive sync
             synced_file_id = payload.get('synced_file_id')
-            if synced_file_id:
-                # Only mark as failed if no retries remain
-                job_info = self.queue.get_job(job_id)
-                if job_info and job_info['status'] == 'failed':
-                    db.update_synced_file_status(
-                        synced_file_id,
-                        sync_status='failed',
-                        error_message=str(e)[:500]
-                    )
+            if synced_file_id and is_permanent_failure:
+                db.update_synced_file_status(
+                    synced_file_id,
+                    sync_status='failed',
+                    error_message=str(e)[:500]
+                )
+
+            # Increment progress even for permanent failures so the
+            # completion condition (processed >= total) can still be met.
+            # Without this, a single failed file blocks the entire data room.
+            if is_permanent_failure and payload.get('connected_folder_id'):
+                self._update_folder_progress(payload, payload.get('data_room_id', ''))
+
+            if is_permanent_failure and payload.get('upload_total_files') and payload.get('data_room_id'):
+                self._update_upload_progress(payload['data_room_id'], payload['upload_total_files'])
+
+    # ========================================================================
+    # Folder Progress Tracking
+    # ========================================================================
+
+    def _update_folder_progress(self, payload: Dict[str, Any], data_room_id: str):
+        """
+        Increment folder progress counter and check for completion.
+        Called from both success and permanent-failure paths so that
+        failed files don't prevent the data room from completing.
+        """
+        connected_folder_id = payload.get('connected_folder_id')
+        if not connected_folder_id:
+            return
+
+        with _folder_progress_lock:
+            if connected_folder_id not in _folder_progress:
+                # Initialize from DB — count already-finished files so the counter
+                # survives server restarts (in-memory dict is lost on restart).
+                # Use only enqueued files (complete/failed/queued/processing) as total,
+                # not files stuck in pending/downloading that were never enqueued.
+                already_done = db.count_processed_synced_files(connected_folder_id)
+                total_all = db.count_synced_files_by_status(connected_folder_id)
+                total_enqueued = (
+                    already_done +
+                    db.count_synced_files_by_status(connected_folder_id, 'queued') +
+                    db.count_synced_files_by_status(connected_folder_id, 'processing')
+                )
+                # Use total_all only if all files were enqueued; otherwise use enqueued count
+                # to prevent data room from getting stuck when some files were never enqueued
+                total = total_all if total_enqueued >= total_all else total_enqueued
+                _folder_progress[connected_folder_id] = {'processed': already_done, 'total': total}
+
+            _folder_progress[connected_folder_id]['processed'] += 1
+            processed = _folder_progress[connected_folder_id]['processed']
+            total = _folder_progress[connected_folder_id]['total']
+
+        # Progress: 10-100% range (0-10% reserved for discovery/download phases)
+        progress = (10 + (processed / total) * 90) if total > 0 else 10
+
+        db.update_connected_folder_status(
+            connected_folder_id,
+            sync_status='syncing',
+            processed_files=processed
+        )
+
+        # Update data room progress (monotonically increasing by design).
+        # Skip intermediate 'parsing' update on last file — completion block below
+        # sets 'complete' + 100% atomically, avoiding a race where the frontend
+        # polls and sees status='parsing' at 100%.
+        if data_room_id and processed < total:
+            db.update_data_room_status(data_room_id, 'parsing', progress=progress)
+
+        # Complete when all files are processed (including failures)
+        if processed >= total and total > 0:
+            try:
+                db.update_connected_folder_stage(connected_folder_id, sync_stage='complete')
+            except Exception as e:
+                logger.error(f"Failed to update folder stage to complete: {e}")
+            try:
+                db.update_connected_folder_status(connected_folder_id, sync_status='active', processed_files=processed)
+            except Exception as e:
+                logger.error(f"Failed to update folder status to active: {e}")
+            try:
+                if data_room_id:
+                    db.update_data_room_status(data_room_id, 'complete', progress=100)
+                    doc_count = len(db.get_documents_by_data_room(data_room_id))
+                    with db.get_db_connection() as conn:
+                        conn.execute(
+                            "UPDATE data_rooms SET total_documents = ? WHERE id = ?",
+                            (doc_count, data_room_id)
+                        )
+                        conn.commit()
+            except Exception as e:
+                logger.error(f"Failed to update data room to complete: {e}")
+            # Clean up in-memory tracker
+            with _folder_progress_lock:
+                _folder_progress.pop(connected_folder_id, None)
+
+    # ========================================================================
+    # Upload Progress Tracking (multi-file uploads)
+    # ========================================================================
+
+    def _update_upload_progress(self, data_room_id: str, total_files: int):
+        """
+        Increment upload progress counter and check for completion.
+        Called after each file finishes processing in a multi-file upload.
+        """
+        # Use actual document count as the source of truth for total,
+        # not the declared total_files from the payload.  Files may be
+        # skipped during upload validation (empty, invalid format), so
+        # the declared total can exceed the actual enqueued job count,
+        # causing the data room to never complete.
+        docs = db.get_documents_by_data_room(data_room_id)
+        actual_total = len(docs) if docs else total_files
+
+        with _upload_progress_lock:
+            if data_room_id not in _upload_progress:
+                # Initialize — count already-finished documents so tracker
+                # survives server restarts (in-memory dict is lost on restart).
+                already_done = sum(1 for d in docs if d.get('parse_status') in ('parsed', 'failed'))
+                _upload_progress[data_room_id] = {'processed': already_done, 'total': actual_total}
+            else:
+                # Update total to reflect actual document count in case
+                # more files have been uploaded since initialization.
+                _upload_progress[data_room_id]['total'] = actual_total
+
+            _upload_progress[data_room_id]['processed'] += 1
+            processed = _upload_progress[data_room_id]['processed']
+            total = _upload_progress[data_room_id]['total']
+
+        progress = int(10 + (processed / total) * 90) if total > 0 else 10
+
+        if processed < total:
+            db.update_data_room_status(data_room_id, 'parsing', progress=progress)
+        else:
+            # All files done — check for failures
+            failed_names = [d['file_name'] for d in docs if d.get('parse_status') == 'failed']
+            if failed_names and len(failed_names) == total:
+                error_msg = f"All {total} files failed: {', '.join(failed_names[:5])}"
+                db.update_data_room_status(data_room_id, 'failed', error_message=error_msg)
+            elif failed_names:
+                error_msg = f"{len(failed_names)}/{total} files failed: {', '.join(failed_names[:5])}"
+                db.update_data_room_status(data_room_id, 'complete', progress=100, error_message=error_msg)
+            else:
+                db.update_data_room_status(data_room_id, 'complete', progress=100)
+
+            # Clean up in-memory tracker
+            with _upload_progress_lock:
+                _upload_progress.pop(data_room_id, None)
+
+            logger.success(f"[{data_room_id}] All {total} files processed ({total - len(failed_names)} succeeded, {len(failed_names)} failed)")
 
     # ========================================================================
     # Job Handlers
     # ========================================================================
+
+    def _mark_file_failed(self, payload: Dict[str, Any], data_room_id: str, error_msg: str, page_count: int = 0):
+        """Mark a file as failed and update all progress trackers so the data room can still complete."""
+        if 'document_id' in payload:
+            db.update_document_status(
+                payload['document_id'], 'failed',
+                error_message=error_msg[:500],
+                page_count=page_count,
+            )
+        synced_file_id = payload.get('synced_file_id')
+        if synced_file_id:
+            db.update_synced_file_status(synced_file_id, sync_status='failed', error_message=error_msg[:500])
+        self._update_folder_progress(payload, data_room_id)
+        if not payload.get('connected_folder_id'):
+            upload_total = payload.get('upload_total_files')
+            if upload_total and upload_total > 1 and data_room_id:
+                self._update_upload_progress(data_room_id, upload_total)
+            elif data_room_id:
+                db.update_data_room_status(data_room_id, 'complete', progress=100)
 
     def _handle_process_file(self, payload: Dict[str, Any]):
         """
@@ -200,9 +377,7 @@ class JobWorker:
             raise MemoryError(error)
 
         # Import processing tools
-        from tools.parse_pdf import parse_pdf
-        from tools.parse_excel_financial import parse_excel_financial
-        from tools.parse_pptx import parse_pptx
+        from tools.ingest_data_room import parse_file_by_type
         from tools.chunk_documents import chunk_documents
         from tools.generate_embeddings import generate_embeddings, generate_embeddings_streaming
         from tools.index_to_vectordb import index_to_vectordb, VectorDBIndexer
@@ -213,87 +388,119 @@ class JobWorker:
         # Parse document with timeout to prevent hanging
         from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 
-        def _parse_file(fpath, ftype, fname):
-            if ftype == '.pdf':
-                return parse_pdf(fpath, use_ocr=True, max_ocr_pages=settings.max_ocr_pages)
-            elif ftype in ['.xlsx', '.xls']:
-                return parse_excel_financial(fpath)
-            elif ftype in ['.pptx']:
-                return parse_pptx(fpath)
-            elif ftype == '.csv':
-                import pandas as pd
-                df = pd.read_csv(fpath)
-                return {
-                    'file_name': fname,
-                    'file_type': 'csv',
-                    'text': df.to_string(),
-                    'sheets': [{'sheet_name': 'data', 'data': df.to_dict()}]
-                }
-            elif ftype in ['.docx', '.doc']:
-                from docx import Document
-                doc = Document(fpath)
-                text_content = "\n\n".join([p.text for p in doc.paragraphs if p.text.strip()])
-                return {
-                    'file_name': fname,
-                    'file_type': 'docx',
-                    'text': text_content,
-                    'page_count': 1,
-                    'pages': [{'page_number': 1, 'text': text_content}]
-                }
-            else:
-                raise ValueError(f"Unsupported file type: {ftype}")
-
         # Update data room status to parsing
-        if data_room_id:
+        # Skip for folder syncs (folder-level progress handles it) and
+        # multi-file uploads (proportional progress in _update_upload_progress handles it).
+        is_multi_file = payload.get('upload_total_files', 0) > 1
+        if data_room_id and not payload.get('connected_folder_id') and not is_multi_file:
             db.update_data_room_status(data_room_id, 'parsing', progress=25)
 
-        logger.info(f"[{data_room_id}] Parsing {file_name} (timeout: {settings.parse_timeout_seconds}s, workers: {settings.max_parse_workers})...")
-        with ThreadPoolExecutor(max_workers=settings.max_parse_workers) as parse_executor:
-            future = parse_executor.submit(_parse_file, str(file_path), file_type, file_name)
+        logger.info(f"[{data_room_id}] Parsing {file_name} (timeout: {settings.parse_timeout_seconds}s)...")
+        with ThreadPoolExecutor(max_workers=1) as parse_executor:
+            future = parse_executor.submit(
+                parse_file_by_type,
+                str(file_path),
+                True,  # use_ocr
+                settings.max_ocr_pages,
+                True,  # use_financial_excel
+            )
             try:
                 parsed = future.result(timeout=settings.parse_timeout_seconds)
             except FuturesTimeoutError:
                 raise TimeoutError(f"Parsing timed out after {settings.parse_timeout_seconds}s")
 
+        # Check if parser returned an error (e.g., encrypted PDF, invalid header, empty file)
+        parse_error = parsed.get('error')
+        if parse_error:
+            error_msg = f"Parse error: {parse_error}"
+            logger.error(f"[{data_room_id}] {file_name}: {error_msg}")
+            self._mark_file_failed(payload, data_room_id, error_msg, page_count=parsed.get('page_count', 0))
+            return  # Deterministic error — no point retrying; _mark_file_failed already updated progress
+
         # Chunk document
         logger.info(f"[{data_room_id}] Chunking {file_name}...")
-        chunks = chunk_documents(parsed)
+        chunks = chunk_documents(parsed, chunk_size=settings.max_chunk_size, overlap=settings.chunk_overlap)
+
+        indexed_count = 0
+        total_token_count = 0
 
         if not chunks:
-            logger.warning(f"[{data_room_id}] No chunks generated for {file_name}")
+            error_msg = f"No text could be extracted from {file_name}. The document may be image-only, empty, or in an unsupported format."
+            logger.error(f"[{data_room_id}] {error_msg}")
+            self._mark_file_failed(payload, data_room_id, error_msg, page_count=parsed.get('page_count', 0))
+            return  # Deterministic error — no point retrying; _mark_file_failed already updated progress
+        else:
+            # Update data room status to embedding
+            # Skip for folder syncs and multi-file uploads (same reason as parsing above).
+            if data_room_id and not payload.get('connected_folder_id') and not is_multi_file:
+                db.update_data_room_status(data_room_id, 'indexing', progress=50)
+
+            # Generate embeddings with streaming (embed + index in parallel)
+            logger.info(f"[{data_room_id}] Streaming embeddings for {len(chunks)} chunks (batch_size={settings.batch_size}, max_concurrent={settings.embedding_max_concurrent})...")
+
+            document_id = payload.get('document_id')
+            if self._indexer is None:
+                self._indexer = VectorDBIndexer()
+            indexer = self._indexer
+            write_pool = ThreadPoolExecutor(max_workers=10)
+
+            try:
+                pending_futures = []
+                for batch in generate_embeddings_streaming(
+                    chunks,
+                    batch_size=settings.batch_size,
+                    max_concurrent=settings.embedding_max_concurrent
+                ):
+                    # Add document metadata to batch
+                    for chunk in batch:
+                        chunk['document_id'] = document_id
+                        chunk['data_room_id'] = data_room_id
+
+                    # Track token count incrementally (no need to accumulate all chunks)
+                    total_token_count += sum(c.get('token_count', 0) for c in batch)
+
+                    # Pipeline VectorDB and DB writes — don't block between batches
+                    # The write_pool's workers naturally limit concurrency
+                    vector_future = write_pool.submit(index_to_vectordb, data_room_id, batch, indexer=indexer)
+                    db_future = write_pool.submit(db.create_chunks_batch_optimized, batch)
+                    pending_futures.append((vector_future, db_future))
+
+                    indexed_count += len(batch)
+                    logger.debug(f"[{data_room_id}] Indexed batch: {indexed_count}/{len(chunks)} chunks")
+
+                    # Sub-file progress: interpolate within this file's slice so the
+                    # progress bar moves during large-file embedding, not just at file boundaries.
+                    if not payload.get('connected_folder_id') and payload.get('upload_total_files', 0) > 1:
+                        upload_total = payload['upload_total_files']
+                        with _upload_progress_lock:
+                            base = _upload_progress.get(data_room_id, {}).get('processed', 0)
+                        file_frac = indexed_count / len(chunks)
+                        overall = 10 + ((base + file_frac) / upload_total) * 90
+                        db.update_data_room_status(data_room_id, 'parsing', progress=int(min(overall, 99)))
+
+                # Wait for all pipelined writes to complete (with timeout to prevent hangs)
+                WRITE_TIMEOUT = 120  # seconds
+                for v_fut, d_fut in pending_futures:
+                    try:
+                        v_fut.result(timeout=WRITE_TIMEOUT)
+                    except (TimeoutError, FuturesTimeoutError):
+                        raise TimeoutError(f"VectorDB write timed out after {WRITE_TIMEOUT}s for {file_name}")
+                    try:
+                        d_fut.result(timeout=WRITE_TIMEOUT)
+                    except (TimeoutError, FuturesTimeoutError):
+                        raise TimeoutError(f"Database write timed out after {WRITE_TIMEOUT}s for {file_name}")
+            finally:
+                write_pool.shutdown(wait=True)
+
+        # Validate embedding results — fail if all embeddings failed
+        failed_embedding_count = sum(1 for c in chunks if c.get('embedding_failed'))
+        if failed_embedding_count == len(chunks):
+            error_msg = f"All {len(chunks)} chunks failed embedding generation for {file_name}"
+            logger.error(f"[{data_room_id}] {error_msg}")
+            self._mark_file_failed(payload, data_room_id, error_msg, page_count=parsed.get('page_count', 0))
             return
-
-        # Update data room status to embedding
-        if data_room_id:
-            db.update_data_room_status(data_room_id, 'indexing', progress=50)
-
-        # Generate embeddings with streaming (embed + index in parallel)
-        logger.info(f"[{data_room_id}] Streaming embeddings for {len(chunks)} chunks (batch_size={settings.batch_size}, max_concurrent={settings.embedding_max_concurrent})...")
-
-        document_id = payload.get('document_id')
-        indexer = VectorDBIndexer()
-        chunks_with_embeddings = []
-        indexed_count = 0
-
-        for batch in generate_embeddings_streaming(
-            chunks,
-            batch_size=settings.batch_size,
-            max_concurrent=settings.embedding_max_concurrent
-        ):
-            # Add document metadata to batch
-            for chunk in batch:
-                chunk['document_id'] = document_id
-                chunk['data_room_id'] = data_room_id
-
-            # Index batch immediately as it completes
-            index_to_vectordb(data_room_id, batch, indexer=indexer)
-
-            # Save batch to database
-            db.create_chunks(batch)
-
-            chunks_with_embeddings.extend(batch)
-            indexed_count += len(batch)
-            logger.debug(f"[{data_room_id}] Indexed batch: {indexed_count}/{len(chunks)} chunks")
+        elif failed_embedding_count > 0:
+            logger.warning(f"[{data_room_id}] {failed_embedding_count}/{len(chunks)} chunks failed embedding for {file_name}")
 
         # Update document status
         if 'document_id' in payload:
@@ -301,7 +508,7 @@ class JobWorker:
                 payload['document_id'],
                 'parsed',
                 page_count=parsed.get('page_count', 0),
-                token_count=sum(c.get('token_count', 0) for c in chunks_with_embeddings)
+                token_count=total_token_count
             )
 
         # Update synced_file status if this came from Drive sync
@@ -313,41 +520,19 @@ class JobWorker:
                 document_id=payload.get('document_id')
             )
 
-        # Update folder progress (count complete + failed as processed)
-        connected_folder_id = payload.get('connected_folder_id')
-        if connected_folder_id:
-            # This is a folder sync - track progress
-            completed = db.count_synced_files_by_status(connected_folder_id, 'complete')
-            failed = db.count_synced_files_by_status(connected_folder_id, 'failed')
-            processed = completed + failed
-            total = db.count_synced_files_by_status(connected_folder_id)
+        # Update folder progress
+        self._update_folder_progress(payload, data_room_id)
 
-            # Calculate progress percentage for data room
-            progress = (processed / total * 100) if total > 0 else 0
-
-            db.update_connected_folder_status(
-                connected_folder_id,
-                sync_status='syncing',
-                processed_files=processed
-            )
-
-            # Update data room progress (but NOT to 'complete' yet)
-            if data_room_id:
-                db.update_data_room_status(data_room_id, 'parsing', progress=progress)
-
-            # Only set to complete when ALL files are processed
-            if processed >= total and total > 0:
-                db.update_connected_folder_stage(connected_folder_id, sync_stage='complete')
-                db.update_connected_folder_status(connected_folder_id, sync_status='active', processed_files=processed)
-                # NOW set data room to complete
-                if data_room_id:
-                    db.update_data_room_status(data_room_id, 'complete', progress=100)
-        else:
-            # Individual file connection (not from folder) - mark complete immediately
-            if data_room_id:
+        if not payload.get('connected_folder_id'):
+            upload_total = payload.get('upload_total_files')
+            if upload_total and upload_total > 1 and data_room_id:
+                # Multi-file upload: track progress and only complete when all files are done
+                self._update_upload_progress(data_room_id, upload_total)
+            elif data_room_id:
+                # Single file or individual Drive file connection — mark complete immediately
                 db.update_data_room_status(data_room_id, 'complete', progress=100)
 
-        logger.success(f"[{data_room_id}] File {file_name} processed: {len(chunks_with_embeddings)} chunks")
+        logger.success(f"[{data_room_id}] File {file_name} processed: {indexed_count} chunks")
 
         # Auto-trigger financial analysis for Excel files if enabled
         if file_type in ['.xlsx', '.xls'] and settings.enable_auto_financial_analysis:
@@ -414,6 +599,10 @@ class JobWorker:
         max_parallel_files = min(len(file_paths), settings.max_parse_workers)
         logger.info(f"[{data_room_id}] Processing {len(file_paths)} files in parallel (max {max_parallel_files} concurrent)")
 
+        succeeded = 0
+        failed = 0
+        failed_names = []
+
         with ThreadPoolExecutor(max_workers=max_parallel_files) as executor:
             futures = {
                 executor.submit(self._handle_process_file, {
@@ -424,19 +613,33 @@ class JobWorker:
                 for file_path in file_paths
             }
 
-            completed = 0
             for future in as_completed(futures):
                 file_path = futures[future]
-                completed += 1
                 try:
                     future.result()
-                    logger.info(f"[{data_room_id}] Completed {completed}/{len(file_paths)}: {Path(file_path).name}")
+                    succeeded += 1
+                    logger.info(f"[{data_room_id}] Completed {succeeded + failed}/{len(file_paths)}: {Path(file_path).name}")
                 except Exception as e:
+                    failed += 1
+                    failed_names.append(Path(file_path).name)
                     logger.error(f"[{data_room_id}] Failed to process {file_path}: {e}")
 
-        # Update data room status
-        db.update_data_room_status(data_room_id, "complete", progress=100)
-        logger.success(f"[{data_room_id}] Data room processing complete")
+        # Determine final status based on results
+        if succeeded == 0 and failed > 0:
+            error_msg = f"All {failed} files failed processing: {', '.join(failed_names[:5])}"
+            if len(failed_names) > 5:
+                error_msg += f" (and {len(failed_names) - 5} more)"
+            db.update_data_room_status(data_room_id, "failed", error_message=error_msg)
+            logger.error(f"[{data_room_id}] Data room processing FAILED: {error_msg}")
+        elif failed > 0:
+            error_msg = f"{failed}/{len(file_paths)} files failed: {', '.join(failed_names[:5])}"
+            if len(failed_names) > 5:
+                error_msg += f" (and {len(failed_names) - 5} more)"
+            db.update_data_room_status(data_room_id, "complete", progress=100, error_message=error_msg)
+            logger.warning(f"[{data_room_id}] Data room processing completed with errors: {error_msg}")
+        else:
+            db.update_data_room_status(data_room_id, "complete", progress=100)
+            logger.success(f"[{data_room_id}] Data room processing complete")
 
     def _handle_generate_embeddings(self, payload: Dict[str, Any]):
         """
@@ -461,11 +664,12 @@ class JobWorker:
             max_concurrent=settings.embedding_max_concurrent
         )
 
-        # Index immediately
-        index_to_vectordb(data_room_id, chunks_with_embeddings)
-
-        # Save to database
-        db.create_chunks(chunks_with_embeddings)
+        # Run VectorDB and DB writes in parallel
+        with ThreadPoolExecutor(max_workers=6) as write_pool:
+            vector_future = write_pool.submit(index_to_vectordb, data_room_id, chunks_with_embeddings)
+            db_future = write_pool.submit(db.create_chunks_batch_optimized, chunks_with_embeddings)
+            vector_future.result()
+            db_future.result()
 
         logger.success(f"[{data_room_id}] Embeddings generated and indexed")
 
@@ -474,7 +678,7 @@ class WorkerPool:
     """
     Auto-scaling pool of job workers for concurrent processing.
 
-    Tier 3 Features:
+    Tier 4 Features:
     - Automatic scaling based on queue depth
     - Memory-aware scaling (pause if memory is tight)
     - Configurable min/max workers
@@ -566,14 +770,28 @@ class WorkerPool:
         return False
 
     def _scaling_monitor(self):
-        """Monitor queue depth and scale workers."""
+        """Monitor queue depth, replace dead workers, and scale pool."""
         while not self._stop_event.is_set():
             try:
                 # Get queue statistics
                 stats = job_queue.get_queue_stats()
                 pending = stats.get("pending", 0)
                 running = stats.get("running", 0)
-                current_workers = len(self.workers)
+
+                # Replace dead workers — threads can die from segfaults in
+                # native libraries (PyMuPDF, etc.) without raising a Python
+                # exception.  Without this check, dead workers stay in the
+                # list and block scaling.
+                with self._scaling_lock:
+                    alive = [w for w in self.workers if w.is_running]
+                    dead_count = len(self.workers) - len(alive)
+                    if dead_count > 0:
+                        logger.warning(f"Detected {dead_count} dead workers, replacing them")
+                        self.workers = alive
+                        for _ in range(dead_count):
+                            self._add_worker()
+
+                    current_workers = len(self.workers)
 
                 # Check memory before scaling up
                 memory_ok = True

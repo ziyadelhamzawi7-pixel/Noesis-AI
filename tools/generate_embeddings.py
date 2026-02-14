@@ -93,7 +93,7 @@ class EmbeddingGenerator:
         self.batch_size = batch_size
         self.max_retries = max_retries
         self.max_concurrent = max_concurrent
-        self.max_tokens_per_request = 280_000  # 20K margin under OpenAI's 300K limit
+        self.max_tokens_per_request = 250_000  # 50K margin under OpenAI's 300K limit (token estimation can undercount)
 
         # Tier 3 features
         self.use_rate_limiter = use_rate_limiter and TIER3_ENABLED
@@ -380,6 +380,15 @@ class EmbeddingGenerator:
                     await asyncio.sleep(wait_time)
                     continue
 
+                # Don't retry deterministic 400 errors (e.g., max_tokens_per_request)
+                if "400" in error_str or "bad request" in error_str:
+                    logger.error(f"Deterministic API error, not retrying: {e}")
+                    if self.use_circuit_breaker:
+                        openai_circuit._record_failure(e)
+                    if TIER3_ENABLED:
+                        record_embedding_batch(0, len(texts), 0, False)
+                    return None
+
                 # Report failure to circuit breaker
                 if self.use_circuit_breaker:
                     openai_circuit._record_failure(e)
@@ -560,6 +569,15 @@ class EmbeddingGenerator:
                     time.sleep(wait_time)
                     continue
 
+                # Don't retry deterministic 400 errors (e.g., max_tokens_per_request)
+                if "400" in error_str or "bad request" in error_str:
+                    logger.error(f"Deterministic API error, not retrying: {e}")
+                    if self.use_circuit_breaker:
+                        openai_circuit._record_failure(e)
+                    if TIER3_ENABLED:
+                        record_embedding_batch(0, len(texts), 0, False)
+                    return None
+
                 # Report failure to circuit breaker
                 if self.use_circuit_breaker:
                     openai_circuit._record_failure(e)
@@ -639,7 +657,8 @@ def generate_embeddings(
         api_key=api_key,
         model=model,
         batch_size=batch_size,
-        max_concurrent=max_concurrent
+        max_concurrent=max_concurrent,
+        use_circuit_breaker=False  # Batch processing relies on retry logic; circuit breaker causes cascade failures
     )
 
     return generator.generate(chunks, parallel=parallel)
@@ -684,7 +703,8 @@ def generate_embeddings_streaming(
         api_key=api_key,
         model=model,
         batch_size=batch_size,
-        max_concurrent=max_concurrent
+        max_concurrent=max_concurrent,
+        use_circuit_breaker=False  # Batch processing relies on retry logic; circuit breaker causes cascade failures
     )
 
     # Split chunks into batches

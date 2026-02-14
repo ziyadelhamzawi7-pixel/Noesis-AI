@@ -7,6 +7,7 @@ import Layout from './components/Layout';
 import GoogleDriveBrowser from './components/GoogleDriveBrowser';
 // import ConnectedFolders from './components/ConnectedFolders'; // Preserved for rollback
 import AuthCallback from './components/AuthCallback';
+import ErrorBoundary from './components/ErrorBoundary';
 
 function App() {
   const [currentDataRoomId, setCurrentDataRoomId] = useState<string | null>(null);
@@ -14,6 +15,7 @@ function App() {
   return (
     <BrowserRouter>
       <Layout>
+        <ErrorBoundary fullPage>
         <Routes>
           <Route path="/" element={<DataRoomList onSelect={setCurrentDataRoomId} />} />
           <Route path="/upload" element={<UploadPage onSuccess={setCurrentDataRoomId} />} />
@@ -27,6 +29,7 @@ function App() {
           <Route path="/auth/callback" element={<AuthCallback />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
+        </ErrorBoundary>
       </Layout>
     </BrowserRouter>
   );

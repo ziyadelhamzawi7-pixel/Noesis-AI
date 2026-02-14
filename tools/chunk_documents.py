@@ -254,6 +254,20 @@ class DocumentChunker:
                     )
                     all_chunks.extend(table_chunks)
 
+        # Handle other documents with text content (PPTX, DOCX, TXT, etc.)
+        elif parsed_doc.get('text'):
+            chunks = self.chunk_text(
+                text=parsed_doc['text'],
+                metadata={
+                    'file_name': parsed_doc.get('file_name'),
+                    'file_path': parsed_doc.get('file_path'),
+                    'file_type': parsed_doc.get('file_type', parsed_doc.get('method', 'unknown')),
+                    'page_count': parsed_doc.get('page_count') or parsed_doc.get('slide_count'),
+                    'document_id': str(uuid.uuid4())
+                }
+            )
+            all_chunks.extend(chunks)
+
         # Handle Excel documents
         elif 'sheets' in parsed_doc:
             detected_currency = parsed_doc.get('model_structure', {}).get('base_currency', None)
@@ -704,7 +718,7 @@ class DocumentChunker:
             return []
 
 
-def chunk_documents(parsed_doc: Dict[str, Any], chunk_size: int = 800, overlap: int = 100) -> List[Dict[str, Any]]:
+def chunk_documents(parsed_doc: Dict[str, Any], chunk_size: int = 800, overlap: int = 100, chunker: 'DocumentChunker | None' = None) -> List[Dict[str, Any]]:
     """
     Convenience function to chunk a parsed document.
 
@@ -712,6 +726,7 @@ def chunk_documents(parsed_doc: Dict[str, Any], chunk_size: int = 800, overlap: 
         parsed_doc: Parsed document from parse_pdf or parse_excel
         chunk_size: Target chunk size in tokens
         overlap: Overlap between chunks in tokens
+        chunker: Optional pre-created DocumentChunker instance for reuse across files
 
     Returns:
         List of chunks with metadata
@@ -722,7 +737,8 @@ def chunk_documents(parsed_doc: Dict[str, Any], chunk_size: int = 800, overlap: 
         >>> chunks = chunk_documents(parsed, chunk_size=800)
         >>> print(f"Created {len(chunks)} chunks")
     """
-    chunker = DocumentChunker(chunk_size=chunk_size, overlap=overlap)
+    if chunker is None:
+        chunker = DocumentChunker(chunk_size=chunk_size, overlap=overlap)
     return chunker.chunk_document(parsed_doc)
 
 

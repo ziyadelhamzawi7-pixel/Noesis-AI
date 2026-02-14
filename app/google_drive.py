@@ -17,6 +17,7 @@ from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from loguru import logger
 
+from app.config import settings
 from app.google_oauth import google_oauth_service
 
 
@@ -131,6 +132,39 @@ class GoogleDriveService:
             logger.warning(f"Could not resolve shortcut {file_id}: {e}")
             return file_id
 
+    def list_shared_drives(self, page_size: int = 100) -> List[Dict[str, Any]]:
+        """
+        List all Shared Drives (Team Drives) the user has access to.
+
+        Args:
+            page_size: Number of drives per page
+
+        Returns:
+            List of shared drives with id and name
+        """
+        try:
+            drives = []
+            page_token = None
+
+            while True:
+                result = self.service.drives().list(
+                    pageSize=page_size,
+                    pageToken=page_token,
+                    fields="nextPageToken, drives(id, name)"
+                ).execute()
+
+                drives.extend(result.get('drives', []))
+                page_token = result.get('nextPageToken')
+                if not page_token:
+                    break
+
+            logger.info(f"Listed {len(drives)} shared drives")
+            return drives
+
+        except HttpError as e:
+            logger.error(f"Failed to list shared drives: {e}")
+            raise
+
     def list_files(
         self,
         folder_id: Optional[str] = None,
@@ -161,7 +195,37 @@ class GoogleDriveService:
             # Resolve folder_id if it's a shortcut (shortcuts point to another folder)
             resolved_folder_id = self._resolve_shortcut(folder_id) if folder_id else None
 
-            if view_mode == "shared_with_me":
+            if view_mode == "shared_drives":
+                if resolved_folder_id:
+                    # Navigating inside a Shared Drive - query by parent
+                    query_parts.append(f"'{resolved_folder_id}' in parents")
+                else:
+                    # Root level: return the list of Shared Drives as folder entries
+                    shared_drives = self.list_shared_drives()
+                    drive_files = []
+                    for drive in shared_drives:
+                        drive_files.append({
+                            'id': drive['id'],
+                            'name': drive['name'],
+                            'mimeType': 'application/vnd.google-apps.folder',
+                            'isFolder': True,
+                            'isSupported': True,
+                            'size': None,
+                            'modifiedTime': None,
+                            'webViewLink': None,
+                            'iconLink': None,
+                            'extension': '',
+                            'ownerEmail': None,
+                            'sharedByEmail': None,
+                            'shortcutTargetId': None
+                        })
+                    logger.info(f"Listed {len(drive_files)} shared drives as folders")
+                    return {
+                        'files': drive_files,
+                        'nextPageToken': None,
+                        'totalFiles': len(drive_files)
+                    }
+            elif view_mode == "shared_with_me":
                 if resolved_folder_id:
                     # Navigating INTO a shared folder - query by parent
                     query_parts.append(f"'{resolved_folder_id}' in parents")
@@ -373,7 +437,7 @@ class GoogleDriveService:
             response.raise_for_status()
 
             with open(str(dest_path), 'wb') as f:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in response.iter_content(chunk_size=settings.drive_download_chunk_size):
                     f.write(chunk)
 
             logger.info(f"Downloaded file: {file_name} -> {dest_path}")
@@ -438,7 +502,7 @@ class GoogleDriveService:
             logger.error(f"Failed to download file to bytes: {e}")
             raise
 
-    def download_file_to_disk(self, file_id: str, destination_path: str, chunk_size: int = 65536) -> Dict[str, Any]:
+    def download_file_to_disk(self, file_id: str, destination_path: str, chunk_size: int = settings.drive_download_chunk_size) -> Dict[str, Any]:
         """
         Stream-download a file from Google Drive to disk, returning metadata.
         Unlike download_file_to_bytes, this never loads the full file into memory.
@@ -575,7 +639,11 @@ class GoogleDriveService:
         """
         subfolders = []
         files = []
+        skipped_files = []
         total_size = 0
+
+        # Extension-based fallback for files with generic/wrong MIME types
+        SUPPORTED_EXTENSIONS = {'.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt'}
 
         # Resolve folder_id if it's a shortcut
         resolved_folder_id = self._resolve_shortcut(folder_id)
@@ -588,10 +656,9 @@ class GoogleDriveService:
 
                 result = self.service.files().list(
                     q=query,
-                    pageSize=100,
+                    pageSize=1000,
                     pageToken=page_token,
                     fields=fields,
-                    orderBy="name",
                     supportsAllDrives=True,
                     includeItemsFromAllDrives=True
                 ).execute()
@@ -616,8 +683,9 @@ class GoogleDriveService:
                             'name': file['name']
                         })
                     else:
-                        # Check if file type is supported
-                        is_supported = mime_type in SUPPORTED_MIME_TYPES
+                        # Check if file type is supported (by MIME type or file extension)
+                        file_ext = os.path.splitext(file['name'])[1].lower()
+                        is_supported = mime_type in SUPPORTED_MIME_TYPES or file_ext in SUPPORTED_EXTENSIONS
                         if not supported_only or is_supported:
                             file_size = int(file.get('size', 0)) if file.get('size') else 0
                             files.append({
@@ -628,6 +696,9 @@ class GoogleDriveService:
                                 'modifiedTime': file.get('modifiedTime')
                             })
                             total_size += file_size
+                        elif supported_only:
+                            skipped_files.append({'name': file['name'], 'mimeType': mime_type})
+                            logger.debug(f"Skipping unsupported file: {file['name']} (mime={mime_type})")
 
                 page_token = result.get('nextPageToken')
                 if not page_token:
@@ -641,7 +712,9 @@ class GoogleDriveService:
             'subfolders': subfolders,
             'files': files,
             'file_count': len(files),
-            'total_size': total_size
+            'total_size': total_size,
+            'skipped_files': skipped_files,
+            'skipped_count': len(skipped_files),
         }
 
     def watch_folder(self, folder_id: str, webhook_url: str) -> Dict[str, Any]:

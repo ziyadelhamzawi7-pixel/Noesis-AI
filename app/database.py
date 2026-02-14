@@ -305,6 +305,109 @@ def run_migrations():
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_drm_data_room ON data_room_members(data_room_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_drm_user ON data_room_members(user_id)")
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_drm_email ON data_room_members(invited_email)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_drm_access ON data_room_members(data_room_id, status, user_id, invited_email)")
+
+            # Create memo_chat_messages table for memo chat feature
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memo_chat_messages (
+                    id TEXT PRIMARY KEY,
+                    memo_id TEXT NOT NULL,
+                    data_room_id TEXT NOT NULL,
+                    role TEXT CHECK(role IN ('user', 'assistant')) NOT NULL,
+                    content TEXT NOT NULL,
+                    updated_section_key TEXT,
+                    updated_section_content TEXT,
+                    tokens_used INTEGER DEFAULT 0,
+                    cost REAL DEFAULT 0.0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (data_room_id) REFERENCES data_rooms(id) ON DELETE CASCADE
+                )
+            """)
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mcm_memo ON memo_chat_messages(memo_id)")
+            cursor.execute("CREATE INDEX IF NOT EXISTS idx_mcm_data_room ON memo_chat_messages(data_room_id)")
+
+            # Migration: Add missing memo columns for existing databases
+            cursor.execute("PRAGMA table_info(memos)")
+            memo_columns = {col[1] for col in cursor.fetchall()}
+            memo_additions = {
+                'proposed_investment_terms': 'TEXT',
+                'valuation_analysis': 'TEXT',
+                'ticket_size': 'REAL',
+                'post_money_valuation': 'REAL',
+                'valuation_methods': 'TEXT',
+            }
+            for col_name, col_type in memo_additions.items():
+                if col_name not in memo_columns:
+                    cursor.execute(f"ALTER TABLE memos ADD COLUMN {col_name} {col_type}")
+                    logger.info(f"Added {col_name} column to memos table")
+
+            # Migration: Deduplicate documents and add UNIQUE(data_room_id, file_name)
+            # Check if the unique index already exists
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_documents_unique_file'")
+            if not cursor.fetchone():
+                # Deduplicate: keep the record with best parse_status for each (data_room_id, file_name)
+                cursor.execute("""
+                    SELECT data_room_id, file_name, COUNT(*) as cnt
+                    FROM documents
+                    GROUP BY data_room_id, file_name
+                    HAVING cnt > 1
+                """)
+                dup_groups = cursor.fetchall()
+                if dup_groups:
+                    total_removed = 0
+                    for dup in dup_groups:
+                        dr_id = dup[0]
+                        fname = dup[1]
+                        # Keep the one with best status; among ties, keep latest
+                        cursor.execute("""
+                            SELECT id FROM documents
+                            WHERE data_room_id = ? AND file_name = ?
+                            ORDER BY
+                                CASE parse_status
+                                    WHEN 'parsed' THEN 1
+                                    WHEN 'parsing' THEN 2
+                                    WHEN 'failed' THEN 3
+                                    WHEN 'pending' THEN 4
+                                END,
+                                uploaded_at DESC
+                            LIMIT 1
+                        """, (dr_id, fname))
+                        keep_row = cursor.fetchone()
+                        if keep_row:
+                            keep_id = keep_row[0]
+                            cursor.execute(
+                                "DELETE FROM documents WHERE data_room_id = ? AND file_name = ? AND id != ?",
+                                (dr_id, fname, keep_id)
+                            )
+                            total_removed += cursor.rowcount
+                    logger.info(f"Deduplicated documents: removed {total_removed} duplicate records")
+
+                    # Clean up orphaned chunks referencing deleted documents
+                    cursor.execute("DELETE FROM chunks WHERE document_id NOT IN (SELECT id FROM documents)")
+                    orphaned_chunks = cursor.rowcount
+                    if orphaned_chunks:
+                        logger.info(f"Cleaned up {orphaned_chunks} orphaned chunks from deduplication")
+
+                # Now safe to create the unique index
+                cursor.execute("""
+                    CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_unique_file
+                    ON documents(data_room_id, file_name)
+                """)
+                logger.info("Created UNIQUE index on documents(data_room_id, file_name)")
+
+            # Migration: Un-own upload-based data rooms so they're accessible without login
+            # Drive-connected data rooms (which have connected_folders entries) keep their owners
+            cursor.execute("""
+                UPDATE data_rooms SET user_id = NULL
+                WHERE user_id IS NOT NULL
+                AND id NOT IN (
+                    SELECT DISTINCT data_room_id FROM connected_folders
+                    WHERE data_room_id IS NOT NULL
+                )
+            """)
+            unowned = cursor.rowcount
+            if unowned > 0:
+                logger.info(f"Made {unowned} upload-based data rooms accessible as legacy (cleared user_id)")
 
             conn.commit()
             logger.info("Database migrations completed successfully")
@@ -394,7 +497,9 @@ def update_data_room_status(
     status: str,
     progress: Optional[float] = None,
     completed_at: Optional[str] = None,
-    error_message: Optional[str] = None
+    error_message: Optional[str] = None,
+    total_chunks: Optional[int] = None,
+    total_documents: Optional[int] = None
 ) -> bool:
     """
     Update data room processing status.
@@ -405,6 +510,8 @@ def update_data_room_status(
         progress: Progress percentage (0-100)
         completed_at: Completion timestamp
         error_message: Error message if status is 'failed'
+        total_chunks: Total number of indexed chunks
+        total_documents: Total number of processed documents
 
     Returns:
         True if updated successfully
@@ -417,7 +524,11 @@ def update_data_room_status(
         values = [status]
 
         if progress is not None:
-            fields.append("progress_percent = ?")
+            # Enforce monotonic progress — never decrease (except reset to 0 for reprocessing)
+            if progress == 0:
+                fields.append("progress_percent = ?")
+            else:
+                fields.append("progress_percent = MAX(COALESCE(progress_percent, 0), ?)")
             values.append(progress)
 
         if completed_at is not None:
@@ -427,6 +538,14 @@ def update_data_room_status(
         if error_message is not None:
             fields.append("error_message = ?")
             values.append(error_message)
+
+        if total_chunks is not None:
+            fields.append("total_chunks = ?")
+            values.append(total_chunks)
+
+        if total_documents is not None:
+            fields.append("total_documents = ?")
+            values.append(total_documents)
 
         values.append(data_room_id)
 
@@ -499,7 +618,8 @@ def list_data_rooms(limit: int = 50) -> List[Dict[str, Any]]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            SELECT * FROM data_rooms
+            SELECT *
+            FROM data_rooms
             ORDER BY created_at DESC
             LIMIT ?
         """, (limit,))
@@ -775,13 +895,24 @@ def create_document(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT INTO documents (
+            INSERT OR IGNORE INTO documents (
                 id, data_room_id, file_name, file_path,
                 file_size, file_type, parse_status
             ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
         """, (document_id, data_room_id, file_name, file_path,
               file_size, file_type))
         conn.commit()
+
+        # If insert was ignored (duplicate), return the existing ID
+        if cursor.rowcount == 0:
+            cursor.execute(
+                "SELECT id FROM documents WHERE data_room_id = ? AND file_name = ?",
+                (data_room_id, file_name)
+            )
+            row = cursor.fetchone()
+            if row:
+                logger.info(f"Document '{file_name}' already exists in {data_room_id}, returning existing ID")
+                return row['id'] if isinstance(row, dict) else row[0]
 
     return document_id
 
@@ -872,6 +1003,116 @@ def get_documents_by_data_room(data_room_id: str) -> List[Dict[str, Any]]:
             ORDER BY uploaded_at DESC
         """, (data_room_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
+
+
+def find_document_by_filename(
+    data_room_id: str,
+    target_filename: str,
+    create_if_missing: bool = False,
+    file_path: str = None,
+    file_size: int = 0,
+) -> Optional[str]:
+    """
+    Find a document ID by filename with resilient multi-tier matching.
+
+    Uses a single DB connection and atomic INSERT OR IGNORE to prevent
+    race conditions when called from parallel threads.
+
+    Matching priority:
+    1. Exact match on file_name
+    2. Case-insensitive match
+    3. Stem match (handles .doc vs .docx, sanitized names, etc.)
+    4. If create_if_missing=True, atomic find-or-create via INSERT OR IGNORE
+
+    Args:
+        data_room_id: Parent data room ID
+        target_filename: Filename to search for
+        create_if_missing: If True, create a document record when no match is found
+        file_path: File path (required if create_if_missing=True)
+        file_size: File size in bytes (used for auto-creation)
+
+    Returns:
+        Document ID string, or None if not found and create_if_missing=False
+    """
+    from pathlib import Path as _Path
+
+    target_lower = target_filename.lower()
+    target_stem = _Path(target_filename).stem.lower()
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Tier 1: exact match
+        cursor.execute(
+            "SELECT id FROM documents WHERE data_room_id = ? AND file_name = ?",
+            (data_room_id, target_filename)
+        )
+        row = cursor.fetchone()
+        if row:
+            return row['id'] if isinstance(row, dict) else row[0]
+
+        # Tier 2: case-insensitive match
+        cursor.execute(
+            "SELECT id, file_name FROM documents WHERE data_room_id = ? AND LOWER(file_name) = ?",
+            (data_room_id, target_lower)
+        )
+        row = cursor.fetchone()
+        if row:
+            matched_name = row['file_name'] if isinstance(row, dict) else row[1]
+            matched_id = row['id'] if isinstance(row, dict) else row[0]
+            logger.warning(
+                f"Document matched case-insensitively: '{target_filename}' ~ '{matched_name}'"
+            )
+            return matched_id
+
+        # Tier 3: stem match (fetch all for this data room since no SQL stem function)
+        cursor.execute(
+            "SELECT id, file_name FROM documents WHERE data_room_id = ?",
+            (data_room_id,)
+        )
+        for doc_row in cursor.fetchall():
+            doc_name = doc_row['file_name'] if isinstance(doc_row, dict) else doc_row[1]
+            doc_id = doc_row['id'] if isinstance(doc_row, dict) else doc_row[0]
+            if _Path(doc_name).stem.lower() == target_stem:
+                logger.warning(
+                    f"Document matched by stem: '{target_filename}' ~ '{doc_name}'"
+                )
+                return doc_id
+
+        # Tier 4: atomic find-or-create using INSERT OR IGNORE
+        if create_if_missing and file_path:
+            file_type = _Path(target_filename).suffix.lower().lstrip('.')
+            new_id = f"doc_{uuid.uuid4().hex[:12]}"
+
+            cursor.execute("""
+                INSERT OR IGNORE INTO documents (
+                    id, data_room_id, file_name, file_path,
+                    file_size, file_type, parse_status
+                ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            """, (new_id, data_room_id, target_filename, file_path,
+                  file_size, file_type))
+            conn.commit()
+
+            # SELECT to get the actual ID (ours or the concurrent winner's)
+            cursor.execute(
+                "SELECT id FROM documents WHERE data_room_id = ? AND file_name = ?",
+                (data_room_id, target_filename)
+            )
+            row = cursor.fetchone()
+            if row:
+                actual_id = row['id'] if isinstance(row, dict) else row[0]
+                if actual_id == new_id:
+                    logger.error(
+                        f"No document record found for '{target_filename}' in {data_room_id}. "
+                        f"Auto-created record {new_id}."
+                    )
+                else:
+                    logger.info(
+                        f"Document '{target_filename}' was concurrently created by another thread"
+                    )
+                return actual_id
+
+    return None
 
 
 def get_documents_with_paths(data_room_id: str) -> List[Dict[str, Any]]:
@@ -1262,6 +1503,18 @@ def get_query_history(
             queries.append(query)
 
         return queries
+
+
+def delete_question(question_id: str, user_id: str) -> bool:
+    """Delete a question. Only the owner can delete their own question."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "DELETE FROM queries WHERE id = ? AND user_id = ?",
+            (question_id, user_id)
+        )
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 # ============================================================================
@@ -2138,6 +2391,53 @@ def update_folder_inventory_counts(
         return cursor.rowcount > 0
 
 
+def create_and_update_folder_inventory_batch(
+    records: List[Dict[str, Any]]
+) -> List[str]:
+    """
+    Create folder inventory records and set their counts in a single transaction.
+
+    Args:
+        records: List of dicts with keys: connected_folder_id, drive_folder_id,
+                 folder_name, folder_path, parent_folder_id, file_count, total_size_bytes
+
+    Returns:
+        List of generated inventory IDs
+    """
+    if not records:
+        return []
+
+    ids = [f"fi_{uuid.uuid4().hex[:12]}" for _ in records]
+
+    insert_values = [
+        (
+            inv_id,
+            r['connected_folder_id'],
+            r['drive_folder_id'],
+            r['folder_name'],
+            r.get('folder_path'),
+            r.get('parent_folder_id'),
+            'scanned',
+            r.get('file_count', 0),
+            r.get('total_size_bytes', 0),
+        )
+        for inv_id, r in zip(ids, records)
+    ]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT OR REPLACE INTO folder_inventory (
+                id, connected_folder_id, drive_folder_id, folder_name,
+                folder_path, parent_folder_id, scan_status,
+                file_count, total_size_bytes
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, insert_values)
+        conn.commit()
+
+    return ids
+
+
 def reset_failed_synced_files(connection_id: Optional[str] = None) -> int:
     """
     Reset failed and stuck synced files to pending status for retry.
@@ -2296,6 +2596,49 @@ def create_synced_file(
     return synced_file_id
 
 
+def create_synced_files_batch(files: List[Dict[str, Any]]) -> List[str]:
+    """
+    Create multiple synced file records in a single transaction using executemany.
+
+    Args:
+        files: List of dicts with keys: connected_folder_id, drive_file_id,
+               file_name, file_path, mime_type, file_size, drive_modified_time
+
+    Returns:
+        List of generated synced file IDs
+    """
+    if not files:
+        return []
+
+    ids = [f"sf_{uuid.uuid4().hex[:12]}" for _ in files]
+
+    values = [
+        (
+            sf_id,
+            f['connected_folder_id'],
+            f['drive_file_id'],
+            f['file_name'],
+            f.get('file_path'),
+            f.get('mime_type'),
+            f.get('file_size'),
+            f.get('drive_modified_time'),
+        )
+        for sf_id, f in zip(ids, files)
+    ]
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.executemany("""
+            INSERT OR REPLACE INTO synced_files (
+                id, connected_folder_id, drive_file_id, file_name,
+                file_path, mime_type, file_size, drive_modified_time
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, values)
+        conn.commit()
+
+    return ids
+
+
 def get_synced_files_by_folder(connected_folder_id: str) -> List[Dict[str, Any]]:
     """Get all synced files for a connected folder."""
     with get_db_connection() as conn:
@@ -2389,6 +2732,58 @@ def check_file_exists_in_sync(connected_folder_id: str, drive_file_id: str) -> O
             WHERE connected_folder_id = ? AND drive_file_id = ?
         """, (connected_folder_id, drive_file_id))
         return dict_from_row(cursor.fetchone())
+
+
+def get_recently_completed_synced_files(connected_folder_id: str, limit: int = 5) -> List[Dict[str, Any]]:
+    """Get the most recently completed synced files for progress UI."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT file_name, mime_type
+            FROM synced_files
+            WHERE connected_folder_id = ? AND sync_status = 'complete'
+            ORDER BY last_synced_at DESC
+            LIMIT ?
+        """, (connected_folder_id, limit))
+        return [dict_from_row(row) for row in cursor.fetchall()]
+
+
+def get_synced_file_type_counts(connected_folder_id: str) -> Dict[str, int]:
+    """Get file type counts grouped by category for progress UI."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT
+                CASE
+                    WHEN mime_type LIKE '%pdf%' THEN 'pdf'
+                    WHEN mime_type LIKE '%spreadsheet%' OR mime_type LIKE '%excel%'
+                         OR mime_type LIKE '%csv%' THEN 'spreadsheet'
+                    WHEN mime_type LIKE '%document%' OR mime_type LIKE '%msword%'
+                         OR mime_type LIKE '%wordprocessing%' THEN 'document'
+                    WHEN mime_type LIKE '%presentation%' OR mime_type LIKE '%powerpoint%' THEN 'presentation'
+                    ELSE 'other'
+                END AS file_category,
+                COUNT(*) AS count
+            FROM synced_files
+            WHERE connected_folder_id = ?
+            GROUP BY file_category
+        """, (connected_folder_id,))
+        return {row['file_category']: row['count'] for row in cursor.fetchall()}
+
+
+def get_current_processing_file(connected_folder_id: str) -> Optional[Dict[str, Any]]:
+    """Get the file currently being processed for progress UI."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT file_name, sync_status
+            FROM synced_files
+            WHERE connected_folder_id = ? AND sync_status IN ('downloading', 'processing')
+            ORDER BY last_synced_at DESC
+            LIMIT 1
+        """, (connected_folder_id,))
+        row = cursor.fetchone()
+        return dict_from_row(row) if row else None
 
 
 # ============================================================================
@@ -2771,28 +3166,6 @@ def save_memo(
     """Create a new memo record with status 'generating'."""
     import json
     with get_db_connection() as conn:
-        # Ensure deal parameter columns exist (migration)
-        try:
-            conn.execute("ALTER TABLE memos ADD COLUMN ticket_size REAL")
-        except Exception:
-            pass  # Column already exists
-        try:
-            conn.execute("ALTER TABLE memos ADD COLUMN post_money_valuation REAL")
-        except Exception:
-            pass  # Column already exists
-        try:
-            conn.execute("ALTER TABLE memos ADD COLUMN valuation_methods TEXT")
-        except Exception:
-            pass  # Column already exists
-        try:
-            conn.execute("ALTER TABLE memos ADD COLUMN valuation_analysis TEXT")
-        except Exception:
-            pass  # Column already exists
-        try:
-            conn.execute("ALTER TABLE memos ADD COLUMN proposed_investment_terms TEXT")
-        except Exception:
-            pass  # Column already exists
-
         valuation_methods_json = json.dumps(valuation_methods) if valuation_methods else None
         conn.execute("""
             INSERT INTO memos (id, data_room_id, version, status, created_at, ticket_size, post_money_valuation, valuation_methods)

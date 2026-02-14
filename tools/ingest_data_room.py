@@ -17,17 +17,81 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from tools.parse_pdf import parse_pdf
 from tools.parse_excel import parse_excel
-from tools.chunk_documents import chunk_document
+from tools.parse_docx import parse_docx
+from tools.parse_pptx import parse_pptx
+from tools.chunk_documents import chunk_documents, DocumentChunker
 from tools.generate_embeddings import generate_embeddings, generate_embeddings_streaming
 from tools.index_to_vectordb import index_to_vectordb, VectorDBIndexer
 from app import database as db
 from app.config import settings
 
 
+def parse_file_by_type(
+    file_path: str,
+    use_ocr: bool = True,
+    max_ocr_pages: int = 50,
+    use_financial_excel: bool = False,
+) -> Dict[str, Any]:
+    """
+    Parse a file using the appropriate parser based on extension.
+
+    Single source of truth for file type dispatch. All processing pipelines
+    (main.py, worker.py, ingest_data_room.py) should use this.
+
+    Args:
+        file_path: Path to the file
+        use_ocr: Enable OCR for scanned PDFs
+        max_ocr_pages: Max pages to run OCR on
+        use_financial_excel: Use the enhanced financial Excel parser
+
+    Returns:
+        Parsed document dictionary with at minimum:
+        file_name, file_path, text, file_type, method
+
+    Raises:
+        ValueError: For unsupported file types
+        FileNotFoundError: If file does not exist
+    """
+    file_path_obj = Path(file_path)
+    if not file_path_obj.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
+
+    file_type = file_path_obj.suffix.lower()
+
+    if file_type == '.pdf':
+        return parse_pdf(file_path, use_ocr=use_ocr, max_ocr_pages=max_ocr_pages)
+
+    elif file_type in ('.xlsx', '.xls', '.csv'):
+        if use_financial_excel and file_type != '.csv':
+            from tools.parse_excel_financial import parse_excel_financial
+            return parse_excel_financial(file_path)
+        return parse_excel(file_path)
+
+    elif file_type in ('.docx', '.doc'):
+        return parse_docx(file_path)
+
+    elif file_type in ('.pptx', '.ppt'):
+        return parse_pptx(file_path)
+
+    elif file_type == '.txt':
+        return {
+            'file_name': file_path_obj.name,
+            'file_path': str(file_path_obj.absolute()),
+            'file_size': file_path_obj.stat().st_size,
+            'text': file_path_obj.read_text(encoding='utf-8', errors='replace'),
+            'file_type': 'txt',
+            'method': 'plaintext',
+        }
+
+    else:
+        raise ValueError(f"Unsupported file type: {file_type}")
+
+
 def _process_single_file(
     file_path: str,
     data_room_id: str,
-    update_progress: bool
+    update_progress: bool,
+    chunker=None,
 ) -> Dict[str, Any]:
     """Parse and chunk a single file. Returns dict with 'chunks', 'error', 'file_name'."""
     file_path_obj = Path(file_path)
@@ -37,30 +101,27 @@ def _process_single_file(
         result['error'] = f"File not found: {file_path}"
         return result
 
-    file_type = file_path_obj.suffix.lower()
-
-    # Get document ID from database
-    documents = db.get_documents_by_data_room(data_room_id)
-    document_id = None
-    for doc in documents:
-        if doc['file_name'] == file_path_obj.name:
-            document_id = doc['id']
-            break
+    # Find document ID with resilient matching and auto-create fallback
+    document_id = db.find_document_by_filename(
+        data_room_id=data_room_id,
+        target_filename=file_path_obj.name,
+        create_if_missing=True,
+        file_path=str(file_path_obj),
+        file_size=file_path_obj.stat().st_size,
+    )
 
     if not document_id:
-        result['error'] = f"Document record not found for {file_path_obj.name}"
+        result['error'] = f"Document record not found and auto-creation failed for {file_path_obj.name}"
         return result
 
     if update_progress:
         db.update_document_status(document_id, "parsing")
 
-    # Parse based on file type
-    if file_type == '.pdf':
-        parsed = parse_pdf(file_path)
-    elif file_type in ['.xlsx', '.xls', '.csv']:
-        parsed = parse_excel(file_path)
-    else:
-        error_msg = f"Unsupported file type: {file_type}"
+    # Parse using shared dispatcher
+    try:
+        parsed = parse_file_by_type(file_path)
+    except ValueError as e:
+        error_msg = str(e)
         if update_progress:
             db.update_document_status(document_id, "failed", error_message=error_msg)
         result['error'] = error_msg
@@ -68,12 +129,7 @@ def _process_single_file(
 
     # Chunk the document
     logger.info(f"Chunking {file_path_obj.name}...")
-    chunks = chunk_document(
-        text=parsed['text'],
-        document_id=document_id,
-        data_room_id=data_room_id,
-        metadata=parsed.get('metadata', {})
-    )
+    chunks = chunk_documents(parsed, chunker=chunker)
 
     # Update document status to parsed
     if update_progress:
@@ -96,12 +152,12 @@ def ingest_data_room(
     """
     Ingest and process a complete data room.
 
-    Pipeline:
-    1. Parse all documents (PDF, Excel, etc.)
+    Pipeline (streaming — processes files in groups to limit memory):
+    1. Parse a group of documents (PDF, Excel, etc.)
     2. Chunk text into semantic units
-    3. Generate embeddings for all chunks
-    4. Index to vector database
-    5. Save metadata to SQLite
+    3. Generate embeddings for the group's chunks
+    4. Index to vector database + save to SQLite
+    5. Repeat for next group until all files are processed
 
     Args:
         data_room_id: Unique identifier for the data room
@@ -133,57 +189,125 @@ def ingest_data_room(
             message=f"Processing {len(file_paths)} files"
         )
 
-    all_chunks = []
+    collection_name = f"data_room_{data_room_id}"
+    total_indexed = 0
+    total_saved = 0
+    total_embedding_failures = 0
+    completed_files = 0
 
-    # Step 1: Parse all documents in parallel
+    # Reuse indexer, chunker, and write executor across all groups
+    indexer = VectorDBIndexer()
+    shared_chunker = DocumentChunker()
+    write_executor = ThreadPoolExecutor(max_workers=5)
+
+    # Process files in groups to limit peak memory usage
+    FILE_GROUP_SIZE = 20
     max_workers = min(settings.max_parse_workers, len(file_paths))
-    logger.info(f"Step 1/4: Parsing documents ({max_workers} workers)...")
 
-    completed_count = 0
-    progress_lock = threading.Lock()
+    try:
+        for group_start in range(0, len(file_paths), FILE_GROUP_SIZE):
+            group_paths = file_paths[group_start:group_start + FILE_GROUP_SIZE]
+            group_num = group_start // FILE_GROUP_SIZE + 1
+            total_groups = (len(file_paths) + FILE_GROUP_SIZE - 1) // FILE_GROUP_SIZE
+            logger.info(f"Processing file group {group_num}/{total_groups} ({len(group_paths)} files)...")
 
-    def _on_file_done(file_result):
-        nonlocal completed_count
-        with progress_lock:
-            completed_count += 1
+            # --- Parse this group in parallel ---
+            group_chunks = []
+            group_workers = min(max_workers, len(group_paths))
+
+            with ThreadPoolExecutor(max_workers=group_workers) as parse_executor:
+                future_to_path = {
+                    parse_executor.submit(_process_single_file, fp, data_room_id, update_progress, shared_chunker): fp
+                    for fp in group_paths
+                }
+
+                for future in as_completed(future_to_path):
+                    fp = future_to_path[future]
+                    completed_files += 1
+                    try:
+                        file_result = future.result()
+
+                        if update_progress:
+                            progress = 5 + (completed_files / len(file_paths)) * 40
+                            db.update_data_room_status(data_room_id, "parsing", progress=progress)
+
+                        if file_result['error']:
+                            logger.error(f"Failed: {file_result['file_name']}: {file_result['error']}")
+                            results['errors'].append({
+                                'file': file_result['file_name'],
+                                'error': file_result['error']
+                            })
+                            results['failed_files'] += 1
+                        else:
+                            group_chunks.extend(file_result['chunks'])
+                            results['parsed_files'] += 1
+
+                    except Exception as e:
+                        error_msg = f"Failed to parse {fp}: {str(e)}"
+                        logger.error(error_msg)
+                        results['errors'].append({
+                            'file': Path(fp).name,
+                            'error': str(e)
+                        })
+                        results['failed_files'] += 1
+
+            if not group_chunks:
+                logger.warning(f"Group {group_num}: no chunks extracted, skipping embedding")
+                continue
+
+            results['total_chunks'] += len(group_chunks)
+            logger.info(f"Group {group_num}: {len(group_chunks)} chunks, embedding + indexing...")
+
             if update_progress:
-                progress = 5 + (completed_count / len(file_paths)) * 40
-                db.update_data_room_status(data_room_id, "parsing", progress=progress)
+                progress = 45 + (completed_files / len(file_paths)) * 40
+                db.update_data_room_status(data_room_id, "indexing", progress=progress)
 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {
-            executor.submit(_process_single_file, fp, data_room_id, update_progress): fp
-            for fp in file_paths
-        }
+            # --- Embed + index + save this group's chunks ---
+            pending_write_futures = []
+            for batch in generate_embeddings_streaming(
+                chunks=group_chunks,
+                batch_size=settings.batch_size,
+                max_concurrent=settings.embedding_max_concurrent
+            ):
+                valid_chunks = [c for c in batch if c.get('embedding') is not None and not c.get('embedding_failed')]
+                failed_chunks = [c for c in batch if c.get('embedding') is None or c.get('embedding_failed')]
+                total_embedding_failures += len(failed_chunks)
 
-        for future in as_completed(future_to_path):
-            fp = future_to_path[future]
-            try:
-                file_result = future.result()
-                _on_file_done(file_result)
+                if failed_chunks:
+                    logger.warning(f"{len(failed_chunks)} chunks failed embedding generation in this batch")
 
-                if file_result['error']:
-                    logger.error(f"Failed: {file_result['file_name']}: {file_result['error']}")
-                    results['errors'].append({
-                        'file': file_result['file_name'],
-                        'error': file_result['error']
-                    })
-                    results['failed_files'] += 1
-                else:
-                    all_chunks.extend(file_result['chunks'])
-                    results['parsed_files'] += 1
+                # Pipeline VectorDB and SQLite writes — don't block between batches
+                batch_futures = []
+                if valid_chunks:
+                    batch_futures.append(write_executor.submit(
+                        indexer.index_chunks, data_room_id, valid_chunks
+                    ))
+                batch_futures.append(write_executor.submit(db.create_chunks, batch))
+                pending_write_futures.append(batch_futures)
 
-            except Exception as e:
-                _on_file_done({'file_name': Path(fp).name})
-                error_msg = f"Failed to parse {fp}: {str(e)}"
-                logger.error(error_msg)
-                results['errors'].append({
-                    'file': Path(fp).name,
-                    'error': str(e)
-                })
-                results['failed_files'] += 1
+                total_indexed += len(valid_chunks)
+                total_saved += len(batch)
 
-    if not all_chunks:
+                if update_progress:
+                    progress = 45 + (completed_files / len(file_paths)) * 40 + (total_saved / max(results['total_chunks'], 1)) * 10
+                    write_executor.submit(
+                        db.update_data_room_status, data_room_id, "indexing", min(progress, 95)
+                    )
+
+            # Wait for all pipelined writes to complete before freeing group memory
+            for batch_futures in pending_write_futures:
+                for future in batch_futures:
+                    future.result()
+
+            # Free group memory before next iteration
+            del group_chunks
+
+            logger.info(f"Group {group_num} done. Running totals: indexed={total_indexed}, saved={total_saved}")
+
+    finally:
+        write_executor.shutdown(wait=True)
+
+    if results['total_chunks'] == 0:
         error_msg = "No chunks extracted from any document"
         logger.error(error_msg)
         if update_progress:
@@ -195,72 +319,8 @@ def ingest_data_room(
             )
         raise Exception(error_msg)
 
-    results['total_chunks'] = len(all_chunks)
-    logger.info(f"Total chunks extracted: {len(all_chunks)}")
-
-    # Steps 2-4: Stream embeddings → index → save in batches (pipelined)
-    logger.info("Step 2/4: Generating embeddings + indexing (pipelined)...")
-
-    if update_progress:
-        db.update_data_room_status(data_room_id, "indexing", progress=50)
-
-    collection_name = f"data_room_{data_room_id}"
-    total_indexed = 0
-    total_saved = 0
-    total_embedding_failures = 0
-
-    # FIX #3: Create indexer ONCE to reuse collection cache
-    indexer = VectorDBIndexer()
-
-    # FIX #1 & #4: Use thread pool for parallel writes and async status updates
-    write_executor = ThreadPoolExecutor(max_workers=3)  # 2 for writes + 1 for status
-
-    try:
-        for batch in generate_embeddings_streaming(
-            chunks=all_chunks,
-            batch_size=settings.batch_size,
-            max_concurrent=settings.embedding_max_concurrent
-        ):
-            # Separate successful and failed embeddings
-            valid_chunks = [c for c in batch if c.get('embedding') is not None and not c.get('embedding_failed')]
-            failed_chunks = [c for c in batch if c.get('embedding') is None or c.get('embedding_failed')]
-            total_embedding_failures += len(failed_chunks)
-
-            if failed_chunks:
-                logger.warning(f"{len(failed_chunks)} chunks failed embedding generation in this batch")
-
-            # FIX #1: Run VectorDB and SQLite writes IN PARALLEL (not sequential)
-            futures = []
-
-            # Index only chunks with valid embeddings
-            if valid_chunks:
-                futures.append(write_executor.submit(
-                    indexer.index_chunks, data_room_id, valid_chunks
-                ))
-
-            # Save all chunks to SQLite (so we can re-embed failed ones later)
-            futures.append(write_executor.submit(db.create_chunks, batch))
-
-            # Wait for both writes to complete
-            for future in futures:
-                future.result()
-
-            total_indexed += len(valid_chunks)
-            total_saved += len(batch)
-
-            # FIX #4: Update progress asynchronously (don't block main loop)
-            if update_progress:
-                progress = 50 + (total_saved / len(all_chunks)) * 35
-                write_executor.submit(
-                    db.update_data_room_status, data_room_id, "indexing", progress
-                )
-
-            logger.info(f"Indexed {total_indexed}, saved {total_saved}/{len(all_chunks)} chunks")
-    finally:
-        write_executor.shutdown(wait=True)
-
     if total_embedding_failures > 0:
-        error_msg = f"{total_embedding_failures}/{len(all_chunks)} chunks failed embedding generation"
+        error_msg = f"{total_embedding_failures}/{results['total_chunks']} chunks failed embedding generation"
         logger.error(error_msg)
         results['errors'].append({'file': 'embeddings', 'error': error_msg})
         results['embedding_failures'] = total_embedding_failures
@@ -275,7 +335,6 @@ def ingest_data_room(
     if update_progress:
         from datetime import datetime
         if total_embedding_failures > 0 and total_indexed == 0:
-            # All embeddings failed — mark as failed
             db.update_data_room_status(
                 data_room_id,
                 "failed",
@@ -288,10 +347,9 @@ def ingest_data_room(
                 duration_ms=duration_ms
             )
         else:
-            status = "complete" if total_embedding_failures == 0 else "complete"
             db.update_data_room_status(
                 data_room_id,
-                status,
+                "complete",
                 progress=100,
                 completed_at=datetime.now().isoformat()
             )
@@ -358,10 +416,11 @@ def reembed_data_room(data_room_id: str) -> Dict[str, Any]:
             )
             total_indexed += result.get('indexed', 0)
 
-            # Update embedding_id in SQLite for successfully embedded chunks
-            for chunk in valid_chunks:
-                if chunk.get('id'):
-                    db.update_chunk_embedding_id(chunk['id'], chunk['id'])
+            # Only mark chunks as embedded if indexing actually succeeded
+            if result.get('indexed', 0) > 0:
+                for chunk in valid_chunks:
+                    if chunk.get('id'):
+                        db.update_chunk_embedding_id(chunk['id'], chunk['id'])
 
         logger.info(f"Re-embedded {total_indexed}/{len(chunks)} chunks")
 

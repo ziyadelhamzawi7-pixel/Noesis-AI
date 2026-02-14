@@ -1,8 +1,12 @@
-import { useState, useCallback } from 'react';
+import { useState, useCallback, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { useDropzone } from 'react-dropzone';
-import { Upload, FileText, X, ArrowLeft, AlertCircle, FileSpreadsheet, File } from 'lucide-react';
-import { createDataRoom } from '../api/client';
+import { useDropzone, FileRejection } from 'react-dropzone';
+import { Upload, FileText, X, ArrowLeft, AlertCircle, FileSpreadsheet, File, Presentation, Folder } from 'lucide-react';
+import { createDataRoom, uploadFilesToDataRoom } from '../api/client';
+
+const SUPPORTED_EXTENSIONS = new Set([
+  '.pdf', '.docx', '.doc', '.xlsx', '.xls', '.pptx', '.ppt', '.csv', '.txt'
+]);
 
 interface UploadPageProps {
   onSuccess: (dataRoomId: string) => void;
@@ -16,21 +20,66 @@ export default function UploadPage({ onSuccess }: UploadPageProps) {
   const [analystEmail, setAnalystEmail] = useState('');
   const [isUploading, setIsUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const folderInputRef = useRef<HTMLInputElement>(null);
 
-  const onDrop = useCallback((acceptedFiles: File[]) => {
-    setFiles((prev) => [...prev, ...acceptedFiles]);
-    setError(null);
+  const onDrop = useCallback((acceptedFiles: File[], fileRejections: FileRejection[]) => {
+    if (acceptedFiles.length > 0) {
+      setFiles((prev) => [...prev, ...acceptedFiles]);
+    }
+
+    if (fileRejections.length === 0) {
+      setError(null);
+    }
+  }, []);
+
+  const onDropRejected = useCallback((_fileRejections: FileRejection[]) => {
+    // Silently skip unsupported files
   }, []);
 
   const { getRootProps, getInputProps, isDragActive } = useDropzone({
     onDrop,
+    onDropRejected,
     accept: {
       'application/pdf': ['.pdf'],
       'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': ['.xlsx'],
       'application/vnd.ms-excel': ['.xls'],
       'text/csv': ['.csv'],
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'],
+      'application/msword': ['.doc'],
+      'application/vnd.openxmlformats-officedocument.presentationml.presentation': ['.pptx'],
+      'application/vnd.ms-powerpoint': ['.ppt'],
+      'text/plain': ['.txt'],
     },
   });
+
+  const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const selectedFiles = Array.from(e.target.files || []);
+
+    const accepted: File[] = [];
+    const rejectedNames: string[] = [];
+
+    for (const file of selectedFiles) {
+      const ext = '.' + file.name.split('.').pop()!.toLowerCase();
+      if (SUPPORTED_EXTENSIONS.has(ext)) {
+        accepted.push(file);
+      } else {
+        rejectedNames.push(file.name);
+      }
+    }
+
+    if (accepted.length > 0) {
+      setFiles((prev) => [...prev, ...accepted]);
+    }
+
+    if (accepted.length === 0) {
+      setError('No supported files found in the selected folder.');
+    } else {
+      setError(null);
+    }
+
+    // Reset input so same folder can be re-selected
+    e.target.value = '';
+  };
 
   const removeFile = (index: number) => {
     setFiles((prev) => prev.filter((_, i) => i !== index));
@@ -58,12 +107,31 @@ export default function UploadPage({ onSuccess }: UploadPageProps) {
     setIsUploading(true);
 
     try {
-      const result = await createDataRoom(companyName.trim(), analystName.trim(), analystEmail.trim(), files);
+      // Step 1: Create data room record (fast, no files)
+      const result = await createDataRoom(
+        companyName.trim(),
+        analystName.trim(),
+        analystEmail.trim(),
+        files.length
+      );
 
+      // Step 2: Navigate to the data room immediately
       onSuccess(result.data_room_id);
       navigate(`/chat/${result.data_room_id}`);
+
+      // Step 3: Upload files in the background (fire-and-forget)
+      // The ChatInterface polls status and shows upload/parsing progress
+      uploadFilesToDataRoom(result.data_room_id, files).catch((err) => {
+        console.error('Background file upload failed:', err);
+      });
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to create data room');
+      console.error('Data room creation failed:', err);
+      const detail = err.response?.data?.detail;
+      const status = err.response?.status;
+      const msg = err.message;
+      let errorText = detail || msg || 'Unknown error';
+      if (status) errorText = `[${status}] ${errorText}`;
+      setError(errorText);
       setIsUploading(false);
     }
   };
@@ -80,6 +148,9 @@ export default function UploadPage({ onSuccess }: UploadPageProps) {
     const ext = fileName.split('.').pop()?.toLowerCase();
     if (ext === 'pdf') return <FileText size={20} style={{ color: '#ef4444' }} />;
     if (['xlsx', 'xls', 'csv'].includes(ext || '')) return <FileSpreadsheet size={20} style={{ color: '#22c55e' }} />;
+    if (['docx', 'doc'].includes(ext || '')) return <FileText size={20} style={{ color: '#3b82f6' }} />;
+    if (['pptx', 'ppt'].includes(ext || '')) return <Presentation size={20} style={{ color: '#f59e0b' }} />;
+    if (ext === 'txt') return <FileText size={20} style={{ color: 'var(--text-tertiary)' }} />;
     return <File size={20} style={{ color: 'var(--text-tertiary)' }} />;
   };
 
@@ -184,9 +255,6 @@ export default function UploadPage({ onSuccess }: UploadPageProps) {
           <div
             {...getRootProps()}
             className={`dropzone ${isDragActive ? 'dropzone-active' : ''}`}
-            style={{
-              marginBottom: files.length > 0 ? '24px' : 0,
-            }}
           >
             <input {...getInputProps()} />
             <div className="dropzone-icon">
@@ -200,21 +268,83 @@ export default function UploadPage({ onSuccess }: UploadPageProps) {
               style={{
                 marginTop: '20px',
                 display: 'flex',
-                gap: '12px',
+                gap: '8px',
                 justifyContent: 'center',
+                flexWrap: 'wrap',
                 position: 'relative',
                 zIndex: 1,
               }}
             >
               <span className="badge badge-neutral">PDF</span>
+              <span className="badge badge-neutral">Word</span>
               <span className="badge badge-neutral">Excel</span>
+              <span className="badge badge-neutral">PowerPoint</span>
               <span className="badge badge-neutral">CSV</span>
+              <span className="badge badge-neutral">TXT</span>
             </div>
           </div>
 
+          {/* Browse Folder */}
+          <input
+            ref={folderInputRef}
+            type="file"
+            // @ts-ignore — webkitdirectory is non-standard but widely supported
+            webkitdirectory=""
+            directory=""
+            multiple
+            style={{ display: 'none' }}
+            onChange={handleFolderSelect}
+          />
+          <div style={{ display: 'flex', justifyContent: 'center', marginTop: '12px' }}>
+            <button
+              type="button"
+              className="btn btn-ghost"
+              onClick={() => folderInputRef.current?.click()}
+              disabled={isUploading}
+              style={{ color: 'var(--text-secondary)', fontSize: '13px' }}
+            >
+              <Folder size={16} />
+              Browse Folder
+            </button>
+          </div>
+
+          {/* Error Message */}
+          {error && (
+            <div
+              style={{
+                padding: '14px 16px',
+                background: 'var(--error-soft)',
+                border: '1px solid rgba(244, 63, 94, 0.2)',
+                borderRadius: '12px',
+                marginTop: '16px',
+                display: 'flex',
+                alignItems: 'center',
+                gap: '12px',
+              }}
+            >
+              <AlertCircle size={18} style={{ color: 'var(--error)', flexShrink: 0 }} />
+              <p style={{ margin: 0, fontSize: '14px', color: 'var(--error)' }}>{error}</p>
+            </div>
+          )}
+
+          {/* Action Buttons — above file list */}
+          {files.length > 0 && (
+            <div style={{ marginTop: '20px' }}>
+              <div style={{ display: 'flex', gap: '12px' }}>
+                <button type="submit" className="btn btn-primary" disabled={isUploading || files.length === 0}>
+                  {isUploading && <div className="loading" />}
+                  {isUploading ? 'Creating...' : 'Create Data Room'}
+                </button>
+                <button type="button" className="btn btn-secondary" onClick={() => navigate('/')} disabled={isUploading}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* File List */}
           {files.length > 0 && (
-            <div>
+            <div style={{ marginTop: '24px' }}>
               <p
                 style={{
                   fontSize: '13px',
@@ -265,35 +395,19 @@ export default function UploadPage({ onSuccess }: UploadPageProps) {
           )}
         </div>
 
-        {/* Error Message */}
-        {error && (
-          <div
-            style={{
-              padding: '14px 16px',
-              background: 'var(--error-soft)',
-              border: '1px solid rgba(244, 63, 94, 0.2)',
-              borderRadius: '12px',
-              marginBottom: '24px',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '12px',
-            }}
-          >
-            <AlertCircle size={18} style={{ color: 'var(--error)', flexShrink: 0 }} />
-            <p style={{ margin: 0, fontSize: '14px', color: 'var(--error)' }}>{error}</p>
+        {/* Action Buttons — shown below card only when no files added yet */}
+        {files.length === 0 && (
+          <div style={{ display: 'flex', gap: '12px' }}>
+            <button type="submit" className="btn btn-primary" disabled={isUploading || files.length === 0}>
+              {isUploading && <div className="loading" />}
+              {isUploading ? 'Creating...' : 'Create Data Room'}
+            </button>
+            <button type="button" className="btn btn-secondary" onClick={() => navigate('/')} disabled={isUploading}>
+              Cancel
+            </button>
           </div>
         )}
 
-        {/* Action Buttons */}
-        <div style={{ display: 'flex', gap: '12px' }}>
-          <button type="submit" className="btn btn-primary" disabled={isUploading}>
-            {isUploading && <div className="loading" />}
-            {isUploading ? 'Creating...' : 'Create Data Room'}
-          </button>
-          <button type="button" className="btn btn-secondary" onClick={() => navigate('/')} disabled={isUploading}>
-            Cancel
-          </button>
-        </div>
       </form>
     </div>
   );

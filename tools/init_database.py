@@ -89,7 +89,8 @@ def init_database():
         token_count INTEGER,
         error_message TEXT,
         metadata TEXT,
-        FOREIGN KEY (data_room_id) REFERENCES data_rooms(id) ON DELETE CASCADE
+        FOREIGN KEY (data_room_id) REFERENCES data_rooms(id) ON DELETE CASCADE,
+        UNIQUE(data_room_id, file_name)
     )
     """)
     logger.info("Created table: documents")
@@ -144,11 +145,13 @@ def init_database():
         data_room_id TEXT NOT NULL,
         version INTEGER DEFAULT 1,
         status TEXT CHECK(status IN ('generating', 'complete', 'partial', 'cancelled', 'failed')) DEFAULT 'generating',
+        proposed_investment_terms TEXT,
         executive_summary TEXT,
         market_analysis TEXT,
         team_assessment TEXT,
         product_technology TEXT,
         financial_analysis TEXT,
+        valuation_analysis TEXT,
         risks_concerns TEXT,
         outcome_scenario_analysis TEXT,
         investment_recommendation TEXT,
@@ -157,6 +160,9 @@ def init_database():
         completed_at TIMESTAMP,
         tokens_used INTEGER,
         cost REAL,
+        ticket_size REAL,
+        post_money_valuation REAL,
+        valuation_methods TEXT,
         analyst_feedback TEXT,
         metadata TEXT,
         FOREIGN KEY (data_room_id) REFERENCES data_rooms(id) ON DELETE CASCADE

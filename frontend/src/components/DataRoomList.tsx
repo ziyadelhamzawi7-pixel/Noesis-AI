@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import {
   FolderOpen,
@@ -16,6 +16,22 @@ import {
 import { listDataRooms, deleteDataRoom, reprocessDataRoom, DataRoom } from '../api/client';
 import ShareDialog from './ShareDialog';
 
+function getErrorMessage(err: any): string {
+  if (err.response?.data?.detail) {
+    return err.response.data.detail;
+  }
+  if (err.code === 'ECONNABORTED') {
+    return 'Request timed out. Please try again.';
+  }
+  if (err.request && !err.response) {
+    return 'Unable to reach the server. Please check that the backend is running.';
+  }
+  if (err.message) {
+    return err.message;
+  }
+  return 'Failed to load data rooms';
+}
+
 interface DataRoomListProps {
   onSelect: (dataRoomId: string) => void;
 }
@@ -28,10 +44,25 @@ export default function DataRoomList({ onSelect }: DataRoomListProps) {
   const [deletingId, setDeletingId] = useState<string | null>(null);
   const [reprocessingId, setReprocessingId] = useState<string | null>(null);
   const [shareDialogRoom, setShareDialogRoom] = useState<DataRoom | null>(null);
+  // Track highest-seen progress per data room to prevent backward jumps
+  const progressHighWaterMark = useRef<Record<string, number>>({});
 
   useEffect(() => {
     loadDataRooms();
   }, []);
+
+  // Poll for progress updates when any data room is still processing
+  useEffect(() => {
+    const hasProcessing = dataRooms.some(
+      dr => dr.processing_status !== 'complete' && dr.processing_status !== 'failed'
+    );
+    if (!hasProcessing) return;
+
+    const interval = setInterval(() => {
+      loadDataRooms();
+    }, 4000);
+    return () => clearInterval(interval);
+  }, [dataRooms]);
 
   const handleDelete = async (dataRoomId: string, companyName: string) => {
     if (!confirm(`Are you sure you want to delete "${companyName}"? This action cannot be undone.`)) {
@@ -55,6 +86,8 @@ export default function DataRoomList({ onSelect }: DataRoomListProps) {
     }
 
     setReprocessingId(dataRoomId);
+    // Reset high-water mark for fresh reprocessing
+    delete progressHighWaterMark.current[dataRoomId];
     try {
       await reprocessDataRoom(dataRoomId);
       setDataRooms(
@@ -69,15 +102,38 @@ export default function DataRoomList({ onSelect }: DataRoomListProps) {
     }
   };
 
+  const initialLoadDone = useRef(false);
+
   const loadDataRooms = async () => {
-    setIsLoading(true);
+    // Only show loading spinner on initial load, not during polling
+    if (!initialLoadDone.current) {
+      setIsLoading(true);
+    }
     setError(null);
 
     try {
       const response = await listDataRooms();
-      setDataRooms(response.data_rooms);
+      const rooms = response?.data_rooms;
+      if (!Array.isArray(rooms)) {
+        setError('Unexpected response from server');
+        return;
+      }
+      // Apply monotonic progress clamping to each data room
+      const clamped = rooms.map((dr: DataRoom) => {
+        if (dr.processing_status === 'complete') {
+          progressHighWaterMark.current[dr.id] = 100;
+          return dr;
+        }
+        const prev = progressHighWaterMark.current[dr.id] ?? 0;
+        const monotonic = Math.max(prev, dr.progress_percent);
+        progressHighWaterMark.current[dr.id] = monotonic;
+        return { ...dr, progress_percent: monotonic };
+      });
+      setDataRooms(clamped);
+      initialLoadDone.current = true;
     } catch (err: any) {
-      setError(err.response?.data?.detail || 'Failed to load data rooms');
+      console.error('Failed to load data rooms:', err);
+      setError(getErrorMessage(err));
     } finally {
       setIsLoading(false);
     }

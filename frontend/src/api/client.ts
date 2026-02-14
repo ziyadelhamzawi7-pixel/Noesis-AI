@@ -1,12 +1,13 @@
 import axios from 'axios';
 
-const API_BASE_URL = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+const API_BASE_URL = import.meta.env.VITE_API_URL || '';
 
 export const api = axios.create({
   baseURL: API_BASE_URL,
   headers: {
     'Content-Type': 'application/json',
   },
+  timeout: 30000, // 30s default for most requests
 });
 
 // Attach user identity to all requests for sharing/access control
@@ -23,6 +24,16 @@ api.interceptors.request.use((config) => {
   }
   return config;
 });
+
+// Pass through network/5xx errors to callers — each component has its own
+// retry logic (e.g. ChatInterface retries with exponential backoff).
+// Previously this interceptor would detect backend downtime and call
+// window.location.reload(), but that causes a disorienting white screen
+// during heavy uploads when the backend is temporarily busy.
+api.interceptors.response.use(
+  (response) => response,
+  (error) => Promise.reject(error)
+);
 
 // Types
 export interface DataRoom {
@@ -100,6 +111,8 @@ export interface Question {
   user_id?: string;
   user_name?: string;
   user_picture_url?: string;
+  charts?: ChartSpec[];
+  is_analytical?: boolean;
 }
 
 export interface Source {
@@ -121,28 +134,29 @@ export interface QuestionResponse {
   tokens_used?: number;
   cost?: number;
   response_time_ms?: number;
+  charts?: ChartSpec[];
+  is_analytical?: boolean;
+  model?: string;
 }
 
 // API Functions
 
 /**
- * Create a new data room with uploaded files
+ * Create a new data room (metadata only, no files).
+ * Files are uploaded separately via uploadFilesToDataRoom().
  */
 export const createDataRoom = async (
   companyName: string,
   analystName: string,
   analystEmail: string,
-  files: File[]
+  totalDocuments: number
 ): Promise<{ data_room_id: string }> => {
   const formData = new FormData();
   formData.append('company_name', companyName);
   formData.append('analyst_name', analystName);
   formData.append('analyst_email', analystEmail);
   formData.append('security_level', 'local_only');
-
-  files.forEach((file) => {
-    formData.append('files', file);
-  });
+  formData.append('total_documents', String(totalDocuments));
 
   const response = await api.post('/api/data-room/create', formData, {
     headers: {
@@ -151,6 +165,40 @@ export const createDataRoom = async (
   });
 
   return response.data;
+};
+
+/**
+ * Upload files to an existing data room.
+ * Called after createDataRoom() — runs in the background while the user
+ * watches parsing progress on the chat page.
+ */
+export const uploadFilesToDataRoom = async (
+  dataRoomId: string,
+  files: File[]
+): Promise<void> => {
+  const BATCH_SIZE = 15;
+  const MAX_CONCURRENT = 5;
+
+  // Split files into batches so processing can start while later batches upload
+  const batches: File[][] = [];
+  for (let i = 0; i < files.length; i += BATCH_SIZE) {
+    batches.push(files.slice(i, i + BATCH_SIZE));
+  }
+
+  // Send batches with concurrency limit
+  for (let i = 0; i < batches.length; i += MAX_CONCURRENT) {
+    const concurrent = batches.slice(i, i + MAX_CONCURRENT);
+    await Promise.all(
+      concurrent.map((batch) => {
+        const formData = new FormData();
+        batch.forEach((file) => formData.append('files', file));
+        return api.post(`/api/data-room/${dataRoomId}/upload-files`, formData, {
+          headers: { 'Content-Type': 'multipart/form-data' },
+          timeout: 600000,
+        });
+      })
+    );
+  }
 };
 
 /**
@@ -211,7 +259,9 @@ export const getDocumentTree = async (
  * Ask a question about a data room
  */
 export const askQuestion = async (dataRoomId: string, request: QuestionRequest): Promise<QuestionResponse> => {
-  const response = await api.post(`/api/data-room/${dataRoomId}/question`, request);
+  const response = await api.post(`/api/data-room/${dataRoomId}/question`, request, {
+    timeout: 120000, // 120s for Q&A (semantic search + Claude API call)
+  });
   return response.data;
 };
 
@@ -227,6 +277,13 @@ export const getQuestionHistory = async (
     params: { limit, filter },
   });
   return response.data;
+};
+
+/**
+ * Delete a question
+ */
+export const deleteQuestion = async (dataRoomId: string, questionId: string): Promise<void> => {
+  await api.delete(`/api/data-room/${dataRoomId}/questions/${questionId}`);
 };
 
 /**
@@ -325,7 +382,7 @@ export interface DriveFile {
   shortcutTargetId?: string;
 }
 
-export type DriveViewMode = 'my_drive' | 'shared_with_me';
+export type DriveViewMode = 'my_drive' | 'shared_with_me' | 'shared_drives';
 
 export interface DriveFileList {
   files: DriveFile[];
@@ -491,6 +548,28 @@ export const getConnectedFolderStatus = async (
   connectionId: string
 ): Promise<{ folder: ConnectedFolder; files: SyncedFile[] }> => {
   const response = await api.get(`/api/drive/folder/${connectionId}`);
+  return response.data;
+};
+
+export interface SyncProgress {
+  sync_stage: SyncStage;
+  sync_status: string;
+  discovered_files: number;
+  discovered_folders: number;
+  total_files: number;
+  processed_files: number;
+  file_type_counts: Record<string, number>;
+  recently_completed: { file_name: string; mime_type?: string }[];
+  current_file: { file_name: string; sync_status: string } | null;
+}
+
+/**
+ * Get lightweight sync progress for the progress UI
+ */
+export const getFolderSyncProgress = async (
+  connectionId: string
+): Promise<SyncProgress> => {
+  const response = await api.get(`/api/drive/folder/${connectionId}/progress`);
   return response.data;
 };
 
@@ -1012,7 +1091,8 @@ export const updateMemoDealTerms = async (
 ): Promise<MemoResponse> => {
   const response = await api.put(
     `/api/data-room/${dataRoomId}/memo/${memoId}/deal-terms`,
-    dealTerms
+    dealTerms,
+    { timeout: 60000 }
   );
   return response.data;
 };

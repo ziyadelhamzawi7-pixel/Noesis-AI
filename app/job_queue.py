@@ -380,28 +380,53 @@ class JobQueue:
         """
         Reset jobs that have been running too long (likely crashed workers).
 
+        Jobs with remaining attempts are returned to 'pending' for retry.
+        Jobs that have exhausted their max_attempts are marked 'failed' so
+        they don't become unclaimmable zombies that block stall detection.
+
         Args:
             timeout_minutes: Consider jobs stale after this many minutes
 
         Returns:
-            Number of jobs recovered
+            Number of jobs recovered (retried + failed)
         """
         with _get_queue_connection() as conn:
+            # 1. Retryable jobs: still have attempts remaining → back to pending
             cursor = conn.execute("""
                 UPDATE job_queue
                 SET status = 'pending',
                     worker_id = NULL,
-                    error_message = 'Job recovered after timeout'
+                    error_message = 'Job recovered after worker timeout — will retry'
                 WHERE status = 'running'
                 AND started_at < datetime('now', ?)
+                AND attempts < max_attempts
             """, (f'-{timeout_minutes} minutes',))
+            retried = cursor.rowcount
+
+            # 2. Exhausted jobs: no attempts remaining → mark as failed
+            #    Without this, jobs sit in 'pending' forever (claim_job requires
+            #    attempts < max_attempts) and block stall detection.
+            cursor = conn.execute("""
+                UPDATE job_queue
+                SET status = 'failed',
+                    worker_id = NULL,
+                    completed_at = CURRENT_TIMESTAMP,
+                    error_message = 'Job failed after all retry attempts (worker crashed repeatedly)'
+                WHERE status = 'running'
+                AND started_at < datetime('now', ?)
+                AND attempts >= max_attempts
+            """, (f'-{timeout_minutes} minutes',))
+            failed = cursor.rowcount
+
             conn.commit()
-            count = cursor.rowcount
+            total = retried + failed
 
-        if count > 0:
-            logger.warning(f"Recovered {count} stale jobs")
+        if retried > 0:
+            logger.warning(f"Recovered {retried} stale jobs (returned to pending for retry)")
+        if failed > 0:
+            logger.error(f"Failed {failed} stale jobs (exhausted all retry attempts)")
 
-        return count
+        return total
 
 
 # Global job queue instance
