@@ -3288,7 +3288,7 @@ _drive_rate_limiter = EndpointRateLimiter(max_per_minute=settings.drive_api_rate
 
 
 @app.get("/api/auth/google/login", response_model=GoogleAuthURL)
-async def google_auth_login():
+async def google_auth_login(request: Request):
     """
     Initiate Google OAuth login flow.
 
@@ -3296,12 +3296,22 @@ async def google_auth_login():
         Authorization URL and state for CSRF protection
     """
     try:
-        redirect_uri = f"http://localhost:{settings.port}/api/auth/google/callback"
+        # Build redirect URI from the actual request origin so it works in both local and deployed envs
+        origin = request.headers.get("origin") or request.headers.get("referer", "")
+        if origin:
+            # Strip trailing path from referer if present
+            from urllib.parse import urlparse
+            parsed = urlparse(origin)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+        else:
+            base_url = f"http://localhost:{settings.port}"
+        redirect_uri = f"{base_url}/api/auth/google/callback"
         result = google_oauth_service.create_auth_url(redirect_uri)
 
         # Store state for verification
         _oauth_states[result['state']] = {
             'redirect_uri': redirect_uri,
+            'base_url': base_url,
             'created_at': datetime.now().isoformat()
         }
 
@@ -3317,6 +3327,7 @@ async def google_auth_login():
 
 @app.get("/api/auth/google/callback")
 async def google_auth_callback(
+    request: Request,
     code: str = Query(...),
     state: str = Query(...)
 ):
@@ -3369,8 +3380,9 @@ async def google_auth_callback(
             except Exception as invite_err:
                 logger.warning(f"Failed to auto-accept invites: {invite_err}")
 
-        # Redirect to frontend with user ID
-        frontend_url = f"http://localhost:3000/auth/callback?user_id={user_id}&email={email}"
+        # Redirect to frontend — use the base_url stored during login initiation
+        base_url = stored_state.get('base_url', f"{request.url.scheme}://{request.url.netloc}")
+        frontend_url = f"{base_url}/auth/callback?user_id={user_id}&email={email}"
         return RedirectResponse(url=frontend_url)
 
     except HTTPException:
@@ -3378,7 +3390,8 @@ async def google_auth_callback(
     except Exception as e:
         logger.error(f"OAuth callback failed: {e}")
         # Redirect to frontend with error
-        return RedirectResponse(url=f"http://localhost:3000/auth/callback?error={str(e)}")
+        base_url = f"{request.url.scheme}://{request.url.netloc}"
+        return RedirectResponse(url=f"{base_url}/auth/callback?error={str(e)}")
 
 
 @app.get("/api/auth/user/{user_id}", response_model=UserInfo)
