@@ -3304,15 +3304,21 @@ async def google_auth_login(request: Request):
         Authorization URL and state for CSRF protection
     """
     try:
-        # Build redirect URI from the actual request origin so it works in both local and deployed envs
-        origin = request.headers.get("origin") or request.headers.get("referer", "")
-        if origin:
-            # Strip trailing path from referer if present
-            from urllib.parse import urlparse
-            parsed = urlparse(origin)
-            base_url = f"{parsed.scheme}://{parsed.netloc}"
+        # Build redirect URI from the actual request so it works in both local and deployed envs
+        # Prefer X-Forwarded-Host/Proto (set by Railway/reverse proxies), fall back to Host header
+        forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+        forwarded_proto = request.headers.get("x-forwarded-proto", "https" if forwarded_host and "localhost" not in forwarded_host else "http")
+        if forwarded_host:
+            base_url = f"{forwarded_proto}://{forwarded_host}"
         else:
-            base_url = f"http://localhost:{settings.port}"
+            # Last resort: try origin/referer headers
+            origin = request.headers.get("origin") or request.headers.get("referer", "")
+            if origin:
+                from urllib.parse import urlparse
+                parsed = urlparse(origin)
+                base_url = f"{parsed.scheme}://{parsed.netloc}"
+            else:
+                base_url = f"http://localhost:{settings.port}"
         redirect_uri = f"{base_url}/api/auth/google/callback"
         result = google_oauth_service.create_auth_url(redirect_uri)
 
