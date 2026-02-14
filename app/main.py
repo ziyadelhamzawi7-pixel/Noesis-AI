@@ -2909,9 +2909,14 @@ async def memo_chat(data_room_id: str, memo_id: str, request: MemoChatRequest):
             "All numeric values must be raw numbers, not formatted strings.\n"
             + (
                 "When modifying charts, include ALL existing charts in the array (not just the changed one), "
-                "otherwise unchanged charts will be lost.\n\n"
+                "otherwise unchanged charts will be lost.\n"
+                "If the user asks to convert a chart into a table, REMOVE that chart from the charts array "
+                "in <updated_charts> and add the table as markdown in the appropriate section via <updated_section>.\n\n"
                 if has_charts else "\n"
             )
+            + "## REMINDER\n"
+            "NEVER just describe or announce what you would change. ALWAYS output the actual <updated_section> "
+            "and/or <updated_charts> tags with full content. If you don't include the tags, nothing will update.\n"
         )
 
         user_prompt = f"Current Investment Memo:\n\n{memo_context}{chart_context}{document_context}\n\n---\n\nUser: {request.message}"
@@ -2966,8 +2971,11 @@ async def memo_chat(data_room_id: str, memo_id: str, request: MemoChatRequest):
             try:
                 charts_json = _json.loads(charts_match.group(1).strip())
                 if isinstance(charts_json, dict) and "charts" in charts_json:
-                    update_memo_metadata(memo_id, {"chart_data": charts_json})
-                    updated_charts = charts_json
+                    from tools.memo_generator import _validate_and_fix_chart_specs
+                    charts_json = _validate_and_fix_chart_specs(charts_json)
+                    if charts_json:
+                        update_memo_metadata(memo_id, {"chart_data": charts_json})
+                        updated_charts = charts_json
                     # Strip the tag from the displayed answer
                     answer_text = answer_text[:charts_match.start()].strip()
                     if not answer_text and tag_match:

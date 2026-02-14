@@ -1039,7 +1039,7 @@ export const sendMemoChat = async (
   memoId: string,
   message: string
 ): Promise<MemoChatResponse> => {
-  const response = await api.post(`/api/data-room/${dataRoomId}/memo/${memoId}/chat`, { message });
+  const response = await api.post(`/api/data-room/${dataRoomId}/memo/${memoId}/chat`, { message }, { timeout: 120000 });
   return response.data;
 };
 

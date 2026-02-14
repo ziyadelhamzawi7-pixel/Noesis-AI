@@ -24,6 +24,16 @@ export default function ChartRenderer({ spec }: { spec: ChartSpec }) {
     return null;
   }
 
+  // Verify at least one data point has a numeric y_key value.
+  // If Claude's y_key doesn't match data keys, all values will be undefined
+  // and Recharts renders an empty chart.
+  const hasValidYValues = spec.data.some(
+    (d) => spec.y_key in d && typeof d[spec.y_key] === 'number'
+  );
+  if (!hasValidYValues) {
+    return null;
+  }
+
   const getColor = (entry: Record<string, any>, index: number): string => {
     if (spec.color_key && typeof spec.colors === 'object' && spec.color_key in (entry || {})) {
       return (spec.colors as Record<string, string>)[entry[spec.color_key]] || '#6366f1';
