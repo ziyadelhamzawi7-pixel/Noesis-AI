@@ -82,6 +82,7 @@ class GoogleOAuthService:
         )
 
         logger.info(f"Created OAuth authorization URL with state: {state[:8]}...")
+        logger.info(f"Full auth URL: {auth_url}")
 
         return {
             "auth_url": auth_url,
