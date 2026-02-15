@@ -22,6 +22,9 @@ class Settings(BaseSettings):
     google_client_id: str = os.getenv("GOOGLE_CLIENT_ID", "")
     google_client_secret: str = os.getenv("GOOGLE_CLIENT_SECRET", "")
 
+    # Public URL (set this in production to the app's public-facing URL, e.g. https://myapp.up.railway.app)
+    public_url: str = os.getenv("PUBLIC_URL", "")
+
     # Application Settings
     security_level: str = os.getenv("SECURITY_LEVEL", "local_only")
     max_cost_per_data_room: float = float(os.getenv("MAX_COST_PER_DATA_ROOM", "15.0"))

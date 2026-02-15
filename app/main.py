@@ -3304,23 +3304,18 @@ async def google_auth_login(request: Request):
         Authorization URL and state for CSRF protection
     """
     try:
-        # Build redirect URI from the actual request so it works in both local and deployed envs
-        # Prefer X-Forwarded-Host/Proto (set by Railway/reverse proxies), fall back to Host header
-        forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
-        forwarded_proto = request.headers.get("x-forwarded-proto", "https" if forwarded_host and "localhost" not in forwarded_host else "http")
-        if forwarded_host:
-            base_url = f"{forwarded_proto}://{forwarded_host}"
+        # Build redirect URI: use PUBLIC_URL env var if set, otherwise detect from request headers
+        if settings.public_url:
+            base_url = settings.public_url.rstrip("/")
         else:
-            # Last resort: try origin/referer headers
-            origin = request.headers.get("origin") or request.headers.get("referer", "")
-            if origin:
-                from urllib.parse import urlparse
-                parsed = urlparse(origin)
-                base_url = f"{parsed.scheme}://{parsed.netloc}"
+            forwarded_host = request.headers.get("x-forwarded-host") or request.headers.get("host", "")
+            forwarded_proto = request.headers.get("x-forwarded-proto", "https" if forwarded_host and "localhost" not in forwarded_host else "http")
+            if forwarded_host:
+                base_url = f"{forwarded_proto}://{forwarded_host}"
             else:
                 base_url = f"http://localhost:{settings.port}"
         redirect_uri = f"{base_url}/api/auth/google/callback"
-        logger.info(f"OAuth redirect_uri: {redirect_uri} (host={forwarded_host}, proto={forwarded_proto})")
+        logger.info(f"OAuth redirect_uri: {redirect_uri}")
         result = google_oauth_service.create_auth_url(redirect_uri)
 
         # Store state for verification
