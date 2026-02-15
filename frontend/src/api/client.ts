@@ -32,7 +32,13 @@ api.interceptors.request.use((config) => {
 // during heavy uploads when the backend is temporarily busy.
 api.interceptors.response.use(
   (response) => response,
-  (error) => Promise.reject(error)
+  (error) => {
+    if (error.response?.status === 401) {
+      window.location.href = '/login';
+      return new Promise(() => {}); // Prevent further error handling during redirect
+    }
+    return Promise.reject(error);
+  }
 );
 
 // Types
