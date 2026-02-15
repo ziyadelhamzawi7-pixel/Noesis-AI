@@ -10,6 +10,9 @@ from typing import Optional, Dict, Any
 from datetime import datetime, timedelta
 from pathlib import Path
 
+# Allow OAuth scope changes (e.g. user declines Drive access but grants profile/email)
+os.environ["OAUTHLIB_RELAX_TOKEN_SCOPE"] = "1"
+
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import Flow
 from google.auth.transport.requests import Request
