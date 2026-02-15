@@ -862,7 +862,8 @@ class MemoGenerator:
 
 You are writing an investment memo for a venture capital firm based on data room documents.
 Be professional, analytical, and data-driven.
-Do NOT include source citations or document references in brackets (e.g., [Document 1: ...]) in your output. Just write the memo content directly.
+At the end of the section, include a "Sources" subsection listing the documents you referenced. Use this format:
+**Sources:** filename (page X), filename (Sheet: sheetname), etc. Only list documents you actually drew information from.
 {deal_context}
 
 Context from data room documents:
