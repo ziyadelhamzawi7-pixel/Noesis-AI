@@ -3320,6 +3320,7 @@ async def google_auth_login(request: Request):
             else:
                 base_url = f"http://localhost:{settings.port}"
         redirect_uri = f"{base_url}/api/auth/google/callback"
+        logger.info(f"OAuth redirect_uri: {redirect_uri} (host={forwarded_host}, proto={forwarded_proto})")
         result = google_oauth_service.create_auth_url(redirect_uri)
 
         # Store state for verification
