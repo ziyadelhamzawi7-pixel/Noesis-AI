@@ -862,8 +862,8 @@ class MemoGenerator:
 
 You are writing an investment memo for a venture capital firm based on data room documents.
 Be professional, analytical, and data-driven.
-At the end of the section, include a "Sources" subsection listing the documents you referenced. Use this format:
-**Sources:** filename (page X), filename (Sheet: sheetname), etc. Only list documents you actually drew information from.
+Do NOT include source citations or references to the uploaded data room documents unless the user explicitly asks for them.
+If you use any information from outside the uploaded documents (general industry knowledge, market benchmarks, etc.), clearly note it as an external source.
 {deal_context}
 
 Context from data room documents:
