@@ -63,6 +63,7 @@ class JobWorker:
         self._thread: Optional[threading.Thread] = None
         self._handlers: Dict[str, Callable] = {}
         self._indexer = None  # Lazy-initialized VectorDBIndexer, reused across files
+        self._chunker = None  # Lazy-initialized DocumentChunker, reused across files for token cache
 
         # Register default handlers
         self._register_default_handlers()
@@ -218,18 +219,13 @@ class JobWorker:
             if connected_folder_id not in _folder_progress:
                 # Initialize from DB — count already-finished files so the counter
                 # survives server restarts (in-memory dict is lost on restart).
-                # Use only enqueued files (complete/failed/queued/processing) as total,
-                # not files stuck in pending/downloading that were never enqueued.
+                # Use total_files from connected_folder (set during discovery phase)
+                # as the authoritative total. This avoids a race condition where
+                # dynamically counting by status returns a partial count while
+                # downloads are still in progress, causing premature completion.
                 already_done = db.count_processed_synced_files(connected_folder_id)
-                total_all = db.count_synced_files_by_status(connected_folder_id)
-                total_enqueued = (
-                    already_done +
-                    db.count_synced_files_by_status(connected_folder_id, 'queued') +
-                    db.count_synced_files_by_status(connected_folder_id, 'processing')
-                )
-                # Use total_all only if all files were enqueued; otherwise use enqueued count
-                # to prevent data room from getting stuck when some files were never enqueued
-                total = total_all if total_enqueued >= total_all else total_enqueued
+                folder_record = db.get_connected_folder(connected_folder_id)
+                total = folder_record['total_files'] if folder_record and folder_record.get('total_files') else 0
                 _folder_progress[connected_folder_id] = {'processed': already_done, 'total': total}
 
             _folder_progress[connected_folder_id]['processed'] += 1
@@ -254,6 +250,27 @@ class JobWorker:
 
         # Complete when all files are processed (including failures)
         if processed >= total and total > 0:
+            # Verify against DB to prevent race conditions. The in-memory total
+            # may have been initialized before all files were discovered/enqueued.
+            # Only trigger completion when:
+            # 1. Downloads are finished (sync_stage past 'processing')
+            # 2. All synced files are in a terminal state (complete/failed)
+            folder_record = db.get_connected_folder(connected_folder_id)
+            downloads_done = folder_record.get('sync_stage') in ('queued', 'complete') if folder_record else False
+            db_processed = db.count_processed_synced_files(connected_folder_id)
+            db_total = folder_record['total_files'] if folder_record and folder_record.get('total_files') else total
+
+            if not downloads_done or db_processed < db_total:
+                # Not actually complete — downloads still running or files still processing.
+                # Correct the in-memory total so future checks use the right number.
+                with _folder_progress_lock:
+                    if connected_folder_id in _folder_progress:
+                        _folder_progress[connected_folder_id]['total'] = db_total
+                if data_room_id:
+                    corrected_progress = (10 + (db_processed / db_total) * 90) if db_total > 0 else 10
+                    db.update_data_room_status(data_room_id, 'parsing', progress=corrected_progress)
+                return
+
             try:
                 db.update_connected_folder_stage(connected_folder_id, sync_stage='complete')
             except Exception as e:
@@ -268,7 +285,7 @@ class JobWorker:
                     doc_count = len(db.get_documents_by_data_room(data_room_id))
                     with db.get_db_connection() as conn:
                         conn.execute(
-                            "UPDATE data_rooms SET total_documents = ? WHERE id = ?",
+                            "UPDATE data_rooms SET total_documents = %s WHERE id = %s",
                             (doc_count, data_room_id)
                         )
                         conn.commit()
@@ -336,6 +353,26 @@ class JobWorker:
     # Job Handlers
     # ========================================================================
 
+    @staticmethod
+    def _is_english_text(text: str) -> bool:
+        """Check if text is predominantly English by examining character distribution.
+
+        Uses a simple heuristic: English text is mostly ASCII letters, digits,
+        punctuation, and whitespace. Non-Latin scripts (Arabic, CJK, Cyrillic, etc.)
+        will have a low ratio of these characters.
+        """
+        if not text or len(text.strip()) < 50:
+            return True  # Too short to judge — assume English
+
+        # Sample up to 2000 chars, strip whitespace-heavy sections
+        sample = text[:2000]
+        # Count characters that are ASCII letters or common in English text
+        english_chars = sum(1 for c in sample if c.isascii())
+        ratio = english_chars / len(sample)
+
+        # English text is typically >85% ASCII. Non-Latin scripts drop well below 50%.
+        return ratio > 0.6
+
     def _mark_file_failed(self, payload: Dict[str, Any], data_room_id: str, error_msg: str, page_count: int = 0):
         """Mark a file as failed and update all progress trackers so the data room can still complete."""
         if 'document_id' in payload:
@@ -371,6 +408,29 @@ class JobWorker:
 
         logger.info(f"[{data_room_id}] Processing file: {file_name}")
 
+        # Signal that a worker has claimed this job (moves progress off 0%)
+        # Skip for folder syncs and multi-file uploads (they have their own progress tracking)
+        if data_room_id and not payload.get('connected_folder_id') and not (payload.get('upload_total_files', 0) > 1):
+            db.update_data_room_status(data_room_id, 'uploading', progress=8)
+
+        # Guard: skip if document is already fully parsed (prevents re-parsing on restart)
+        document_id = payload.get('document_id')
+        if document_id:
+            existing_doc = db.get_document_by_id(document_id)
+            if existing_doc and existing_doc.get('parse_status') == 'parsed':
+                logger.info(f"[{data_room_id}] Skipping already-parsed document: {file_name}")
+                synced_file_id = payload.get('synced_file_id')
+                if synced_file_id:
+                    db.update_synced_file_status(synced_file_id, sync_status='complete', document_id=document_id)
+                self._update_folder_progress(payload, data_room_id)
+                if not payload.get('connected_folder_id'):
+                    upload_total = payload.get('upload_total_files')
+                    if upload_total and upload_total > 1 and data_room_id:
+                        self._update_upload_progress(data_room_id, upload_total)
+                    elif data_room_id:
+                        db.update_data_room_status(data_room_id, 'complete', progress=100)
+                return
+
         # Check memory before processing
         can_process, error = can_process_file(file_path)
         if not can_process:
@@ -378,7 +438,7 @@ class JobWorker:
 
         # Import processing tools
         from tools.ingest_data_room import parse_file_by_type
-        from tools.chunk_documents import chunk_documents
+        from tools.chunk_documents import chunk_documents, DocumentChunker
         from tools.generate_embeddings import generate_embeddings, generate_embeddings_streaming
         from tools.index_to_vectordb import index_to_vectordb, VectorDBIndexer
 
@@ -392,8 +452,11 @@ class JobWorker:
         # Skip for folder syncs (folder-level progress handles it) and
         # multi-file uploads (proportional progress in _update_upload_progress handles it).
         is_multi_file = payload.get('upload_total_files', 0) > 1
-        if data_room_id and not payload.get('connected_folder_id') and not is_multi_file:
-            db.update_data_room_status(data_room_id, 'parsing', progress=25)
+        if data_room_id and not payload.get('connected_folder_id'):
+            if is_multi_file:
+                db.update_data_room_status(data_room_id, 'parsing', progress=5)
+            else:
+                db.update_data_room_status(data_room_id, 'parsing', progress=25)
 
         logger.info(f"[{data_room_id}] Parsing {file_name} (timeout: {settings.parse_timeout_seconds}s)...")
         with ThreadPoolExecutor(max_workers=1) as parse_executor:
@@ -417,9 +480,24 @@ class JobWorker:
             self._mark_file_failed(payload, data_room_id, error_msg, page_count=parsed.get('page_count', 0))
             return  # Deterministic error — no point retrying; _mark_file_failed already updated progress
 
+        # Skip non-English documents (spreadsheets are language-agnostic, so skip this check for them)
+        if file_type not in ('.xlsx', '.xls', '.csv'):
+            text_sample = (parsed.get('text') or '')[:2000]
+            if text_sample and not self._is_english_text(text_sample):
+                error_msg = f"Skipped: document does not appear to be in English"
+                logger.warning(f"[{data_room_id}] {file_name}: {error_msg}")
+                self._mark_file_failed(payload, data_room_id, error_msg, page_count=parsed.get('page_count', 0))
+                return
+
         # Chunk document
         logger.info(f"[{data_room_id}] Chunking {file_name}...")
-        chunks = chunk_documents(parsed, chunk_size=settings.max_chunk_size, overlap=settings.chunk_overlap)
+        if self._chunker is None:
+            self._chunker = DocumentChunker(chunk_size=settings.max_chunk_size, overlap=settings.chunk_overlap)
+        chunks = chunk_documents(parsed, chunker=self._chunker)
+
+        # Chunking complete — intermediate milestone so bar doesn't sit at 25% for the full parse+chunk duration
+        if data_room_id and not payload.get('connected_folder_id') and not is_multi_file:
+            db.update_data_room_status(data_room_id, 'parsing', progress=35)
 
         indexed_count = 0
         total_token_count = 0
@@ -477,6 +555,11 @@ class JobWorker:
                         file_frac = indexed_count / len(chunks)
                         overall = 10 + ((base + file_frac) / upload_total) * 90
                         db.update_data_room_status(data_room_id, 'parsing', progress=int(min(overall, 99)))
+                    elif not payload.get('connected_folder_id') and not is_multi_file and data_room_id:
+                        # Single-file embedding progress: range 50-95%
+                        file_frac = indexed_count / len(chunks)
+                        single_progress = 50 + file_frac * 45
+                        db.update_data_room_status(data_room_id, 'indexing', progress=int(min(single_progress, 95)))
 
                 # Wait for all pipelined writes to complete (with timeout to prevent hangs)
                 WRITE_TIMEOUT = 120  # seconds
@@ -691,7 +774,7 @@ class WorkerPool:
         max_workers: int = 20,
         scale_up_threshold: int = 10,
         scale_down_threshold: int = 3,
-        check_interval: float = 5.0
+        check_interval: float = 2.0
     ):
         """
         Initialize auto-scaling worker pool.
@@ -805,10 +888,16 @@ class WorkerPool:
                     # Scale up if queue is backing up and memory allows
                     if pending > self.scale_up_threshold and memory_ok:
                         if current_workers < self.max_workers:
-                            self._add_worker()
+                            # Burst-scale: add multiple workers at once for large queues
+                            if pending > 20:
+                                workers_to_add = self.max_workers - current_workers
+                            else:
+                                workers_to_add = min(3, self.max_workers - current_workers)
+                            for _ in range(workers_to_add):
+                                self._add_worker()
                             logger.info(
                                 f"Scaled up to {len(self.workers)} workers "
-                                f"(queue depth: {pending})"
+                                f"(+{workers_to_add}, queue depth: {pending})"
                             )
 
                     # Scale down if queue is mostly empty

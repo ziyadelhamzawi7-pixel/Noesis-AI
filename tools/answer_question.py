@@ -7,9 +7,10 @@ import sys
 import os
 import re
 from pathlib import Path
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any, Optional, Generator
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
 from datetime import datetime
 from loguru import logger
 
@@ -56,6 +57,7 @@ class QuestionAnswerer:
         self.client = Anthropic(api_key=api_key)
         self.model = model
         self.max_context_chunks = max_context_chunks
+        self.haiku_model = "claude-3-5-haiku-20241022"
         self.max_tokens = 2048
         self.api_timeout = 90  # seconds
 
@@ -81,7 +83,7 @@ class QuestionAnswerer:
         filters: Optional[Dict[str, Any]] = None
     ) -> Dict[str, Any]:
         """
-        Answer a question using RAG pipeline.
+        Answer a question using RAG pipeline with optional web search.
 
         Args:
             question: Analyst's question
@@ -97,15 +99,18 @@ class QuestionAnswerer:
         logger.info(f"Answering question for data room {data_room_id}")
         logger.debug(f"Question: {question}")
 
-        # Step 1: Semantic search for relevant chunks
-        search_results = semantic_search(
-            query=question,
+        # Determine if web search is enabled
+        web_search_enabled = self._should_use_web_search()
+
+        # Step 1: Multi-query semantic search for relevant chunks
+        search_results = self._multi_query_search(
+            question=question,
             data_room_id=data_room_id,
-            top_k=self.max_context_chunks * 3,  # Get extra for reranking
+            top_k=self.max_context_chunks * 2,  # Get extra for reranking
             filters=filters
         )
 
-        if not search_results:
+        if not search_results and not web_search_enabled:
             logger.warning("No relevant context found")
             # Check if the collection exists and has documents
             no_results_reason = "I couldn't find relevant information in the data room documents to answer this question."
@@ -139,40 +144,92 @@ class QuestionAnswerer:
             }
 
         # Step 2: Select top chunks for context
-        context_chunks = search_results[:self.max_context_chunks]
+        context_chunks = search_results[:self.max_context_chunks] if search_results else []
 
-        # Step 3: Build prompt with context
-        prompt = self._build_prompt(question, context_chunks, conversation_history)
+        # Step 3: Build web search tool config
+        tools = None
+        if web_search_enabled:
+            tools = [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": self._get_web_search_max_uses(),
+            }]
 
-        # Step 4: Call Claude API
+        # Step 4: Build prompt with context
+        prompt = self._build_prompt(question, context_chunks, conversation_history,
+                                     web_search_enabled=web_search_enabled)
+
+        # Step 5: Call Claude API
         try:
-            response = self.client.messages.create(
-                model=self.model,
-                max_tokens=self.max_tokens,
-                temperature=0.3,
-                timeout=self.api_timeout,
-                messages=[{"role": "user", "content": prompt}]
-            )
+            max_tokens = 4096 if tools else self.max_tokens
+            timeout = 150 if tools else self.api_timeout
 
-            answer_text = response.content[0].text
+            kwargs = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+                "timeout": timeout,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if tools:
+                kwargs["tools"] = tools
+
+            response = self.client.messages.create(**kwargs)
+
+            total_input = response.usage.input_tokens
+            total_output = response.usage.output_tokens
+            all_content = list(response.content)
+
+            # Handle pause_turn: Claude paused mid-turn (e.g. during web search)
+            if response.stop_reason == "pause_turn":
+                continuation_messages = [
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": response.content},
+                ]
+                kwargs["messages"] = continuation_messages
+                response2 = self.client.messages.create(**kwargs)
+                all_content.extend(response2.content)
+                total_input += response2.usage.input_tokens
+                total_output += response2.usage.output_tokens
+
+            # Extract text (skip narration before tool calls when tools are used)
+            if tools:
+                answer_text = self._extract_text_after_tools(all_content)
+            else:
+                answer_text = response.content[0].text
+
+            # Extract web sources and search count
+            web_sources = []
+            web_search_count = 0
+            if tools:
+                # Build a minimal object with .content for _extract_web_sources
+                class _FakeMsg:
+                    pass
+                fake_msg = _FakeMsg()
+                fake_msg.content = all_content
+                web_sources = self._extract_web_sources(fake_msg)
+
+                server_tool_use = getattr(response.usage, 'server_tool_use', None)
+                if server_tool_use:
+                    web_search_count = getattr(server_tool_use, 'web_search_requests', 0)
 
             # Track usage
-            input_tokens = response.usage.input_tokens
-            output_tokens = response.usage.output_tokens
-            self.total_input_tokens += input_tokens
-            self.total_output_tokens += output_tokens
+            self.total_input_tokens += total_input
+            self.total_output_tokens += total_output
 
-            # Calculate cost
+            # Calculate cost (tokens + web search)
             pricing = self.pricing.get(self.model, {"input": 3.0, "output": 15.0})
-            cost = (input_tokens * pricing["input"] / 1_000_000) + \
-                   (output_tokens * pricing["output"] / 1_000_000)
+            token_cost = (total_input * pricing["input"] / 1_000_000) + \
+                         (total_output * pricing["output"] / 1_000_000)
+            web_search_cost = web_search_count * 0.01
+            cost = token_cost + web_search_cost
             self.total_cost += cost
 
-            # Step 5: Extract and validate citations
-            sources = self._extract_sources(context_chunks)
+            # Step 6: Extract and validate citations
+            sources = self._extract_sources(context_chunks) if context_chunks else []
 
             # Calculate confidence based on similarity scores
-            avg_similarity = sum(c['similarity_score'] for c in context_chunks) / len(context_chunks)
+            avg_similarity = (sum(c['similarity_score'] for c in context_chunks) / len(context_chunks)) if context_chunks else 0.0
             confidence_score = round(avg_similarity, 3)
 
             response_time_ms = int((time.time() - start_time) * 1000)
@@ -181,17 +238,22 @@ class QuestionAnswerer:
                 "question": question,
                 "answer": answer_text,
                 "sources": sources,
+                "web_sources": web_sources,
+                "web_search_count": web_search_count,
                 "confidence_score": confidence_score,
-                "tokens_used": input_tokens + output_tokens,
-                "input_tokens": input_tokens,
-                "output_tokens": output_tokens,
+                "tokens_used": total_input + total_output,
+                "input_tokens": total_input,
+                "output_tokens": total_output,
                 "cost": round(cost, 6),
                 "response_time_ms": response_time_ms,
                 "model": self.model,
                 "timestamp": datetime.now().isoformat()
             }
 
-            logger.success(f"Generated answer in {response_time_ms}ms, cost: ${cost:.4f}")
+            logger.success(
+                f"Generated answer in {response_time_ms}ms, cost: ${cost:.4f}"
+                + (f", {web_search_count} web searches" if web_search_count else "")
+            )
 
             return result
 
@@ -216,16 +278,286 @@ class QuestionAnswerer:
                 "response_time_ms": int((time.time() - start_time) * 1000)
             }
 
+    def _expand_query(self, question: str) -> List[str]:
+        """
+        Use Claude Haiku to generate 2-3 keyword-rich search queries
+        from the user's question to improve retrieval recall.
+
+        Returns empty list on failure, preserving single-query behavior.
+        """
+        prompt = f"""You are a search query expander for a venture capital due diligence system.
+Given an analyst's question about a company, generate 2-3 alternative search queries that would better match the actual content in data room documents (pitch decks, financial models, cap tables, legal docs, etc.).
+
+Rules:
+- Each query should be keyword-rich, using terms that would actually appear in documents
+- Focus on specific nouns, titles, metrics, and domain terminology
+- Do NOT rephrase the question — generate queries that would MATCH document content
+- Return ONLY the queries, one per line, no numbering, no bullets, no explanation
+
+Example:
+Question: "Give me highlights of the team"
+Queries:
+founders team CEO CTO background experience leadership
+advisors board members management team hiring key personnel
+co-founder education prior companies executive biography
+
+Question: "What's the company's competitive advantage?"
+Queries:
+competitive advantage moat differentiation unique value proposition
+competitors market positioning intellectual property patents technology
+
+Question: "{question}"
+Queries:"""
+
+        try:
+            response = self.client.messages.create(
+                model=self.haiku_model,
+                max_tokens=200,
+                temperature=0.3,
+                timeout=10,
+                messages=[{"role": "user", "content": prompt}]
+            )
+
+            raw_text = response.content[0].text.strip()
+
+            queries = [
+                line.strip()
+                for line in raw_text.split("\n")
+                if line.strip() and not line.strip().startswith(("Question:", "Queries:"))
+            ][:3]
+
+            if queries:
+                logger.debug(f"Query expansion generated {len(queries)} additional queries: {queries}")
+
+            return queries
+
+        except Exception as e:
+            logger.warning(f"Query expansion failed (falling back to single query): {e}")
+            return []
+
+    def _keyword_search(
+        self,
+        question: str,
+        expanded_queries: List[str],
+        data_room_id: str,
+        top_k: int
+    ) -> List[Dict[str, Any]]:
+        """
+        Search chunks by keyword matching in PostgreSQL.
+        Returns results formatted to match semantic search output.
+        """
+        try:
+            sys.path.insert(0, str(Path(__file__).parent.parent))
+            from app.database import search_chunks_by_keywords
+        except ImportError:
+            logger.warning("Could not import database module for keyword search")
+            return []
+
+        # Extract meaningful keywords (4+ chars) from question and expanded queries
+        all_text = question + " " + " ".join(expanded_queries)
+        stop_words = {"what", "give", "tell", "about", "highlights", "with", "from",
+                       "that", "this", "have", "does", "their", "they", "some", "more",
+                       "been", "were", "will", "would", "could", "should", "which"}
+        keywords = [
+            w for w in all_text.lower().split()
+            if len(w) >= 3 and w not in stop_words
+        ]
+        # Deduplicate while preserving order
+        seen = set()
+        unique_keywords = []
+        for kw in keywords:
+            if kw not in seen:
+                seen.add(kw)
+                unique_keywords.append(kw)
+
+        if not unique_keywords:
+            return []
+
+        try:
+            db_chunks = search_chunks_by_keywords(
+                data_room_id=data_room_id,
+                keywords=unique_keywords[:10],  # Limit keywords to avoid huge queries
+                limit=top_k
+            )
+        except Exception as e:
+            logger.warning(f"Keyword search failed: {e}")
+            return []
+
+        # Format to match semantic search output
+        formatted = []
+        for i, chunk in enumerate(db_chunks):
+            metadata_json = chunk.get('metadata', '{}')
+            try:
+                metadata = json.loads(metadata_json) if isinstance(metadata_json, str) else (metadata_json or {})
+            except (json.JSONDecodeError, TypeError):
+                metadata = {}
+
+            formatted.append({
+                'rank': i + 1,
+                'chunk_id': chunk.get('id', f'kw_{i}'),
+                'chunk_text': chunk.get('chunk_text', ''),
+                'similarity_score': 0.5,  # Synthetic score for keyword matches
+                'distance': 1.0,
+                'metadata': metadata,
+                'source': {
+                    'file_name': chunk.get('file_name', metadata.get('file_name', 'Unknown')),
+                    'page_number': chunk.get('page_number'),
+                    'section_title': chunk.get('section_title', ''),
+                    'document_category': chunk.get('document_category', metadata.get('document_category', '')),
+                    'sheet_name': metadata.get('sheet_name'),
+                    'row_start': metadata.get('row_start'),
+                    'row_end': metadata.get('row_end'),
+                    'currency': metadata.get('currency'),
+                }
+            })
+
+        if formatted:
+            logger.info(f"Keyword search found {len(formatted)} chunks for keywords: {unique_keywords[:5]}")
+
+        return formatted
+
+    def _multi_query_search(
+        self,
+        question: str,
+        data_room_id: str,
+        top_k: int,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Hybrid search: semantic search (with query expansion) + keyword search.
+        All searches run in parallel using threads.
+        Uses round-robin selection to guarantee each source contributes results.
+        """
+        search_start = time.time()
+        per_query_results: List[List[Dict[str, Any]]] = []
+
+        def _do_semantic(query: str) -> List[Dict[str, Any]]:
+            try:
+                return semantic_search(
+                    query=query,
+                    data_room_id=data_room_id,
+                    top_k=top_k,
+                    filters=filters,
+                )
+            except Exception as e:
+                logger.warning(f"Search failed for query '{query[:50]}...': {e}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=6) as pool:
+            # Immediately start: original query search + keyword search + query expansion
+            original_future = pool.submit(_do_semantic, question)
+            keyword_future = pool.submit(
+                self._keyword_search, question, [], data_room_id, top_k
+            )
+            expand_future = pool.submit(self._expand_query, question)
+
+            # Wait for expansion to finish, then submit expanded query searches
+            expanded_futures: List[Future] = []
+            try:
+                expanded_queries = expand_future.result(timeout=10)
+            except Exception:
+                expanded_queries = []
+
+            for eq in expanded_queries:
+                expanded_futures.append(pool.submit(_do_semantic, eq))
+
+            # Re-submit keyword search with expanded queries if we got any
+            if expanded_queries:
+                keyword_future_2 = pool.submit(
+                    self._keyword_search, question, expanded_queries, data_room_id, top_k
+                )
+            else:
+                keyword_future_2 = None
+
+            # Collect original query results
+            per_query_results.append(original_future.result(timeout=15))
+
+            # Collect expanded query results
+            for ef in expanded_futures:
+                try:
+                    per_query_results.append(ef.result(timeout=15))
+                except Exception as e:
+                    logger.warning(f"Expanded search timed out: {e}")
+
+            # Collect keyword results (prefer expanded version if available)
+            kw_results: List[Dict[str, Any]] = []
+            if keyword_future_2 is not None:
+                try:
+                    kw_results = keyword_future_2.result(timeout=15)
+                except Exception:
+                    pass
+            if not kw_results:
+                try:
+                    kw_results = keyword_future.result(timeout=15)
+                except Exception:
+                    pass
+            if kw_results:
+                per_query_results.append(kw_results)
+
+        # Round-robin: take top results from each source in turns to ensure diversity
+        selected: List[Dict[str, Any]] = []
+        seen_ids: set = set()
+        max_rounds = top_k  # safety limit
+
+        for round_idx in range(max_rounds):
+            added_this_round = False
+            for query_results in per_query_results:
+                # Find the next unseen chunk from this query
+                while query_results:
+                    chunk = query_results.pop(0)
+                    cid = chunk.get("chunk_id", chunk.get("rank", id(chunk)))
+                    if cid not in seen_ids:
+                        seen_ids.add(cid)
+                        selected.append(chunk)
+                        added_this_round = True
+                        break
+                if len(selected) >= top_k:
+                    break
+            if len(selected) >= top_k or not added_this_round:
+                break
+
+        search_ms = int((time.time() - search_start) * 1000)
+        total_queries = 1 + len(expanded_queries)
+        logger.info(
+            f"Hybrid search: {total_queries} semantic queries + keyword search, "
+            f"{len(selected)} unique chunks selected (round-robin) in {search_ms}ms"
+        )
+
+        return selected
+
     def _build_prompt(
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        conversation_history: Optional[List[Dict[str, str]]] = None
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        web_search_enabled: bool = False
     ) -> str:
         """Build prompt for Claude with context and question."""
 
         # System instructions
-        system_prompt = """You are an AI assistant helping venture capital analysts with due diligence.
+        if web_search_enabled:
+            system_prompt = """You are an AI assistant helping venture capital analysts with due diligence.
+
+Your role:
+- Answer questions using both the provided data room documents AND web research when appropriate
+- For questions about the company's own documents (financials, pitch deck content, cap tables), rely primarily on the data room context
+- For questions requiring external context (market comparables, industry benchmarks, competitor analysis, recent news, public market data), use web search to find current, relevant information
+- Be concise but thorough
+- Use professional VC analysis language
+- If you need to make calculations or inferences, explain your reasoning
+- Never make up information or hallucinate facts
+- Do NOT include source citations or references to the uploaded data room documents unless the user explicitly asks for them.
+- When you use information from web research, clearly label it as coming from external sources and include the source name.
+- When citing monetary values, ALWAYS use the currency specified in the document context (e.g., NGN, USD, EUR). Different sheets or sections may use different currencies — respect each one. Never default to "$" unless the source explicitly uses USD.
+- Financial models may have historical sheets in local currency (e.g., NGN) and projection sheets in a different currency (e.g., USD). Always prefix monetary values with the correct currency code for their specific sheet as indicated by the "Currency:" label in the context.
+- Do not write any preamble or narration about your search process. Do not announce what you will search for. Write only the final analysis.
+
+Quality standards:
+- If context is ambiguous or contradictory, note this explicitly
+- Prioritize accuracy over completeness
+- When web research provides data that contradicts or supplements data room content, note both perspectives"""
+        else:
+            system_prompt = """You are an AI assistant helping venture capital analysts with due diligence.
 
 Your role:
 - Answer questions accurately based ONLY on the provided context from data room documents
@@ -321,6 +653,195 @@ Please provide a comprehensive answer based on the context above."""
                 seen_sources.add(source_key)
 
         return sources
+
+    def _should_use_web_search(self) -> bool:
+        """Check if web search is globally enabled via config."""
+        try:
+            from app.config import settings
+            return settings.qa_web_search_enabled
+        except ImportError:
+            return os.getenv("QA_WEB_SEARCH_ENABLED", "True").lower() == "true"
+
+    def _get_web_search_max_uses(self) -> int:
+        """Get the max web searches per question from config."""
+        try:
+            from app.config import settings
+            return settings.qa_web_search_max_uses
+        except ImportError:
+            return int(os.getenv("QA_WEB_SEARCH_MAX_USES", "10"))
+
+    def _extract_web_sources(self, final_message) -> List[Dict[str, Any]]:
+        """Extract web search source citations from Claude's response content blocks."""
+        web_sources = []
+        seen_urls = set()
+
+        for block in final_message.content:
+            if hasattr(block, 'type') and block.type == 'web_search_tool_result':
+                for result in getattr(block, 'search_results', []):
+                    url = getattr(result, 'url', '')
+                    if url and url not in seen_urls:
+                        seen_urls.add(url)
+                        snippet = getattr(result, 'snippet', '') or ''
+                        web_sources.append({
+                            'type': 'web',
+                            'title': getattr(result, 'title', ''),
+                            'url': url,
+                            'snippet': snippet[:200],
+                        })
+
+        return web_sources
+
+    def _extract_text_after_tools(self, content_blocks) -> str:
+        """Extract text from content blocks, skipping narration before tool calls.
+
+        Web search responses interleave text + server_tool_use + web_search_tool_result blocks.
+        Only keep text blocks after the last tool block (the final analysis).
+        """
+        last_tool_idx = -1
+        for i, block in enumerate(content_blocks):
+            if not hasattr(block, 'text'):
+                last_tool_idx = i
+        text_parts = []
+        for i, block in enumerate(content_blocks):
+            if hasattr(block, 'text') and i > last_tool_idx:
+                text_parts.append(block.text)
+        return "".join(text_parts)
+
+    def answer_stream(
+        self,
+        question: str,
+        data_room_id: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> Generator[str, None, None]:
+        """
+        Stream an answer as SSE events.
+
+        Yields SSE-formatted lines:
+          data: {"type": "search_done", "sources": [...]}
+          data: {"type": "web_search_status", "status": "searching", "count": N}
+          data: {"type": "delta", "text": "..."}
+          data: {"type": "done", "metadata": {...}}
+        """
+        start_time = time.time()
+
+        # Determine if web search is enabled
+        web_search_enabled = self._should_use_web_search()
+
+        # Step 1: Search (same as non-streaming)
+        search_results = self._multi_query_search(
+            question=question,
+            data_room_id=data_room_id,
+            top_k=self.max_context_chunks * 2,
+            filters=filters,
+        )
+
+        if not search_results and not web_search_enabled:
+            yield f"data: {json.dumps({'type': 'done', 'metadata': {'answer': 'I could not find relevant information in the data room documents to answer this question.', 'sources': [], 'confidence_score': 0.0, 'response_time_ms': int((time.time() - start_time) * 1000)}})}\n\n"
+            return
+
+        context_chunks = search_results[:self.max_context_chunks] if search_results else []
+        sources = self._extract_sources(context_chunks) if context_chunks else []
+
+        # Emit document sources immediately so frontend can show them while answer streams
+        yield f"data: {json.dumps({'type': 'search_done', 'sources': sources})}\n\n"
+
+        # Step 2: Build web search tool config
+        tools = None
+        if web_search_enabled:
+            tools = [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": self._get_web_search_max_uses(),
+            }]
+
+        # Step 3: Build prompt (with web search awareness)
+        prompt = self._build_prompt(question, context_chunks, conversation_history,
+                                     web_search_enabled=web_search_enabled)
+
+        # Step 4: Stream Claude response
+        try:
+            answer_parts: List[str] = []
+            input_tokens = 0
+            output_tokens = 0
+            web_search_count = 0
+            web_sources: List[Dict[str, Any]] = []
+
+            # Increase limits when web search is enabled
+            max_tokens = 4096 if tools else self.max_tokens
+            timeout = 150 if tools else self.api_timeout
+
+            stream_kwargs = {
+                "model": self.model,
+                "max_tokens": max_tokens,
+                "temperature": 0.3,
+                "timeout": timeout,
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            if tools:
+                stream_kwargs["tools"] = tools
+
+            with self.client.messages.stream(**stream_kwargs) as stream:
+                for event in stream:
+                    # Detect web search tool use starting
+                    if event.type == "content_block_start":
+                        if hasattr(event.content_block, 'type') and event.content_block.type == "server_tool_use":
+                            web_search_count += 1
+                            yield f"data: {json.dumps({'type': 'web_search_status', 'status': 'searching', 'count': web_search_count})}\n\n"
+
+                    # Stream text deltas to frontend (skip tool JSON deltas)
+                    elif event.type == "content_block_delta" and hasattr(event.delta, "text"):
+                        text = event.delta.text
+                        answer_parts.append(text)
+                        yield f"data: {json.dumps({'type': 'delta', 'text': text})}\n\n"
+
+                # Get final usage and web sources from the accumulated message
+                final_message = stream.get_final_message()
+                input_tokens = final_message.usage.input_tokens
+                output_tokens = final_message.usage.output_tokens
+
+                # Extract web search sources from response content blocks
+                if tools:
+                    web_sources = self._extract_web_sources(final_message)
+
+                    # Get accurate web search count from usage metadata
+                    server_tool_use = getattr(final_message.usage, 'server_tool_use', None)
+                    if server_tool_use:
+                        web_search_count = getattr(server_tool_use, 'web_search_requests', web_search_count)
+
+            full_answer = "".join(answer_parts)
+
+            # Calculate cost (tokens + web search)
+            pricing = self.pricing.get(self.model, {"input": 3.0, "output": 15.0})
+            token_cost = (input_tokens * pricing["input"] / 1_000_000) + \
+                         (output_tokens * pricing["output"] / 1_000_000)
+            web_search_cost = web_search_count * 0.01
+            cost = token_cost + web_search_cost
+
+            avg_similarity = (sum(c['similarity_score'] for c in context_chunks) / len(context_chunks)) if context_chunks else 0.0
+            response_time_ms = int((time.time() - start_time) * 1000)
+
+            done_metadata = {
+                'answer': full_answer,
+                'sources': sources,
+                'web_sources': web_sources,
+                'web_search_count': web_search_count,
+                'confidence_score': round(avg_similarity, 3),
+                'tokens_used': input_tokens + output_tokens,
+                'cost': round(cost, 6),
+                'response_time_ms': response_time_ms,
+                'model': self.model,
+            }
+            yield f"data: {json.dumps({'type': 'done', 'metadata': done_metadata})}\n\n"
+
+            logger.success(
+                f"Streamed answer in {response_time_ms}ms, cost: ${cost:.4f}"
+                + (f", {web_search_count} web searches" if web_search_count else "")
+            )
+
+        except Exception as e:
+            logger.error(f"Streaming failed: {e}")
+            yield f"data: {json.dumps({'type': 'error', 'message': str(e)})}\n\n"
 
 
 class FinancialQuestionAnswerer(QuestionAnswerer):
@@ -427,16 +948,16 @@ class FinancialQuestionAnswerer(QuestionAnswerer):
         """
         Answer a question with optional financial context enrichment.
         """
-        # Check if this is a financial question
-        if self._is_financial_question(question):
-            # Get financial context
-            financial_context = self._get_financial_context(data_room_id)
+        self._prepare_financial_context(question, data_room_id)
+        return super().answer(question, data_room_id, conversation_history, filters)
 
+    def _prepare_financial_context(self, question: str, data_room_id: str) -> None:
+        """Set self._financial_context if the question is financial."""
+        if self._is_financial_question(question):
+            financial_context = self._get_financial_context(data_room_id)
             if financial_context:
                 logger.info(f"Adding financial context to question: {question[:50]}...")
-
-                # Enhance the question with context note
-                enhanced_prompt_note = f"""
+                self._financial_context = f"""
 
 Note: This question appears to be about financials. I have extracted financial metrics available from analyzed Excel files in this data room. Please use these extracted values to provide precise answers with specific numbers when available.
 
@@ -446,26 +967,33 @@ Note: This question appears to be about financials. I have extracted financial m
 
 Now answer the following question using both the extracted financial data above AND the document context below. Prioritize the extracted metrics for specific numbers, but use document context for additional details and verification.
 """
-                # Store the financial context to inject into the prompt
-                self._financial_context = enhanced_prompt_note
             else:
                 self._financial_context = None
         else:
             self._financial_context = None
 
-        # Call parent answer method
-        return super().answer(question, data_room_id, conversation_history, filters)
+    def answer_stream(
+        self,
+        question: str,
+        data_room_id: str,
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        filters: Optional[Dict[str, Any]] = None
+    ) -> Generator[str, None, None]:
+        """Stream with financial context enrichment."""
+        self._prepare_financial_context(question, data_room_id)
+        yield from super().answer_stream(question, data_room_id, conversation_history, filters)
 
     def _build_prompt(
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        conversation_history: Optional[List[Dict[str, str]]] = None
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        web_search_enabled: bool = False
     ) -> str:
         """Build prompt with optional financial context."""
 
         # Get base prompt
-        base_prompt = super()._build_prompt(question, context_chunks, conversation_history)
+        base_prompt = super()._build_prompt(question, context_chunks, conversation_history, web_search_enabled=web_search_enabled)
 
         # Inject financial context if available
         if hasattr(self, '_financial_context') and self._financial_context:
@@ -566,9 +1094,10 @@ You may include multiple charts if the analysis covers different dimensions.
         self,
         question: str,
         context_chunks: List[Dict[str, Any]],
-        conversation_history: Optional[List[Dict[str, str]]] = None
+        conversation_history: Optional[List[Dict[str, str]]] = None,
+        web_search_enabled: bool = False
     ) -> str:
-        base_prompt = super()._build_prompt(question, context_chunks, conversation_history)
+        base_prompt = super()._build_prompt(question, context_chunks, conversation_history, web_search_enabled=web_search_enabled)
 
         # Inject analytics instructions before the question
         parts = base_prompt.split("Question:")
@@ -640,6 +1169,26 @@ def answer_question(
         answerer = QuestionAnswerer(model=model)
 
     return answerer.answer(question, data_room_id, conversation_history, filters)
+
+
+def answer_question_stream(
+    question: str,
+    data_room_id: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+    filters: Optional[Dict[str, Any]] = None,
+    model: str = os.getenv("CLAUDE_MODEL", "claude-sonnet-4-20250514"),
+    use_financial_context: bool = True,
+) -> Generator[str, None, None]:
+    """
+    Streaming version of answer_question. Yields SSE-formatted events.
+    Falls back to non-streaming for analytical questions (they need post-processing for charts).
+    """
+    if use_financial_context:
+        answerer = FinancialQuestionAnswerer(model=model)
+    else:
+        answerer = QuestionAnswerer(model=model)
+
+    yield from answerer.answer_stream(question, data_room_id, conversation_history, filters)
 
 
 def main():

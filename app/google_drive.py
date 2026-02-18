@@ -4,6 +4,7 @@ Google Drive API integration for browsing, listing, and downloading files.
 
 import os
 import io
+import threading
 import requests as requests_lib
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -62,6 +63,7 @@ class GoogleDriveService:
         """
         self.credentials = credentials
         self.timeout = timeout
+        self._credentials_lock = threading.Lock()
 
         # Persistent session with connection pooling and transport-level retries
         # to avoid LibreSSL 2.8.3 TLS handshake failures on macOS
@@ -77,6 +79,13 @@ class GoogleDriveService:
         # Build service with credentials (uses default HTTP transport)
         # The requests library with google-auth handles SSL more reliably
         self.service = build('drive', 'v3', credentials=credentials)
+
+    def _ensure_valid_credentials(self):
+        """Thread-safe credential refresh. Uses double-check locking to avoid thundering herd."""
+        if self.credentials.expired or not self.credentials.token:
+            with self._credentials_lock:
+                if self.credentials.expired or not self.credentials.token:
+                    self.credentials.refresh(GoogleAuthRequest())
 
     @classmethod
     def from_tokens(
@@ -370,7 +379,8 @@ class GoogleDriveService:
         try:
             file = self.service.files().get(
                 fileId=file_id,
-                fields="id, name, mimeType, size, modifiedTime, createdTime, parents, webViewLink, description"
+                fields="id, name, mimeType, size, modifiedTime, createdTime, parents, webViewLink, description",
+                supportsAllDrives=True
             ).execute()
 
             mime_type = file.get('mimeType', '')
@@ -415,8 +425,7 @@ class GoogleDriveService:
             dest_path.parent.mkdir(parents=True, exist_ok=True)
 
             # Refresh credentials to get a valid access token
-            if self.credentials.expired or not self.credentials.token:
-                self.credentials.refresh(GoogleAuthRequest())
+            self._ensure_valid_credentials()
 
             # Use requests library for downloads to bypass LibreSSL 2.8.3 SSL issues
             # (httplib2/MediaIoBaseDownload fails with SSL errors on macOS system Python)
@@ -466,8 +475,7 @@ class GoogleDriveService:
             output_mime_type = mime_type
 
             # Refresh credentials to get a valid access token
-            if self.credentials.expired or not self.credentials.token:
-                self.credentials.refresh(GoogleAuthRequest())
+            self._ensure_valid_credentials()
 
             headers = {'Authorization': f'Bearer {self.credentials.token}'}
 
@@ -521,8 +529,7 @@ class GoogleDriveService:
             file_name = file_info['name']
             output_mime_type = mime_type
 
-            if self.credentials.expired or not self.credentials.token:
-                self.credentials.refresh(GoogleAuthRequest())
+            self._ensure_valid_credentials()
 
             headers = {'Authorization': f'Bearer {self.credentials.token}'}
 
@@ -809,4 +816,54 @@ class GoogleDriveService:
             return result.get('startPageToken')
         except HttpError as e:
             logger.error(f"Failed to get start page token: {e}")
+            raise
+
+    def upload_file(
+        self,
+        name: str,
+        content: bytes,
+        mime_type: str = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        parent_folder_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        Upload a file to Google Drive.
+
+        Requires the drive.file scope.
+
+        Args:
+            name: File name in Google Drive
+            content: File content as bytes
+            mime_type: MIME type of the file
+            parent_folder_id: Optional parent folder ID (defaults to Drive root)
+
+        Returns:
+            Dict with 'id' and 'webViewLink'
+        """
+        from googleapiclient.http import MediaIoBaseUpload
+
+        try:
+            file_metadata: Dict[str, Any] = {'name': name}
+            if parent_folder_id:
+                file_metadata['parents'] = [parent_folder_id]
+
+            media = MediaIoBaseUpload(
+                io.BytesIO(content),
+                mimetype=mime_type,
+                resumable=True
+            )
+
+            file = self.service.files().create(
+                body=file_metadata,
+                media_body=media,
+                fields='id, webViewLink'
+            ).execute()
+
+            logger.info(f"Uploaded file to Drive: {name} (id={file.get('id')})")
+            return {
+                'id': file.get('id'),
+                'webViewLink': file.get('webViewLink')
+            }
+
+        except HttpError as e:
+            logger.error(f"Failed to upload file to Drive: {e}")
             raise

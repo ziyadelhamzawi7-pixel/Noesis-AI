@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback, memo, Fragment } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { Send, FileText, AlertCircle, Loader2, MessageSquare, FileEdit, Sparkles, User, Users, UserPlus, Pencil, Trash2, Check } from 'lucide-react';
+import { Send, FileText, AlertCircle, Loader2, MessageSquare, FileEdit, Sparkles, User, Users, UserPlus, Pencil, Trash2, Check, Globe } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import InvestmentMemo from './InvestmentMemo';
@@ -8,6 +8,7 @@ import ChartRenderer from './ChartRenderer';
 import {
   getDataRoomStatus,
   askQuestion,
+  askQuestionStream,
   getQuestionHistory,
   getDocuments,
   deleteQuestion,
@@ -111,6 +112,8 @@ export default function ChatInterface() {
   const [pendingQuestionId, setPendingQuestionId] = useState<string | null>(null);
   const [streamingQuestionId, setStreamingQuestionId] = useState<string | null>(null);
   const [displayedAnswer, setDisplayedAnswer] = useState('');
+  const [isWebSearching, setIsWebSearching] = useState(false);
+  const [webSearchCount, setWebSearchCount] = useState(0);
   const streamingIntervalRef = useRef<number | null>(null);
   const streamingFullQuestionRef = useRef<Question | null>(null);
 
@@ -125,6 +128,9 @@ export default function ChatInterface() {
   const progressHighWaterMark = useRef<number>(0);
   // Track last progress change to detect stalls
   const lastProgressChangeRef = useRef<{ value: number; time: number }>({ value: 0, time: Date.now() });
+  // Trickle progress — smoothly advances displayed value between backend polls
+  const trickledProgress = useRef<number>(0);
+  const trickleIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   useEffect(() => {
     if (!dataRoomId) {
@@ -180,8 +186,13 @@ export default function ChatInterface() {
       // Enforce monotonic progress — never let progress_percent decrease
       if (status.processing_status === 'complete') {
         progressHighWaterMark.current = 100;
+        trickledProgress.current = 100;
       } else {
         progressHighWaterMark.current = Math.max(progressHighWaterMark.current, status.progress_percent);
+        // Keep trickle baseline in sync so it never shows a value below real progress
+        if (status.progress_percent > trickledProgress.current) {
+          trickledProgress.current = status.progress_percent;
+        }
       }
       // Track when progress last changed (for stall detection)
       if (status.progress_percent !== lastProgressChangeRef.current.value) {
@@ -344,6 +355,24 @@ export default function ChatInterface() {
     return () => clearInterval(interval);
   }, [dataRoom?.processing_status, syncProgress?.current_file?.file_name]);
 
+  // Trickle progress — slowly advance displayed value between backend polls
+  useEffect(() => {
+    const isActive = dataRoom && dataRoom.processing_status !== 'complete' && dataRoom.processing_status !== 'failed';
+    if (!isActive) {
+      if (trickleIntervalRef.current) { clearInterval(trickleIntervalRef.current); trickleIntervalRef.current = null; }
+      trickledProgress.current = 0;
+      return;
+    }
+    if (trickleIntervalRef.current) return;
+    trickleIntervalRef.current = setInterval(() => {
+      const c = trickledProgress.current;
+      const inc = c < 10 ? 1.5 : c < 30 ? 0.8 : c < 60 ? 0.5 : c < 90 ? 0.3 : 0.1;
+      trickledProgress.current = Math.min(c + inc, 95);
+      setDataRoom(prev => prev ? { ...prev } : prev);
+    }, 1000);
+    return () => { if (trickleIntervalRef.current) { clearInterval(trickleIntervalRef.current); trickleIntervalRef.current = null; } };
+  }, [dataRoom?.processing_status]);
+
   const loadHistory = async (filter?: 'team' | 'mine') => {
     if (!dataRoomId) return;
 
@@ -395,55 +424,88 @@ export default function ChatInterface() {
     setPendingQuestionId(tempId);
 
     try {
-      const response = await askQuestion(dataRoomId, { question: questionText });
+      let accumulatedAnswer = '';
 
-      const fullQuestion: Question = {
-        id: tempId,
-        question: questionText,
-        answer: response.answer,
-        sources: response.sources || [],
-        confidence_score: response.confidence,
-        created_at: new Date().toISOString(),
-        response_time_ms: response.response_time_ms,
-        cost: response.cost,
-        charts: response.charts,
-        is_analytical: response.is_analytical,
+      // Transition from pending to streaming as soon as the first token arrives
+      const startStreaming = () => {
+        if (streamingQuestionId !== tempId) {
+          setPendingQuestionId(null);
+          setStreamingQuestionId(tempId);
+          setDisplayedAnswer('');
+        }
       };
 
-      // Transition from pending to streaming the answer
-      setPendingQuestionId(null);
-      setStreamingQuestionId(tempId);
-      setDisplayedAnswer('');
-      streamingFullQuestionRef.current = fullQuestion;
+      await askQuestionStream(dataRoomId, { question: questionText }, {
+        onSearchDone: (sources) => {
+          // Show sources while we wait for the answer text
+          startStreaming();
+          streamingFullQuestionRef.current = {
+            id: tempId,
+            question: questionText,
+            answer: '',
+            sources: sources || [],
+            created_at: new Date().toISOString(),
+          };
+        },
+        onWebSearchStatus: (_status, count) => {
+          setIsWebSearching(true);
+          setWebSearchCount(count);
+        },
+        onDelta: (text) => {
+          startStreaming();
+          setIsWebSearching(false);
+          accumulatedAnswer += text;
+          setDisplayedAnswer(accumulatedAnswer);
+        },
+        onDone: (metadata) => {
+          // Merge document sources and web sources with type tags
+          const docSources = (metadata.sources || streamingFullQuestionRef.current?.sources || [])
+            .map((s: Source) => ({ ...s, type: 'document' as const }));
+          const webSources = (metadata.web_sources || []).map((s: any) => ({
+            document: s.title || 'Web Source',
+            excerpt: s.snippet || s.excerpt || '',
+            url: s.url,
+            type: 'web' as const,
+          }));
 
-      // Stream the answer with adaptive speed (~4s target duration)
-      const fullText = response.answer;
-      const TICK_MS = 30;
-      const charsPerTick = Math.max(3, Math.ceil(fullText.length / (4000 / TICK_MS)));
-      let charIndex = 0;
+          const fullQuestion: Question = {
+            id: tempId,
+            question: questionText,
+            answer: metadata.answer || accumulatedAnswer,
+            sources: [...docSources, ...webSources],
+            confidence_score: metadata.confidence_score ?? metadata.confidence,
+            created_at: new Date().toISOString(),
+            response_time_ms: metadata.response_time_ms,
+            cost: metadata.cost,
+            charts: metadata.charts,
+            is_analytical: metadata.is_analytical,
+          };
 
-      streamingIntervalRef.current = window.setInterval(() => {
-        charIndex = Math.min(charIndex + charsPerTick, fullText.length);
-        setDisplayedAnswer(fullText.slice(0, charIndex));
-
-        if (charIndex >= fullText.length) {
-          // Streaming complete — reveal full answer with metadata
-          if (streamingIntervalRef.current !== null) {
-            window.clearInterval(streamingIntervalRef.current);
-            streamingIntervalRef.current = null;
-          }
           setQuestions((prev) => prev.map((q) => q.id === tempId ? fullQuestion : q));
           setStreamingQuestionId(null);
           setDisplayedAnswer('');
+          setIsWebSearching(false);
+          setWebSearchCount(0);
           streamingFullQuestionRef.current = null;
           setIsLoading(false);
-        }
-      }, TICK_MS);
+        },
+        onError: (message) => {
+          setQuestions((prev) => prev.filter((q) => q.id !== tempId));
+          setPendingQuestionId(null);
+          setStreamingQuestionId(null);
+          setIsWebSearching(false);
+          setWebSearchCount(0);
+          setError(message || 'Failed to get answer');
+          setInputValue(questionText);
+          setIsLoading(false);
+        },
+      });
 
     } catch (err: any) {
       // Remove placeholder and restore input on error
       setQuestions((prev) => prev.filter((q) => q.id !== tempId));
       setPendingQuestionId(null);
+      setStreamingQuestionId(null);
       setError(getErrorMessage(err));
       setInputValue(questionText);
       setIsLoading(false);
@@ -513,11 +575,9 @@ export default function ChatInterface() {
     };
     const isFailed = dataRoom.processing_status === 'failed';
     const isProcessing = dataRoom.processing_status !== 'complete' && dataRoom.processing_status !== 'failed';
-    const hasFailedDocs = dataRoom.failed_documents && dataRoom.failed_documents.length > 0;
+    if (dataRoom.processing_status === 'complete') return null;
 
-    if (dataRoom.processing_status === 'complete' && !hasFailedDocs) return null;
-
-    const progress = dataRoom.progress_percent;
+    const progress = Math.max(dataRoom.progress_percent, trickledProgress.current);
     const milestoneIndex = getMilestoneIndex(dataRoom.processing_status);
     const milestones = ['Upload', 'Parse', 'Index', 'Ready'];
     const totalDocs = syncProgress?.total_files || dataRoom.total_documents;
@@ -546,30 +606,6 @@ export default function ChatInterface() {
           <p style={{ fontSize: '13px', color: 'var(--error)' }}>{dataRoom.error_message}</p>
         )}
 
-        {hasFailedDocs && (
-          <div>
-            <p style={{ fontSize: '12px', fontWeight: 500, color: 'var(--text-secondary)', marginBottom: '8px' }}>
-              Failed Documents:
-            </p>
-            <div style={{ display: 'flex', flexDirection: 'column', gap: '6px' }}>
-              {dataRoom.failed_documents!.map((doc, idx) => (
-                <div
-                  key={idx}
-                  style={{
-                    fontSize: '12px',
-                    padding: '8px 12px',
-                    background: 'var(--bg-secondary)',
-                    borderRadius: '8px',
-                    color: 'var(--text-secondary)',
-                  }}
-                >
-                  <span style={{ fontWeight: 500, color: 'var(--text-primary)' }}>{doc.file_name}:</span>{' '}
-                  {doc.error_message}
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
 
         {/* Milestone track */}
         {isProcessing && (
@@ -640,11 +676,30 @@ export default function ChatInterface() {
       }}
     >
       <div style={{ display: 'flex', alignItems: 'center', gap: '8px', marginBottom: '6px' }}>
-        <FileText size={14} style={{ color: 'var(--accent-primary)' }} />
+        {source.type === 'web' ? (
+          <Globe size={14} style={{ color: 'var(--accent-secondary)' }} />
+        ) : (
+          <FileText size={14} style={{ color: 'var(--accent-primary)' }} />
+        )}
         <span style={{ fontWeight: 500, color: 'var(--text-primary)' }}>
-          {source.document}
-          {source.page && <span style={{ color: 'var(--text-tertiary)' }}> - Page {source.page}</span>}
+          {source.type === 'web' ? (
+            <a href={source.url} target="_blank" rel="noopener noreferrer"
+               style={{ color: 'var(--accent-secondary)', textDecoration: 'none' }}>
+              {source.document}
+            </a>
+          ) : (
+            <>
+              {source.document}
+              {source.page && <span style={{ color: 'var(--text-tertiary)' }}> - Page {source.page}</span>}
+            </>
+          )}
         </span>
+        {source.type === 'web' && (
+          <span style={{
+            fontSize: '10px', padding: '1px 6px', borderRadius: '4px',
+            background: 'var(--accent-secondary)', color: 'white', fontWeight: 600,
+          }}>Web</span>
+        )}
       </div>
       <p style={{ color: 'var(--text-secondary)', fontStyle: 'italic', lineHeight: 1.5, margin: 0 }}>
         "{source.excerpt}"
@@ -703,7 +758,7 @@ export default function ChatInterface() {
         </div>
 
         {/* AI Answer — pending (thinking), streaming, or complete */}
-        {isPending ? (
+        {isPending || (isStreaming && isWebSearching) ? (
           <div className="typing-indicator" style={{ marginTop: '12px' }}>
             <div className="message-avatar" style={{ background: 'var(--bg-tertiary)', color: 'var(--accent-primary)' }}>
               <Sparkles size={16} />
@@ -740,6 +795,38 @@ export default function ChatInterface() {
                 )}
               </div>
 
+              {/* Sources — only after streaming completes */}
+              {!isStreaming && question.sources && question.sources.length > 0 && (() => {
+                const docSources = question.sources.filter(s => s.type !== 'web');
+                const webSources = question.sources.filter(s => s.type === 'web');
+                return (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '10px' }}>
+                    {docSources.length > 0 && (
+                      <details style={{ fontSize: '12px' }}>
+                        <summary style={{ cursor: 'pointer', color: 'var(--text-secondary)', userSelect: 'none' }}>
+                          <FileText size={12} style={{ display: 'inline', verticalAlign: 'middle', marginRight: '4px' }} />
+                          Document Sources ({docSources.length})
+                        </summary>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px' }}>
+                          {docSources.map((s, i) => renderSource(s, i))}
+                        </div>
+                      </details>
+                    )}
+                    {webSources.length > 0 && (
+                      <details style={{ fontSize: '12px' }}>
+                        <summary style={{ cursor: 'pointer', color: 'var(--accent-secondary)', userSelect: 'none' }}>
+                          <Globe size={12} style={{ display: 'inline', verticalAlign: 'middle', marginRight: '4px' }} />
+                          Web Research ({webSources.length})
+                        </summary>
+                        <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', marginTop: '6px' }}>
+                          {webSources.map((s, i) => renderSource(s, i))}
+                        </div>
+                      </details>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* Metadata — only after streaming completes */}
               {!isStreaming && (
                 <div className="message-meta" style={{ marginTop: '12px' }}>
@@ -771,7 +858,7 @@ export default function ChatInterface() {
 
   return (
     <>
-      <div style={{ display: 'flex', gap: '20px', height: 'calc(100vh - 140px)' }}>
+      <div style={{ display: 'flex', gap: '20px', height: 'calc(100vh - 100px)' }}>
         {/* Documents Sidebar - always mounted, hidden when not on Q&A tab */}
         {dataRoomId && (
           <div style={{ display: activeTab === 'qa' ? 'contents' : 'none' }}>
@@ -782,7 +869,7 @@ export default function ChatInterface() {
         {/* Main Chat Area */}
         <div style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
           {/* Header */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '20px' }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '12px' }}>
             {isInitialLoading ? (
               <>
                 <div className="skeleton" style={{ height: '28px', width: '200px', borderRadius: '8px' }} />
@@ -819,7 +906,7 @@ export default function ChatInterface() {
               <div className="skeleton" style={{ height: '16px', width: '120px', margin: '14px 24px' }} />
             </div>
           ) : (
-            <div className="tabs-underline" style={{ marginBottom: '20px' }}>
+            <div className="tabs-underline" style={{ marginBottom: '12px' }}>
               <button className={`tab ${activeTab === 'qa' ? 'tab-active' : ''}`} onClick={() => setActiveTab('qa')}>
                 <MessageSquare size={16} style={{ marginRight: '8px' }} />
                 Q&A

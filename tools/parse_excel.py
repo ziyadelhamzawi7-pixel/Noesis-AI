@@ -34,6 +34,8 @@ HEADER_REGEX = re.compile('|'.join(HEADER_PATTERNS), re.IGNORECASE)
 class ExcelParser:
     """Excel/CSV parser with formula and structure preservation."""
 
+    MAX_ROWS_PER_SHEET = 50_000  # Cap for very large data sheets (e.g. loan books, transaction logs)
+
     def __init__(self, file_path: Path):
         self.file_path = Path(file_path)
         if not self.file_path.exists():
@@ -97,6 +99,12 @@ class ExcelParser:
         # Trim to actual data boundaries (removes empty trailing rows/columns)
         df = self._trim_to_data_boundaries(df)
 
+        truncated = False
+        if len(df) > self.MAX_ROWS_PER_SHEET:
+            logger.warning(f"CSV has {len(df):,} rows, truncating to {self.MAX_ROWS_PER_SHEET:,}")
+            df = df.head(self.MAX_ROWS_PER_SHEET)
+            truncated = True
+
         sheet_data = {
             "sheet_name": "Sheet1",
             "rows": len(df),
@@ -104,7 +112,8 @@ class ExcelParser:
             "headers": df.columns.tolist(),
             "data": df.values.tolist(),
             "data_frame": df.to_dict('records'),  # More structured format
-            "statistics": self._calculate_statistics(df)
+            "statistics": self._calculate_statistics(df),
+            "truncated": truncated,
         }
 
         result["sheets"].append(sheet_data)
@@ -164,6 +173,12 @@ class ExcelParser:
                     logger.info(f"  Skipping sheet '{sheet_name}' (empty)")
                     return None
 
+                truncated = False
+                if len(df) > self.MAX_ROWS_PER_SHEET:
+                    logger.warning(f"Sheet '{sheet_name}' has {len(df):,} rows, truncating to {self.MAX_ROWS_PER_SHEET:,}")
+                    df = df.head(self.MAX_ROWS_PER_SHEET)
+                    truncated = True
+
                 sheet_data = {
                     "sheet_name": sheet_name,
                     "rows": len(df),
@@ -173,7 +188,8 @@ class ExcelParser:
                     "data_frame": df.to_dict('records'),
                     "statistics": self._calculate_statistics(df),
                     "has_formulas": False,
-                    "charts": []
+                    "charts": [],
+                    "truncated": truncated,
                 }
 
                 if openpyxl_wb is not None:

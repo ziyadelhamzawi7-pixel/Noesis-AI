@@ -11,6 +11,7 @@ Provides distributed caching for:
 import asyncio
 import hashlib
 import json
+import os
 import pickle
 import threading
 import time
@@ -151,7 +152,8 @@ class RedisCache:
         # Stats
         self.stats = CacheStats()
 
-        if REDIS_AVAILABLE:
+        _redis_enabled = os.getenv("REDIS_ENABLED", "True").lower() == "true"
+        if REDIS_AVAILABLE and _redis_enabled:
             self._connect()
 
     def _connect(self) -> bool:

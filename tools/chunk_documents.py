@@ -320,8 +320,7 @@ class DocumentChunker:
                 f"Check if data rows were filtered out or sheet-to-text conversion failed."
             )
 
-        # Clear token cache after processing document to free memory
-        self.clear_cache()
+        # Token cache is preserved across documents for reuse (100K entry cap on line 71 prevents unbounded growth)
 
         return all_chunks
 

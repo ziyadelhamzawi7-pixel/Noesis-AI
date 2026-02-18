@@ -33,7 +33,12 @@ api.interceptors.request.use((config) => {
 api.interceptors.response.use(
   (response) => response,
   (error) => {
-    if (error.response?.status === 401) {
+    const status = error.response?.status;
+    const url = error.config?.url || '';
+
+    // Clear stale user and redirect to login on auth failures
+    if (status === 401 || (status === 404 && url.includes('/api/auth/user/'))) {
+      localStorage.removeItem('noesis_user');
       window.location.href = '/login';
       return new Promise(() => {}); // Prevent further error handling during redirect
     }
@@ -126,6 +131,9 @@ export interface Source {
   page?: number;
   excerpt: string;
   relevance?: number;
+  type?: 'document' | 'web';
+  url?: string;
+  title?: string;
 }
 
 export interface QuestionRequest {
@@ -136,7 +144,10 @@ export interface QuestionRequest {
 export interface QuestionResponse {
   answer: string;
   sources: Source[];
+  web_sources?: Source[];
+  web_search_count?: number;
   confidence?: number;
+  confidence_score?: number;
   tokens_used?: number;
   cost?: number;
   response_time_ms?: number;
@@ -197,7 +208,19 @@ export const uploadFilesToDataRoom = async (
     await Promise.all(
       concurrent.map((batch) => {
         const formData = new FormData();
-        batch.forEach((file) => formData.append('files', file));
+        // Collect relative paths from folder-selected files (webkitRelativePath)
+        const relativePaths: (string | null)[] = [];
+        let hasAnyPath = false;
+        batch.forEach((file) => {
+          formData.append('files', file);
+          const relPath = (file as any).webkitRelativePath || '';
+          relativePaths.push(relPath || null);
+          if (relPath) hasAnyPath = true;
+        });
+        // Only send paths if at least one file has a folder path
+        if (hasAnyPath) {
+          formData.append('paths', JSON.stringify(relativePaths));
+        }
         return api.post(`/api/data-room/${dataRoomId}/upload-files`, formData, {
           headers: { 'Content-Type': 'multipart/form-data' },
           timeout: 600000,
@@ -269,6 +292,103 @@ export const askQuestion = async (dataRoomId: string, request: QuestionRequest):
     timeout: 120000, // 120s for Q&A (semantic search + Claude API call)
   });
   return response.data;
+};
+
+/**
+ * Ask a question with SSE streaming — answer text arrives incrementally.
+ */
+export interface StreamCallbacks {
+  onSearchDone?: (sources: Source[]) => void;
+  onDelta?: (text: string) => void;
+  onDone?: (metadata: QuestionResponse) => void;
+  onError?: (message: string) => void;
+  onWebSearchStatus?: (status: string, count: number) => void;
+}
+
+export const askQuestionStream = async (
+  dataRoomId: string,
+  request: QuestionRequest,
+  callbacks: StreamCallbacks,
+): Promise<void> => {
+  const baseUrl = API_BASE_URL || window.location.origin;
+  const url = `${baseUrl}/api/data-room/${dataRoomId}/question/stream`;
+
+  // Build auth headers matching the axios interceptor
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  const stored = localStorage.getItem('noesis_user');
+  if (stored) {
+    try {
+      const { id, email } = JSON.parse(stored);
+      if (id) headers['X-User-Id'] = id;
+      if (email) headers['X-User-Email'] = email;
+    } catch { /* ignore */ }
+  }
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(request),
+  });
+
+  if (!response.ok) {
+    if (response.status === 401) {
+      localStorage.removeItem('noesis_user');
+      window.location.href = '/login';
+      return;
+    }
+    const errorText = await response.text();
+    callbacks.onError?.(errorText || `HTTP ${response.status}`);
+    return;
+  }
+
+  const reader = response.body?.getReader();
+  if (!reader) {
+    callbacks.onError?.('No response body');
+    return;
+  }
+
+  const decoder = new TextDecoder();
+  let buffer = '';
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+
+    buffer += decoder.decode(value, { stream: true });
+
+    // Parse SSE lines (each event is "data: {...}\n\n")
+    const lines = buffer.split('\n\n');
+    buffer = lines.pop() || ''; // Keep incomplete last chunk in buffer
+
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data: ')) continue;
+
+      try {
+        const payload = JSON.parse(trimmed.slice(6));
+
+        switch (payload.type) {
+          case 'search_done':
+            callbacks.onSearchDone?.(payload.sources || []);
+            break;
+          case 'web_search_status':
+            callbacks.onWebSearchStatus?.(payload.status || 'searching', payload.count || 0);
+            break;
+          case 'delta':
+            callbacks.onDelta?.(payload.text || '');
+            break;
+          case 'done':
+            callbacks.onDone?.(payload.metadata || {});
+            break;
+          case 'error':
+            callbacks.onError?.(payload.message || 'Unknown error');
+            break;
+        }
+      } catch {
+        // Skip malformed SSE lines
+      }
+    }
+  }
 };
 
 /**
@@ -1113,6 +1233,21 @@ export const exportMemoDocx = async (
   const response = await api.get(
     `/api/data-room/${dataRoomId}/memo/${memoId}/export`,
     { responseType: 'blob' }
+  );
+  return response.data;
+};
+
+/**
+ * Save memo as DOCX to the user's Google Drive
+ */
+export const saveMemoToDrive = async (
+  dataRoomId: string,
+  memoId: string
+): Promise<{ file_id: string; web_view_link: string; file_name: string }> => {
+  const response = await api.post(
+    `/api/data-room/${dataRoomId}/memo/${memoId}/save-to-drive`,
+    {},
+    { timeout: 60000 }
   );
   return response.data;
 };

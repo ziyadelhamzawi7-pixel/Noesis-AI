@@ -10,6 +10,7 @@ Features:
 
 import asyncio
 import collections
+import math
 import threading
 import time
 from typing import Optional, List, Dict, Any
@@ -60,6 +61,8 @@ class SyncService:
         # Per-folder locks to prevent concurrent syncs of the same folder
         self._folder_locks: Dict[str, threading.Lock] = {}
         self._locks_lock = threading.Lock()
+        # Per-user locks to prevent thundering herd of concurrent token refreshes
+        self._token_refresh_locks: Dict[str, threading.Lock] = {}
 
         # Separate executors for different workloads
         self._download_executor = ThreadPoolExecutor(
@@ -168,7 +171,8 @@ class SyncService:
                 logger.debug(f"Folder already complete, skipping: {folder_name}")
                 return
 
-            logger.info(f"Starting staged sync for folder: {folder_name}")
+            data_room_id = folder.get('data_room_id')
+            logger.info(f"Starting staged sync for folder: {folder_name} (data_room={data_room_id})")
 
             # Update status to syncing
             db.update_connected_folder_status(folder_id, sync_status='syncing')
@@ -176,34 +180,134 @@ class SyncService:
             # Get drive service
             drive_service = self._get_drive_service(folder)
 
-            # Stage 1: Discovery — scan ALL folders and files first
+            # Streamed discovery + download: start downloading files as soon as
+            # they are discovered instead of waiting for full BFS to finish.
+            download_queue = collections.deque()
+            download_queue_lock = threading.Lock()
+            discovery_done = threading.Event()
+
             db.update_connected_folder_stage(folder_id, sync_stage='discovering')
-            # Update data room to show sync has started
-            data_room_id = folder.get('data_room_id')
             if data_room_id:
                 db.update_data_room_status(data_room_id, 'parsing', progress=2)
-            self._discovery_phase(folder, drive_service)
 
-            # Stage 2: Processing — only starts after discovery is fully complete
+            def _download_consumer():
+                """Consume discovered files and download+enqueue them in parallel."""
+                downloaded = 0
+                failed = 0
+                status_update_interval = 10
+                last_status_count = 0
+
+                with ThreadPoolExecutor(
+                    max_workers=self.max_parallel_downloads,
+                    thread_name_prefix="drive_download"
+                ) as executor:
+                    futures = {}
+
+                    while True:
+                        # Drain any pending files from the queue
+                        batch = []
+                        with download_queue_lock:
+                            while download_queue:
+                                batch.append(download_queue.popleft())
+
+                        def _download_one(rec):
+                            thread_drive = self._get_drive_service(folder)
+                            self._download_and_enqueue_file(folder, rec, thread_drive)
+
+                        for file_rec in batch:
+                            if self._stop_event.is_set():
+                                break
+                            fut = executor.submit(_download_one, file_rec)
+                            futures[fut] = file_rec
+
+                        # Collect completed downloads
+                        done_futs = [f for f in list(futures.keys()) if f.done()]
+                        for fut in done_futs:
+                            file_rec = futures.pop(fut)
+                            try:
+                                fut.result()
+                                downloaded += 1
+                            except Exception as e:
+                                logger.error(f"Download failed for {file_rec['file_name']}: {e}")
+                                failed += 1
+
+                            completed = downloaded + failed
+                            if completed - last_status_count >= status_update_interval:
+                                db.update_connected_folder_status(folder_id, sync_status='syncing')
+                                last_status_count = completed
+
+                        # Exit when discovery is done and queue+futures are empty
+                        if discovery_done.is_set():
+                            with download_queue_lock:
+                                queue_empty = len(download_queue) == 0
+                            if queue_empty and not futures:
+                                break
+
+                        if not batch and not done_futs:
+                            time.sleep(0.5)  # Avoid busy-waiting
+
+                    # Wait for remaining futures
+                    for fut in as_completed(futures):
+                        file_rec = futures[fut] if fut in futures else None
+                        try:
+                            fut.result()
+                            downloaded += 1
+                        except Exception as e:
+                            name = file_rec['file_name'] if file_rec else 'unknown'
+                            logger.error(f"Download failed for {name}: {e}")
+                            failed += 1
+
+                logger.info(f"Download consumer done: {downloaded} enqueued, {failed} failed")
+
+            # Start download consumer in parallel with discovery
+            download_thread = threading.Thread(
+                target=_download_consumer, daemon=True, name="download-consumer"
+            )
+            download_thread.start()
+
+            # Run discovery, streaming files to the download queue
+            self._discovery_phase(folder, drive_service, download_queue=download_queue, download_queue_lock=download_queue_lock)
+
+            # Signal discovery is complete so download consumer can drain and exit
+            discovery_done.set()
+            pending_count = db.count_pending_synced_files(folder_id)
+            logger.info(f"Discovery complete for {folder_name}: {pending_count} files, waiting for downloads to finish")
+
             db.update_connected_folder_stage(folder_id, sync_stage='processing')
-            # Update data room to show processing is starting
             if data_room_id:
                 db.update_data_room_status(data_room_id, 'parsing', progress=10)
-            self._processing_phase(folder, drive_service)
 
-            # Downloads enqueued — worker pool will process and mark folder active
-            db.update_connected_folder_stage(folder_id, sync_stage='queued')
+            # Wait for all downloads to complete
+            download_thread.join()
 
-            logger.success(f"Downloads enqueued for {folder_name}, worker pool processing")
+            if pending_count == 0:
+                logger.info(f"No files to process in {folder_name}")
+                if data_room_id:
+                    db.update_data_room_status(data_room_id, 'complete', progress=100)
+                db.update_connected_folder_stage(folder_id, sync_stage='complete')
+            else:
+                db.update_connected_folder_stage(folder_id, sync_stage='queued')
+                logger.success(f"Downloads enqueued for {folder_name}, worker pool processing")
 
         except Exception as e:
+            # Signal download consumer to stop if it's running
+            try:
+                discovery_done.set()
+            except NameError:
+                pass
             logger.error(f"Sync failed for folder {folder_name}: {e}")
+            logger.error(traceback.format_exc())
             db.update_connected_folder_stage(folder_id, sync_stage='error', error_message=str(e))
             db.update_connected_folder_status(
                 folder_id,
                 sync_status='error',
                 error_message=str(e)
             )
+            if data_room_id:
+                db.update_data_room_status(
+                    data_room_id, 'failed',
+                    error_message=f"Drive sync failed: {str(e)[:500]}"
+                )
             raise
         finally:
             folder_lock.release()
@@ -211,6 +315,7 @@ class SyncService:
     def _get_drive_service(self, folder: Dict[str, Any]) -> GoogleDriveService:
         """
         Get Google Drive service with fresh tokens.
+        Uses per-user locking to prevent thundering herd of concurrent refreshes.
 
         Args:
             folder: Connected folder record with user tokens
@@ -223,16 +328,35 @@ class SyncService:
         expires_at = folder.get('token_expires_at')
 
         if self._token_needs_refresh(expires_at):
-            new_tokens = google_oauth_service.refresh_access_token(refresh_token)
-            if new_tokens:
-                access_token = new_tokens['access_token']
-                db.update_user_tokens(
-                    folder['user_id'],
-                    access_token=access_token,
-                    token_expires_at=new_tokens.get('expires_at')
-                )
-            else:
-                raise Exception("Failed to refresh access token")
+            user_id = folder['user_id']
+
+            # Per-user lock prevents thundering herd of concurrent refreshes
+            with self._locks_lock:
+                if user_id not in self._token_refresh_locks:
+                    self._token_refresh_locks[user_id] = threading.Lock()
+                refresh_lock = self._token_refresh_locks[user_id]
+
+            with refresh_lock:
+                # Re-check after acquiring lock — another thread may have already refreshed
+                if self._token_needs_refresh(folder.get('token_expires_at')):
+                    new_tokens = google_oauth_service.refresh_access_token(refresh_token)
+                    if new_tokens:
+                        access_token = new_tokens['access_token']
+                        expires_at = new_tokens.get('expires_at')
+                        db.update_user_tokens(
+                            user_id,
+                            access_token=access_token,
+                            token_expires_at=expires_at
+                        )
+                        # Update the shared folder dict so other threads see the fresh token
+                        folder['access_token'] = access_token
+                        folder['token_expires_at'] = expires_at
+                    else:
+                        raise Exception("Failed to refresh access token")
+                else:
+                    # Another thread already refreshed — use the updated values
+                    access_token = folder['access_token']
+                    expires_at = folder.get('token_expires_at')
 
         return GoogleDriveService.from_tokens(
             access_token=access_token,
@@ -240,7 +364,8 @@ class SyncService:
             expires_at=expires_at
         )
 
-    def _discovery_phase(self, folder: Dict[str, Any], drive_service: GoogleDriveService):
+    def _discovery_phase(self, folder: Dict[str, Any], drive_service: GoogleDriveService,
+                         download_queue=None, download_queue_lock=None):
         """
         Stage 1: Discover all folders and files without downloading.
         Uses parallel breadth-first search to scan multiple subfolders concurrently.
@@ -248,6 +373,8 @@ class SyncService:
         Args:
             folder: Connected folder record
             drive_service: Google Drive service instance
+            download_queue: Optional deque to push discovered files for concurrent download
+            download_queue_lock: Lock for thread-safe access to download_queue
         """
         folder_id = folder['id']
         drive_folder_id = folder['folder_id']
@@ -261,6 +388,12 @@ class SyncService:
             pending_count = db.count_pending_synced_files(folder_id)
             if pending_count > 0:
                 logger.info(f"Resuming from previous discovery: {pending_count} pending files")
+                # Load pending files into the download queue so the consumer can process them
+                if download_queue is not None and download_queue_lock is not None:
+                    pending_files = db.get_pending_synced_files(folder_id, limit=pending_count)
+                    with download_queue_lock:
+                        download_queue.extend(pending_files)
+                    logger.info(f"Loaded {len(pending_files)} pending files into download queue")
                 return
 
         if existing_stage == 'discovering':
@@ -337,7 +470,15 @@ class SyncService:
                         'file_size': file.get('size'),
                         'drive_modified_time': file.get('modifiedTime'),
                     })
-                db.create_synced_files_batch(file_records)
+                synced_ids = db.create_synced_files_batch(file_records)
+
+                # Stream discovered files to download consumer (if available)
+                if download_queue is not None and download_queue_lock is not None:
+                    enriched = []
+                    for sf_id, rec in zip(synced_ids, file_records):
+                        enriched.append({**rec, 'id': sf_id, 'sync_status': 'pending'})
+                    with download_queue_lock:
+                        download_queue.extend(enriched)
 
             # Enqueue subfolders for scanning
             new_subfolders = []
@@ -362,6 +503,14 @@ class SyncService:
             return contents['file_count'], len(contents['subfolders'])
 
         # Parallel BFS loop
+        data_room_id = folder.get('data_room_id')
+        discovery_timeout = 600  # 10 minutes max for discovery phase
+        discovery_start_time = time.time()
+        logger.info(
+            f"Discovery BFS starting: max_workers={max_scan_workers}, "
+            f"timeout={discovery_timeout}s, initial_queue={len(initial_items)} items"
+        )
+
         with ThreadPoolExecutor(max_workers=max_scan_workers, thread_name_prefix="discovery") as executor:
             futures = {}
             last_progress_update = time.time()
@@ -369,6 +518,20 @@ class SyncService:
             while True:
                 if self._stop_event.is_set():
                     break
+
+                # Check discovery timeout
+                elapsed = time.time() - discovery_start_time
+                if elapsed > discovery_timeout:
+                    logger.error(
+                        f"Discovery timeout after {elapsed:.0f}s for {folder_name}. "
+                        f"Discovered {discovered_files} files in {discovered_folders} folders so far."
+                    )
+                    for fut in futures:
+                        fut.cancel()
+                    raise TimeoutError(
+                        f"Discovery timed out after {int(elapsed)}s. "
+                        f"Found {discovered_files} files in {discovered_folders} folders before timeout."
+                    )
 
                 # Submit work from the queue
                 with queue_lock:
@@ -391,6 +554,7 @@ class SyncService:
                             fut.result()
                         except Exception as e:
                             logger.error(f"Error scanning folder {path or 'Root'}: {e}")
+                            logger.error(traceback.format_exc())
                 except TimeoutError:
                     pass  # Timeout just means no more futures completed yet; loop back
 
@@ -409,6 +573,10 @@ class SyncService:
                         discovered_files=cur_files,
                         discovered_folders=cur_folders
                     )
+                    # Update data room progress during discovery (5% -> 9%)
+                    if data_room_id and cur_folders > 0:
+                        discovery_progress = 5 + min(4, 4 * math.log1p(cur_folders) / math.log1p(50))
+                        db.update_data_room_status(data_room_id, 'parsing', progress=discovery_progress)
                     last_progress_update = now
 
         # Mark discovery complete
@@ -594,6 +762,13 @@ class SyncService:
         if existing_doc:
             document_id = existing_doc['id']
             logger.info(f"Document already exists: {file_name} ({document_id})")
+            # Skip enqueuing if already parsed — prevents re-parsing on restart
+            if existing_doc.get('parse_status') == 'parsed':
+                logger.info(f"Document already parsed, skipping enqueue: {file_name}")
+                db.update_synced_file_status(
+                    synced_file_id, sync_status='complete', document_id=document_id
+                )
+                return True
         else:
             # Create document record
             file_size = file_record.get('file_size') or local_path.stat().st_size
@@ -976,27 +1151,59 @@ class SyncService:
 
         folder = db.get_connected_folder(folder_id)
         if not folder:
-            raise ValueError(f"Folder not found: {folder_id}")
+            logger.error(f"trigger_sync: Folder not found: {folder_id}")
+            return
 
-        # Get user tokens
-        user = db.get_user_by_id(folder['user_id'])
-        if not user:
-            raise ValueError(f"User not found for folder: {folder_id}")
+        data_room_id = folder.get('data_room_id')
 
-        folder_with_tokens = {
-            **folder,
-            'access_token': user['access_token'],
-            'refresh_token': user['refresh_token'],
-            'token_expires_at': user.get('token_expires_at')
-        }
+        try:
+            # Get user tokens
+            user = db.get_user_by_id(folder['user_id'])
+            if not user:
+                raise ValueError(f"User not found for folder: {folder_id}")
 
-        # Run sync in background thread
-        sync_thread = threading.Thread(
-            target=self._sync_folder,
-            args=(folder_with_tokens,),
-            daemon=True
-        )
-        sync_thread.start()
+            folder_with_tokens = {
+                **folder,
+                'access_token': user['access_token'],
+                'refresh_token': user['refresh_token'],
+                'token_expires_at': user.get('token_expires_at')
+            }
+
+            def _safe_sync():
+                try:
+                    self._sync_folder(folder_with_tokens)
+                except Exception as e:
+                    logger.error(f"Sync thread crashed for folder {folder_id}: {e}")
+                    logger.error(traceback.format_exc())
+                    if data_room_id:
+                        try:
+                            db.update_data_room_status(
+                                data_room_id, 'failed',
+                                error_message=f"Sync failed: {str(e)[:500]}"
+                            )
+                        except Exception:
+                            logger.error("Failed to update data room status after sync crash")
+
+            # Run sync in background thread
+            sync_thread = threading.Thread(
+                target=_safe_sync,
+                daemon=True,
+                name=f"sync-{folder_id[:8]}"
+            )
+            sync_thread.start()
+            logger.info(f"Sync thread started for folder {folder_id} (thread={sync_thread.name})")
+
+        except Exception as e:
+            logger.error(f"trigger_sync setup failed for {folder_id}: {e}")
+            logger.error(traceback.format_exc())
+            if data_room_id:
+                try:
+                    db.update_data_room_status(
+                        data_room_id, 'failed',
+                        error_message=f"Sync setup failed: {str(e)[:500]}"
+                    )
+                except Exception:
+                    logger.error("Failed to update data room status after trigger_sync error")
 
 
 # Global sync service instance

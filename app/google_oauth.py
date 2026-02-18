@@ -23,6 +23,7 @@ from app.config import settings
 # OAuth 2.0 scopes for Google Drive
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',  # Read-only access to Drive
+    'https://www.googleapis.com/auth/drive.file',  # Create/edit files the app creates (memo export)
     'https://www.googleapis.com/auth/userinfo.email',  # Get user email
     'https://www.googleapis.com/auth/userinfo.profile',  # Get user profile
     'openid'  # OpenID Connect
@@ -178,7 +179,6 @@ class GoogleOAuthService:
                 token_uri="https://oauth2.googleapis.com/token",
                 client_id=settings.google_client_id,
                 client_secret=settings.google_client_secret,
-                scopes=SCOPES
             )
 
             # Refresh the token
@@ -248,7 +248,10 @@ class GoogleOAuthService:
         """
         expiry = None
         if expires_at:
-            expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
+            if isinstance(expires_at, datetime):
+                expiry = expires_at
+            else:
+                expiry = datetime.fromisoformat(expires_at.replace('Z', '+00:00'))
 
         credentials = Credentials(
             token=access_token,
@@ -256,7 +259,6 @@ class GoogleOAuthService:
             token_uri="https://oauth2.googleapis.com/token",
             client_id=settings.google_client_id,
             client_secret=settings.google_client_secret,
-            scopes=SCOPES,
             expiry=expiry
         )
 

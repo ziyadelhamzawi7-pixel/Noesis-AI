@@ -6,6 +6,7 @@ import {
   clearCurrentUser,
   initiateGoogleLogin,
   logoutUser,
+  getUserInfo,
   UserInfo,
 } from '../api/client';
 
@@ -21,7 +22,18 @@ export default function Layout({ children }: LayoutProps) {
 
   useEffect(() => {
     const storedUser = getCurrentUser();
-    setUser(storedUser);
+    if (storedUser) {
+      // Verify the stored user still exists in the database
+      getUserInfo(storedUser.id)
+        .then((validUser) => setUser(validUser))
+        .catch(() => {
+          // User no longer exists in DB — clear stale session
+          clearCurrentUser();
+          setUser(null);
+        });
+    } else {
+      setUser(null);
+    }
   }, [location]);
 
   const handleLogin = async () => {

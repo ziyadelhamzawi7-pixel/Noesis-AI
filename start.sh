@@ -3,6 +3,9 @@ set -e
 
 echo "=== Noesis AI - Starting ==="
 
+# Log system resources so Railway logs show what the instance has
+echo "System: $(nproc) CPUs, $(free -m 2>/dev/null | awk '/Mem:/{print $2}' || echo '?')MB RAM"
+
 mkdir -p /data/data_rooms /data/chroma_db /data/logs
 
 echo "Initializing database..."
@@ -13,4 +16,4 @@ exec uvicorn app.main:app \
     --host "${HOST:-0.0.0.0}" \
     --port "${PORT:-8000}" \
     --log-level info \
-    --workers 1
+    --workers "${UVICORN_WORKERS:-1}"

@@ -11,6 +11,81 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def _detect_system_resources() -> dict:
+    """
+    Detect available RAM and CPU at startup.
+    Returns sensible defaults for worker pools, concurrency, and OCR based on
+    the actual instance size — so the app auto-tunes on Railway, EC2, or local.
+
+    These values are only used as fallback defaults. Any env var the user sets
+    explicitly (in .env or Railway dashboard) takes full priority.
+    """
+    try:
+        import psutil
+        total_ram_mb = psutil.virtual_memory().total / (1024 * 1024)
+        cpu_count = os.cpu_count() or 2
+    except ImportError:
+        total_ram_mb = 4096  # Assume 4GB if psutil not yet installed
+        cpu_count = 2
+
+    # --- Worker pool sizing (biggest impact on RAM/CPU) ---
+    # Each active worker can hold a parsed PDF (~50-200MB) + embeddings in memory.
+    # Rule of thumb: 1 worker per 500MB of RAM, capped by CPU count.
+    ram_based_max_workers = max(2, int(total_ram_mb / 500))
+    cpu_based_max_workers = cpu_count * 3  # Workers are mostly I/O-bound (API calls)
+    max_workers = min(ram_based_max_workers, cpu_based_max_workers, 30)
+    min_workers = max(2, max_workers // 3)
+
+    # --- OCR limits (most memory-intensive operation) ---
+    # pdf2image rasterizes pages at ~150-200MB each. Limit based on RAM headroom.
+    if total_ram_mb >= 16000:
+        max_ocr_pages = 100
+    elif total_ram_mb >= 8000:
+        max_ocr_pages = 50
+    elif total_ram_mb >= 4000:
+        max_ocr_pages = 30
+    else:
+        max_ocr_pages = 15
+
+    # --- Parse workers (CPU-bound PyMuPDF thread pool) ---
+    max_parse_workers = min(cpu_count, 8)
+
+    # --- Memory management ---
+    if total_ram_mb < 4000:
+        min_free_memory_mb = 200
+        memory_limit_percent = 85
+    elif total_ram_mb < 8000:
+        min_free_memory_mb = 400
+        memory_limit_percent = 80
+    else:
+        min_free_memory_mb = 500
+        memory_limit_percent = 80
+
+    # --- Embedding concurrency (network-bound, but each batch uses ~50MB RAM) ---
+    if total_ram_mb >= 8000:
+        embedding_max_concurrent = 100
+    elif total_ram_mb >= 4000:
+        embedding_max_concurrent = 50
+    else:
+        embedding_max_concurrent = 25
+
+    return {
+        "total_ram_mb": int(total_ram_mb),
+        "cpu_count": cpu_count,
+        "min_workers": min_workers,
+        "max_workers": max_workers,
+        "max_ocr_pages": max_ocr_pages,
+        "max_parse_workers": max_parse_workers,
+        "min_free_memory_mb": min_free_memory_mb,
+        "memory_limit_percent": memory_limit_percent,
+        "embedding_max_concurrent": embedding_max_concurrent,
+    }
+
+
+# Detect once at import time — values used as defaults below
+_RESOURCES = _detect_system_resources()
+
+
 class Settings(BaseSettings):
     """Application settings loaded from environment variables."""
 
@@ -41,6 +116,10 @@ class Settings(BaseSettings):
     claude_opus_model: str = os.getenv("CLAUDE_OPUS_MODEL", "claude-opus-4-5-20251101")
     openai_embedding_model: str = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 
+    # Embedding Provider: "local" (fastembed, fast, free) or "openai" (API, slower, costs money)
+    embedding_provider: str = os.getenv("EMBEDDING_PROVIDER", "local")
+    local_embedding_model: str = os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
     # Financial Analysis Settings
     financial_analysis_model: str = os.getenv("FINANCIAL_ANALYSIS_MODEL", "claude-opus-4-5-20251101")
     financial_extraction_model: str = os.getenv("FINANCIAL_EXTRACTION_MODEL", "claude-sonnet-4-20250514")
@@ -55,9 +134,10 @@ class Settings(BaseSettings):
     max_file_size_mb: int = int(os.getenv("MAX_FILE_SIZE_MB", "100"))
 
     # Performance & Scaling Settings
+    # (defaults auto-tuned from detected RAM/CPU — env vars override)
     parse_timeout_seconds: int = int(os.getenv("PARSE_TIMEOUT_SECONDS", "180"))
-    max_parse_workers: int = int(os.getenv("MAX_PARSE_WORKERS", "8"))
-    max_ocr_pages: int = int(os.getenv("MAX_OCR_PAGES", "50"))
+    max_parse_workers: int = int(os.getenv("MAX_PARSE_WORKERS") or _RESOURCES["max_parse_workers"])
+    max_ocr_pages: int = int(os.getenv("MAX_OCR_PAGES") or _RESOURCES["max_ocr_pages"])
     ocr_provider: str = os.getenv("OCR_PROVIDER", "google_document_ai")  # "google_document_ai" | "tesseract"
     google_document_ai_project: str = os.getenv("GOOGLE_DOCUMENT_AI_PROJECT", "")
     google_document_ai_location: str = os.getenv("GOOGLE_DOCUMENT_AI_LOCATION", "us")
@@ -70,7 +150,7 @@ class Settings(BaseSettings):
     # Rate Limiting for Google Drive Sync
     drive_sync_max_downloads_per_minute: int = int(os.getenv("DRIVE_SYNC_MAX_DOWNLOADS", "600"))
     drive_sync_max_processing_per_minute: int = int(os.getenv("DRIVE_SYNC_MAX_PROCESSING", "600"))
-    embedding_max_concurrent: int = int(os.getenv("EMBEDDING_MAX_CONCURRENT", "100"))
+    embedding_max_concurrent: int = int(os.getenv("EMBEDDING_MAX_CONCURRENT") or _RESOURCES["embedding_max_concurrent"])
 
     # OpenAI API Rate Limits (Tier 4: 10K RPM, 10M TPM for text-embedding-3-small)
     openai_tier: int = int(os.getenv("OPENAI_TIER", "4"))
@@ -79,16 +159,16 @@ class Settings(BaseSettings):
     embedding_safety_margin: float = float(os.getenv("EMBEDDING_SAFETY_MARGIN", "0.90"))
     embedding_backoff_multiplier: float = float(os.getenv("EMBEDDING_BACKOFF_MULTIPLIER", "1.5"))
 
-    # Worker Pool Auto-Scaling
-    min_workers: int = int(os.getenv("MIN_WORKERS", "8"))
-    max_workers: int = int(os.getenv("MAX_WORKERS", "20"))
+    # Worker Pool Auto-Scaling (auto-tuned from detected RAM/CPU — env vars override)
+    min_workers: int = int(os.getenv("MIN_WORKERS") or _RESOURCES["min_workers"])
+    max_workers: int = int(os.getenv("MAX_WORKERS") or _RESOURCES["max_workers"])
     scale_up_threshold: int = int(os.getenv("SCALE_UP_THRESHOLD", "3"))
     scale_down_threshold: int = int(os.getenv("SCALE_DOWN_THRESHOLD", "1"))
 
-    # Memory Management
-    memory_limit_percent: float = float(os.getenv("MEMORY_LIMIT_PERCENT", "80"))
+    # Memory Management (auto-tuned — env vars override)
+    memory_limit_percent: float = float(os.getenv("MEMORY_LIMIT_PERCENT") or _RESOURCES["memory_limit_percent"])
     gc_threshold_percent: float = float(os.getenv("GC_THRESHOLD_PERCENT", "70"))
-    min_free_memory_mb: int = int(os.getenv("MIN_FREE_MEMORY_MB", "500"))
+    min_free_memory_mb: int = int(os.getenv("MIN_FREE_MEMORY_MB") or _RESOURCES["min_free_memory_mb"])
 
     # Database Optimization
     db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "10"))
@@ -141,6 +221,34 @@ class Settings(BaseSettings):
 
 # Global settings instance
 settings = Settings()
+
+
+def log_resource_config():
+    """Log detected resources and resolved settings at startup."""
+    from loguru import logger
+    r = _RESOURCES
+    logger.info(
+        f"System resources: {r['total_ram_mb']}MB RAM, {r['cpu_count']} CPUs"
+    )
+    logger.info(
+        f"Auto-tuned defaults: workers={r['min_workers']}-{r['max_workers']}, "
+        f"parse_workers={r['max_parse_workers']}, ocr_pages={r['max_ocr_pages']}, "
+        f"embedding_concurrent={r['embedding_max_concurrent']}"
+    )
+    logger.info(
+        f"Resolved settings:  workers={settings.min_workers}-{settings.max_workers}, "
+        f"parse_workers={settings.max_parse_workers}, ocr_pages={settings.max_ocr_pages}, "
+        f"embedding_concurrent={settings.embedding_max_concurrent}, "
+        f"min_free_mem={settings.min_free_memory_mb}MB"
+    )
+    if settings.embedding_provider == "local":
+        logger.info(
+            f"Embedding provider: LOCAL (fastembed, model={settings.local_embedding_model})"
+        )
+    else:
+        logger.info(
+            f"Embedding provider: OPENAI (model={settings.openai_embedding_model})"
+        )
 
 
 def validate_settings() -> bool:

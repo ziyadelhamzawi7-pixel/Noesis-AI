@@ -981,11 +981,21 @@ tr:hover td {
 }
 
 .markdown table {
-  width: 100%;
+  width: max-content;
+  min-width: 100%;
   border-collapse: collapse;
   margin: var(--space-4) 0;
   font-size: var(--text-sm);
-  display: block;
+}
+
+/* Scrollable wrapper — ReactMarkdown wraps tables in a div when using display:block,
+   but we need the table itself to keep table layout for proper column sizing. */
+.markdown > table {
+  display: table;
+}
+
+/* Allow horizontal scroll when the table overflows its container */
+.markdown {
   overflow-x: auto;
 }
 
@@ -1000,6 +1010,7 @@ tr:hover td {
   background: var(--bg-tertiary);
   font-weight: var(--font-semibold);
   color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .markdown tr:nth-child(even) td {
@@ -1205,7 +1216,7 @@ tr:hover td {
 .message {
   display: flex;
   gap: var(--space-3);
-  max-width: 85%;
+  max-width: 95%;
   min-width: 0;
 }
 

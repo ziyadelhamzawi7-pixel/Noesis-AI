@@ -3,7 +3,7 @@ import { Loader2, AlertCircle, RefreshCw, Send, X, Sparkles, Check, Circle, Down
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import ChartRenderer from './ChartRenderer';
-import { generateMemo, getMemo, getMemoStatus, cancelMemoGeneration, sendMemoChat, getMemoChatHistory, exportMemoDocx, updateMemoDealTerms, MemoResponse, MemoGenerateParams, ChartSpec } from '../api/client';
+import { generateMemo, getMemo, getMemoStatus, cancelMemoGeneration, sendMemoChat, getMemoChatHistory, exportMemoDocx, saveMemoToDrive, updateMemoDealTerms, MemoResponse, MemoGenerateParams, ChartSpec } from '../api/client';
 
 const SECTION_ORDER = [
   { key: 'proposed_investment_terms', label: 'Proposed Investment Terms', icon: '1' },
@@ -48,6 +48,7 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
   const [postMoneyValuation, setPostMoneyValuation] = useState<string>('');
   const [dealParamsError, setDealParamsError] = useState<string | null>(null);
   const [isDownloading, setIsDownloading] = useState(false);
+  const [isSavingToDrive, setIsSavingToDrive] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [valuationMethods, setValuationMethods] = useState<string[]>(['vc_method']);
   const [isEditingDealTerms, setIsEditingDealTerms] = useState(false);
@@ -219,6 +220,28 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
       setError('Failed to download memo. Please try again.');
     } finally {
       setIsDownloading(false);
+    }
+  };
+
+  const handleSaveToDrive = async () => {
+    if (!memo?.id || isSavingToDrive) return;
+
+    setIsSavingToDrive(true);
+    try {
+      const result = await saveMemoToDrive(dataRoomId, memo.id);
+      if (result.web_view_link) {
+        window.open(result.web_view_link, '_blank');
+      }
+    } catch (err: any) {
+      const detail = err.response?.data?.detail || '';
+      if (detail.includes('not authenticated') || err.response?.status === 401) {
+        setError('Please reconnect your Google account to save to Drive.');
+      } else {
+        setError('Failed to save memo to Google Drive. Please try again.');
+      }
+      console.error('Failed to save memo to Drive:', err);
+    } finally {
+      setIsSavingToDrive(false);
     }
   };
 
@@ -681,18 +704,37 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
                   </button>
                 )}
                 {(isComplete || (isCancelled && completedCount > 0)) && (
-                  <button
-                    className="btn btn-primary"
-                    onClick={handleDownloadDocx}
-                    disabled={isDownloading}
-                  >
-                    {isDownloading ? (
-                      <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
-                    ) : (
-                      <Download size={14} />
-                    )}
-                    {isDownloading ? 'Downloading...' : 'Download DOCX'}
-                  </button>
+                  <>
+                    <button
+                      className="btn btn-secondary"
+                      onClick={handleSaveToDrive}
+                      disabled={isSavingToDrive}
+                    >
+                      {isSavingToDrive ? (
+                        <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                      ) : (
+                        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M12 2L2 19.5h20L12 2z" />
+                          <path d="M2 19.5l10-6.5" />
+                          <path d="M22 19.5l-10-6.5" />
+                          <path d="M7.5 12h9" />
+                        </svg>
+                      )}
+                      {isSavingToDrive ? 'Saving...' : 'Save to Drive'}
+                    </button>
+                    <button
+                      className="btn btn-primary"
+                      onClick={handleDownloadDocx}
+                      disabled={isDownloading}
+                    >
+                      {isDownloading ? (
+                        <Loader2 size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                      ) : (
+                        <Download size={14} />
+                      )}
+                      {isDownloading ? 'Downloading...' : 'Download DOCX'}
+                    </button>
+                  </>
                 )}
               </div>
             </div>
@@ -924,7 +966,9 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
                 <div style={{ display: 'flex', flexDirection: 'column', gap: '8px' }}>
                   {SECTION_ORDER.map((section, idx) => {
                     const hasContent = !!memo[section.key as SectionKey];
-                    const isCurrentlyGenerating = !hasContent && memo.status === 'generating' && idx === completedCount;
+                    const firstIncompleteIdx = SECTION_ORDER.findIndex((s) => !memo[s.key as SectionKey]);
+                    const hasLaterCompleted = !hasContent && SECTION_ORDER.slice(idx + 1).some((s) => !!memo[s.key as SectionKey]);
+                    const isCurrentlyGenerating = !hasContent && memo.status === 'generating' && (idx === firstIncompleteIdx || hasLaterCompleted);
 
                     return (
                       <div
@@ -987,7 +1031,9 @@ export default function InvestmentMemo({ dataRoomId, isReady }: Props) {
             {/* Sections */}
             {SECTION_ORDER.map((section, idx) => {
               const content = memo[section.key as SectionKey];
-              const isNextToGenerate = !content && memo.status === 'generating' && idx === completedCount;
+              const firstIncompleteIdx = SECTION_ORDER.findIndex((s) => !memo[s.key as SectionKey]);
+              const hasLaterCompleted = !content && SECTION_ORDER.slice(idx + 1).some((s) => !!memo[s.key as SectionKey]);
+              const isNextToGenerate = !content && memo.status === 'generating' && (idx === firstIncompleteIdx || hasLaterCompleted);
 
               if (!content && !isNextToGenerate) return null;
 

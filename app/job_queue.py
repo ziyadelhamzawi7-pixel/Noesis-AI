@@ -1,5 +1,5 @@
 """
-SQLite-based persistent job queue for background processing.
+PostgreSQL-based persistent job queue for background processing.
 
 Provides reliable job processing with:
 - Job persistence across server restarts
@@ -8,9 +8,12 @@ Provides reliable job processing with:
 - Job status tracking
 """
 
-import sqlite3
+import psycopg2
+import psycopg2.extras
+import psycopg2.pool
 import json
 import uuid
+import threading
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 from enum import Enum
@@ -38,22 +41,51 @@ class JobType(str, Enum):
     FINANCIAL_ANALYSIS = "financial_analysis"
 
 
+_queue_pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
+_queue_pool_lock = threading.Lock()
+
+
+def _get_queue_pool() -> psycopg2.pool.ThreadedConnectionPool:
+    """Get or create the job queue connection pool (lazy singleton)."""
+    global _queue_pool
+    if _queue_pool is None:
+        with _queue_pool_lock:
+            if _queue_pool is None:
+                _queue_pool = psycopg2.pool.ThreadedConnectionPool(
+                    minconn=2,
+                    maxconn=8,
+                    dsn=settings.database_url,
+                )
+                logger.info("Job queue connection pool initialized (min=2, max=8)")
+    return _queue_pool
+
+
 @contextmanager
 def _get_queue_connection():
-    """Get database connection for job queue operations."""
-    conn = sqlite3.connect(settings.database_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    """Get a pooled database connection for job queue operations."""
+    pool = _get_queue_pool()
+    conn = pool.getconn()
     try:
         yield conn
+    except Exception:
+        conn.rollback()
+        raise
     finally:
-        conn.close()
+        pool.putconn(conn)
+
+
+def close_queue_pool():
+    """Close the job queue connection pool (call on shutdown)."""
+    global _queue_pool
+    if _queue_pool:
+        _queue_pool.closeall()
+        _queue_pool = None
+        logger.info("Job queue connection pool closed")
 
 
 class JobQueue:
     """
-    SQLite-based job queue for persistent background task processing.
+    PostgreSQL-based job queue for persistent background task processing.
 
     Features:
     - Jobs persist across server restarts
@@ -75,7 +107,8 @@ class JobQueue:
     def _init_table(self):
         """Create job queue table if not exists."""
         with _get_queue_connection() as conn:
-            conn.execute("""
+            cursor = conn.cursor()
+            cursor.execute("""
                 CREATE TABLE IF NOT EXISTS job_queue (
                     id TEXT PRIMARY KEY,
                     job_type TEXT NOT NULL,
@@ -93,11 +126,11 @@ class JobQueue:
                     file_name TEXT
                 )
             """)
-            conn.execute("""
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_job_status
                 ON job_queue(status, priority DESC, created_at ASC)
             """)
-            conn.execute("""
+            cursor.execute("""
                 CREATE INDEX IF NOT EXISTS idx_job_data_room
                 ON job_queue(data_room_id)
             """)
@@ -130,10 +163,11 @@ class JobQueue:
         job_id = f"job_{uuid.uuid4().hex[:12]}"
 
         with _get_queue_connection() as conn:
-            conn.execute("""
+            cursor = conn.cursor()
+            cursor.execute("""
                 INSERT INTO job_queue
                 (id, job_type, payload, priority, data_room_id, file_name, max_attempts)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
             """, (
                 job_id,
                 job_type,
@@ -161,12 +195,13 @@ class JobQueue:
             Job dict or None if no jobs available
         """
         with _get_queue_connection() as conn:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             # Find and claim the highest priority pending job
-            cursor = conn.execute("""
+            cursor.execute("""
                 UPDATE job_queue
                 SET status = 'running',
                     started_at = CURRENT_TIMESTAMP,
-                    worker_id = ?,
+                    worker_id = %s,
                     attempts = attempts + 1
                 WHERE id = (
                     SELECT id FROM job_queue
@@ -174,6 +209,7 @@ class JobQueue:
                     AND attempts < max_attempts
                     ORDER BY priority DESC, created_at ASC
                     LIMIT 1
+                    FOR UPDATE SKIP LOCKED
                 )
                 RETURNING id, job_type, payload, attempts, data_room_id, file_name
             """, (worker_id,))
@@ -203,11 +239,12 @@ class JobQueue:
             job_id: Job ID to complete
         """
         with _get_queue_connection() as conn:
-            conn.execute("""
+            cursor = conn.cursor()
+            cursor.execute("""
                 UPDATE job_queue
                 SET status = 'completed',
                     completed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = %s
             """, (job_id,))
             conn.commit()
 
@@ -223,33 +260,34 @@ class JobQueue:
             retry: If True and attempts remain, job returns to pending
         """
         with _get_queue_connection() as conn:
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
             if retry:
                 # Check if retries remain
-                cursor = conn.execute(
-                    "SELECT attempts, max_attempts FROM job_queue WHERE id = ?",
+                cursor.execute(
+                    "SELECT attempts, max_attempts FROM job_queue WHERE id = %s",
                     (job_id,)
                 )
                 row = cursor.fetchone()
 
                 if row and row['attempts'] < row['max_attempts']:
-                    conn.execute("""
+                    cursor.execute("""
                         UPDATE job_queue
                         SET status = 'pending',
-                            error_message = ?,
+                            error_message = %s,
                             worker_id = NULL
-                        WHERE id = ?
+                        WHERE id = %s
                     """, (error, job_id))
                     conn.commit()
                     logger.warning(f"Job {job_id} failed, will retry (attempt {row['attempts']}/{row['max_attempts']}): {error}")
                     return
 
             # No retries - mark as failed
-            conn.execute("""
+            cursor.execute("""
                 UPDATE job_queue
                 SET status = 'failed',
-                    error_message = ?,
+                    error_message = %s,
                     completed_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = %s
             """, (error, job_id))
             conn.commit()
 
@@ -266,11 +304,12 @@ class JobQueue:
             True if cancelled, False if job not found or not pending
         """
         with _get_queue_connection() as conn:
-            cursor = conn.execute("""
+            cursor = conn.cursor()
+            cursor.execute("""
                 UPDATE job_queue
                 SET status = 'cancelled',
                     completed_at = CURRENT_TIMESTAMP
-                WHERE id = ? AND status = 'pending'
+                WHERE id = %s AND status = 'pending'
             """, (job_id,))
             conn.commit()
             return cursor.rowcount > 0
@@ -286,8 +325,9 @@ class JobQueue:
             Job dict or None
         """
         with _get_queue_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM job_queue WHERE id = ?",
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(
+                "SELECT * FROM job_queue WHERE id = %s",
                 (job_id,)
             )
             row = cursor.fetchone()
@@ -306,8 +346,9 @@ class JobQueue:
             List of job dicts
         """
         with _get_queue_connection() as conn:
-            cursor = conn.execute(
-                "SELECT * FROM job_queue WHERE data_room_id = ? ORDER BY created_at DESC",
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(
+                "SELECT * FROM job_queue WHERE data_room_id = %s ORDER BY created_at DESC",
                 (data_room_id,)
             )
             return [dict(row) for row in cursor.fetchall()]
@@ -315,18 +356,20 @@ class JobQueue:
     def get_pending_count(self) -> int:
         """Get count of pending jobs."""
         with _get_queue_connection() as conn:
-            cursor = conn.execute(
-                "SELECT COUNT(*) FROM job_queue WHERE status = 'pending'"
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM job_queue WHERE status = 'pending'"
             )
-            return cursor.fetchone()[0]
+            return cursor.fetchone()['cnt']
 
     def get_running_count(self) -> int:
         """Get count of running jobs."""
         with _get_queue_connection() as conn:
-            cursor = conn.execute(
-                "SELECT COUNT(*) FROM job_queue WHERE status = 'running'"
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM job_queue WHERE status = 'running'"
             )
-            return cursor.fetchone()[0]
+            return cursor.fetchone()['cnt']
 
     def get_queue_stats(self) -> Dict[str, int]:
         """
@@ -336,7 +379,8 @@ class JobQueue:
             Dict with counts by status
         """
         with _get_queue_connection() as conn:
-            cursor = conn.execute("""
+            cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+            cursor.execute("""
                 SELECT status, COUNT(*) as count
                 FROM job_queue
                 GROUP BY status
@@ -363,11 +407,12 @@ class JobQueue:
             Number of jobs removed
         """
         with _get_queue_connection() as conn:
-            cursor = conn.execute("""
+            cursor = conn.cursor()
+            cursor.execute("""
                 DELETE FROM job_queue
                 WHERE status IN ('completed', 'failed', 'cancelled')
-                AND completed_at < datetime('now', ?)
-            """, (f'-{days} days',))
+                AND completed_at < CURRENT_TIMESTAMP - (%s * interval '1 day')
+            """, (days,))
             conn.commit()
             count = cursor.rowcount
 
@@ -391,31 +436,30 @@ class JobQueue:
             Number of jobs recovered (retried + failed)
         """
         with _get_queue_connection() as conn:
-            # 1. Retryable jobs: still have attempts remaining → back to pending
-            cursor = conn.execute("""
+            cursor = conn.cursor()
+            # 1. Retryable jobs: still have attempts remaining -> back to pending
+            cursor.execute("""
                 UPDATE job_queue
                 SET status = 'pending',
                     worker_id = NULL,
                     error_message = 'Job recovered after worker timeout — will retry'
                 WHERE status = 'running'
-                AND started_at < datetime('now', ?)
+                AND started_at < CURRENT_TIMESTAMP - (%s * interval '1 minute')
                 AND attempts < max_attempts
-            """, (f'-{timeout_minutes} minutes',))
+            """, (timeout_minutes,))
             retried = cursor.rowcount
 
-            # 2. Exhausted jobs: no attempts remaining → mark as failed
-            #    Without this, jobs sit in 'pending' forever (claim_job requires
-            #    attempts < max_attempts) and block stall detection.
-            cursor = conn.execute("""
+            # 2. Exhausted jobs: no attempts remaining -> mark as failed
+            cursor.execute("""
                 UPDATE job_queue
                 SET status = 'failed',
                     worker_id = NULL,
                     completed_at = CURRENT_TIMESTAMP,
                     error_message = 'Job failed after all retry attempts (worker crashed repeatedly)'
                 WHERE status = 'running'
-                AND started_at < datetime('now', ?)
+                AND started_at < CURRENT_TIMESTAMP - (%s * interval '1 minute')
                 AND attempts >= max_attempts
-            """, (f'-{timeout_minutes} minutes',))
+            """, (timeout_minutes,))
             failed = cursor.rowcount
 
             conn.commit()

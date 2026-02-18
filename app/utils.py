@@ -95,7 +95,7 @@ def get_system_status() -> dict:
     """
     process = psutil.Process()
     memory = psutil.virtual_memory()
-    disk = psutil.disk_usage(Path(settings.database_path).parent)
+    disk = psutil.disk_usage(Path(settings.data_rooms_path).parent)
 
     return {
         "process": {

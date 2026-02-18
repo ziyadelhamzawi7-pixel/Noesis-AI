@@ -7,3 +7,7 @@ healthcheckPath = "/api/health"
 healthcheckTimeout = 300
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 3
+# Railway Pro: set numReplicas = 1 (vertical scaling, not horizontal)
+# To resize the instance, go to Railway dashboard -> Service -> Settings -> Resources
+# Recommended: 8GB RAM / 8 vCPUs for production workloads with OCR
+# The app auto-detects available RAM/CPU and tunes worker pools accordingly

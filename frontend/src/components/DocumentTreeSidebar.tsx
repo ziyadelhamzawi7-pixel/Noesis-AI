@@ -1,6 +1,6 @@
-import { useState, useEffect, useCallback, memo } from 'react';
-import { ChevronRight, ChevronDown, Folder, FileText, Table, File, Eye, Upload, Loader2, AlertTriangle } from 'lucide-react';
-import { getDocumentTree, DocumentTreeResponse, FolderNode, DocumentWithPath } from '../api/client';
+import { useState, useEffect, useCallback, useRef, memo } from 'react';
+import { ChevronRight, ChevronDown, Folder, FileText, Table, File, Eye, Upload, Loader2, AlertTriangle, RefreshCw, Plus } from 'lucide-react';
+import { getDocumentTree, uploadFilesToDataRoom, DocumentTreeResponse, FolderNode, DocumentWithPath } from '../api/client';
 
 interface DocumentTreeSidebarProps {
   dataRoomId: string;
@@ -14,6 +14,25 @@ function DocumentTreeSidebar({ dataRoomId, onDocumentClick, processingStatus }: 
   const [folderContents, setFolderContents] = useState<Map<string, DocumentTreeResponse>>(new Map());
   const [loadingFolders, setLoadingFolders] = useState<Set<string>>(new Set());
   const [isUploadsExpanded, setIsUploadsExpanded] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [isUploading, setIsUploading] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleAddFiles = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = e.target.files;
+    if (!files || files.length === 0) return;
+
+    setIsUploading(true);
+    try {
+      await uploadFilesToDataRoom(dataRoomId, Array.from(files));
+      loadRootTree();
+    } catch (err) {
+      console.error('Failed to upload files:', err);
+    } finally {
+      setIsUploading(false);
+      if (fileInputRef.current) fileInputRef.current.value = '';
+    }
+  };
 
   useEffect(() => {
     loadRootTree();
@@ -38,11 +57,16 @@ function DocumentTreeSidebar({ dataRoomId, onDocumentClick, processingStatus }: 
   }, [processingStatus]);
 
   const loadRootTree = async () => {
+    setError(null);
     try {
       const tree = await getDocumentTree(dataRoomId);
       setRootTree(tree);
-    } catch (error) {
-      console.error('Failed to load document tree:', error);
+    } catch (err: any) {
+      console.error('Failed to load document tree:', err);
+      if (!rootTree) {
+        const detail = err.response?.data?.detail;
+        setError(detail || 'Failed to load documents');
+      }
     }
   };
 
@@ -203,15 +227,34 @@ function DocumentTreeSidebar({ dataRoomId, onDocumentClick, processingStatus }: 
     );
   };
 
-  // Loading state
+  // Loading / error state
   if (!rootTree) {
     return (
       <div className="sidebar" style={{ width: '240px' }}>
         <div className="sidebar-header">
           <h4 className="sidebar-title">Documents</h4>
         </div>
-        <div className="sidebar-content" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', padding: '32px' }}>
-          <div className="spinner spinner-sm" />
+        <div className="sidebar-content" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', padding: '32px', gap: '12px' }}>
+          {error ? (
+            <>
+              <AlertTriangle size={20} style={{ color: 'var(--error)' }} />
+              <p style={{ fontSize: '12px', color: 'var(--text-secondary)', textAlign: 'center', margin: 0 }}>{error}</p>
+              <button
+                onClick={loadRootTree}
+                style={{
+                  display: 'flex', alignItems: 'center', gap: '6px',
+                  fontSize: '12px', padding: '6px 12px', borderRadius: '6px',
+                  border: '1px solid var(--border)', background: 'var(--bg-secondary)',
+                  color: 'var(--text-secondary)', cursor: 'pointer',
+                }}
+              >
+                <RefreshCw size={12} />
+                Retry
+              </button>
+            </>
+          ) : (
+            <div className="spinner spinner-sm" />
+          )}
         </div>
       </div>
     );
@@ -219,8 +262,32 @@ function DocumentTreeSidebar({ dataRoomId, onDocumentClick, processingStatus }: 
 
   return (
     <div className="sidebar" style={{ width: '240px' }}>
-      <div className="sidebar-header">
+      <div className="sidebar-header" style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
         <h4 className="sidebar-title">Documents ({rootTree.total_documents})</h4>
+        <button
+          onClick={() => fileInputRef.current?.click()}
+          disabled={isUploading}
+          title="Add files"
+          style={{
+            display: 'flex', alignItems: 'center', gap: '4px',
+            fontSize: '11px', fontWeight: 600, padding: '4px 10px',
+            borderRadius: '6px', border: '1px solid var(--border-default)',
+            background: 'var(--bg-secondary)', color: 'var(--accent-primary)',
+            cursor: isUploading ? 'not-allowed' : 'pointer',
+            opacity: isUploading ? 0.6 : 1,
+          }}
+        >
+          {isUploading ? <Loader2 size={12} style={{ animation: 'spin 1s linear infinite' }} /> : <Plus size={12} />}
+          Add
+        </button>
+        <input
+          ref={fileInputRef}
+          type="file"
+          multiple
+          accept=".pdf,.xlsx,.xls,.csv,.docx,.doc,.pptx,.ppt,.txt"
+          onChange={handleAddFiles}
+          style={{ display: 'none' }}
+        />
       </div>
 
       <div className="sidebar-content">

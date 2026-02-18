@@ -53,6 +53,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
+# Pre-download the local embedding model so first request has no cold start
+RUN python -c "from fastembed import TextEmbedding; TextEmbedding('BAAI/bge-small-en-v1.5')" 2>/dev/null || true
+
 # Copy application code
 COPY app/ ./app/
 COPY tools/ ./tools/
@@ -69,7 +72,7 @@ RUN chmod +x start.sh
 ENV PORT=8000
 ENV HOST=0.0.0.0
 ENV SERVE_FRONTEND=true
-ENV DATABASE_PATH=/data/due_diligence.db
+# DATABASE_URL is passed at runtime via docker run -e (e.g. postgresql://user:pass@host:5432/dbname)
 ENV CHROMA_DB_PATH=/data/chroma_db
 ENV DATA_ROOMS_PATH=/data/data_rooms
 

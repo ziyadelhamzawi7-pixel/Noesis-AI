@@ -25,7 +25,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse, FileResponse, StreamingResponse, Response
 from loguru import logger
 
-from app.config import settings, validate_settings
+from app.config import settings, validate_settings, log_resource_config
 from app.job_queue import job_queue, JobStatus
 from app.models import (
     DataRoomCreate,
@@ -84,6 +84,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# GZip compression for all responses (JS/CSS/JSON) — cuts transfer size 3-5x
+from starlette.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # --- Access Password Protection ---
 # When ACCESS_PASSWORD is set, all routes are gated behind a login page.
@@ -194,6 +198,7 @@ _active_background_tasks_lock = Lock()
 async def startup_event():
     """Validate configuration and initialize services."""
     logger.info("Starting VC Due Diligence API server...")
+    log_resource_config()
 
     if not validate_settings():
         logger.error("Configuration validation failed!")
@@ -201,21 +206,23 @@ async def startup_event():
     else:
         logger.success("Configuration validated successfully")
 
-    # Cancel stale running jobs from previous run (they caused OOM crashes)
+    # Cancel stale running AND pending jobs from previous run.
+    # No workers survived the restart, so every incomplete job is orphaned.
+    # The recovery logic below will selectively re-trigger what's truly needed.
     try:
-        import sqlite3 as _sqlite3
-        _conn = _sqlite3.connect(settings.database_path, timeout=30.0)
-        stale_count = _conn.execute(
-            "UPDATE job_queue SET status = 'cancelled' WHERE status = 'running'"
-        ).rowcount
+        import psycopg2 as _psycopg2_startup
+        _conn = _psycopg2_startup.connect(settings.database_url)
+        _cur = _conn.cursor()
+        _cur.execute("UPDATE job_queue SET status = 'cancelled' WHERE status IN ('running', 'pending')")
+        stale_count = _cur.rowcount
         _conn.commit()
         _conn.close()
         if stale_count > 0:
-            logger.info(f"Cancelled {stale_count} stale running jobs from previous run")
+            logger.info(f"Cancelled {stale_count} stale incomplete jobs from previous run")
 
         # Clean up orphaned connected_folders and jobs (referencing deleted data rooms)
-        import sqlite3
-        conn = sqlite3.connect(settings.database_path, timeout=30.0)
+        import psycopg2 as _psycopg2_cleanup
+        conn = _psycopg2_cleanup.connect(settings.database_url)
         try:
             cursor = conn.cursor()
             # Delete orphaned connected_folders first (this is the source of orphaned jobs)
@@ -238,15 +245,61 @@ async def startup_event():
             if orphaned_jobs > 0:
                 logger.info(f"Cleaned up {orphaned_jobs} orphaned jobs")
 
-            # Reset documents stuck at 'parsing' with no active job
+            # Mark documents stuck at 'parsing' as failed (interrupted by restart).
+            # Previously this reset them to 'pending' which caused infinite re-parsing
+            # loops since workers would immediately pick them up on every restart.
             cursor.execute("""
                 UPDATE documents
-                SET parse_status = 'pending'
+                SET parse_status = 'failed',
+                    error_message = 'Interrupted by server restart — use Reprocess to retry'
                 WHERE parse_status = 'parsing'
             """)
             orphaned_docs = cursor.rowcount
             if orphaned_docs > 0:
-                logger.info(f"Reset {orphaned_docs} orphaned documents to pending")
+                logger.info(f"Marked {orphaned_docs} interrupted documents as failed")
+
+            # Mark data rooms as complete if all their documents are in terminal
+            # states (parsed/failed) but the data room is still stuck in processing.
+            cursor.execute("""
+                UPDATE data_rooms
+                SET processing_status = 'complete',
+                    progress_percent = 100,
+                    completed_at = CURRENT_TIMESTAMP
+                WHERE processing_status IN ('parsing', 'indexing', 'extracting')
+                AND EXISTS (
+                    SELECT 1 FROM documents d WHERE d.data_room_id = data_rooms.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM documents d
+                    WHERE d.data_room_id = data_rooms.id
+                    AND d.parse_status NOT IN ('parsed', 'failed')
+                )
+            """)
+            recovered_rooms = cursor.rowcount
+            if recovered_rooms > 0:
+                logger.info(f"Marked {recovered_rooms} stuck data rooms as complete")
+
+            # Mark connected folders as complete if they are stuck in a processing
+            # state but all their synced files are already in terminal states.
+            # This prevents re-discovery and re-download of already-parsed files on restart.
+            cursor.execute("""
+                UPDATE connected_folders
+                SET sync_stage = 'complete',
+                    sync_status = 'active'
+                WHERE sync_stage IN ('discovering', 'discovered', 'processing', 'queued')
+                AND EXISTS (
+                    SELECT 1 FROM synced_files sf
+                    WHERE sf.connected_folder_id = connected_folders.id
+                )
+                AND NOT EXISTS (
+                    SELECT 1 FROM synced_files sf
+                    WHERE sf.connected_folder_id = connected_folders.id
+                    AND sf.sync_status NOT IN ('complete', 'failed')
+                )
+            """)
+            recovered_folders = cursor.rowcount
+            if recovered_folders > 0:
+                logger.info(f"Marked {recovered_folders} stuck connected folders as complete")
 
             conn.commit()
         finally:
@@ -279,12 +332,12 @@ async def startup_event():
 
     # Recover stalled data rooms — re-trigger processing instead of killing them
     try:
-        import sqlite3 as _sqlite3_recovery
+        import psycopg2 as _psycopg2_recovery
+        import psycopg2.extras as _psycopg2_extras_recovery
         import threading as _threading_recovery
-        _rconn = _sqlite3_recovery.connect(settings.database_path, timeout=30.0)
-        _rconn.row_factory = _sqlite3_recovery.Row
+        _rconn = _psycopg2_recovery.connect(settings.database_url)
         try:
-            _rcur = _rconn.cursor()
+            _rcur = _rconn.cursor(cursor_factory=_psycopg2_extras_recovery.RealDictCursor)
             # Find data rooms with pending documents but no active jobs.
             # (all running jobs were already reset to pending/failed above).
             # Exclude pending jobs that have exhausted their attempts — they
@@ -364,7 +417,7 @@ async def startup_event():
     # Periodic stall detection — recover data rooms stuck in processing with no active jobs
     async def _stall_detection_loop():
         import asyncio
-        import sqlite3 as _sqlite3_stall
+        import psycopg2.extras as _psycopg2_extras_stall
         await asyncio.sleep(60)  # Wait 1 minute before first check (after startup recovery settles)
         while True:
             try:
@@ -373,10 +426,9 @@ async def startup_event():
                 if recovered > 0:
                     logger.info(f"[stall-guard] Recovered {recovered} stale running jobs")
 
-                _sconn = _sqlite3_stall.connect(settings.database_path, timeout=30.0)
-                _sconn.row_factory = _sqlite3_stall.Row
-                try:
-                    _scur = _sconn.cursor()
+                needs_reembed = []
+                with db.get_db_connection() as _sconn:
+                    _scur = _sconn.cursor(cursor_factory=_psycopg2_extras_stall.RealDictCursor)
                     # Find data rooms stuck in processing for >5 minutes with no active jobs.
                     # Treat jobs running for >5 minutes as effectively dead (crashed workers).
                     # Exclude pending jobs that have exhausted their attempts — they can
@@ -386,14 +438,14 @@ async def startup_event():
                         SELECT dr.id
                         FROM data_rooms dr
                         WHERE dr.processing_status IN ('parsing', 'indexing', 'extracting')
-                        AND dr.created_at < datetime('now', '-5 minutes')
+                        AND dr.created_at < CURRENT_TIMESTAMP - interval '5 minutes'
                         AND EXISTS (SELECT 1 FROM documents d WHERE d.data_room_id = dr.id)
                         AND NOT EXISTS (
                             SELECT 1 FROM job_queue jq
                             WHERE jq.data_room_id = dr.id
                             AND (
                                 (jq.status = 'pending' AND jq.attempts < jq.max_attempts)
-                                 OR (jq.status = 'running' AND jq.started_at > datetime('now', '-5 minutes'))
+                                 OR (jq.status = 'running' AND jq.started_at > CURRENT_TIMESTAMP - interval '5 minutes')
                             )
                         )
                     """)
@@ -412,11 +464,11 @@ async def startup_event():
                             UPDATE documents
                             SET parse_status = 'failed',
                                 error_message = 'Processing interrupted - use Reprocess to retry'
-                            WHERE data_room_id = ? AND parse_status IN ('pending', 'parsing')
+                            WHERE data_room_id = %s AND parse_status IN ('pending', 'parsing')
                         """, (room_id,))
 
                         _scur.execute(
-                            "SELECT COUNT(*) as cnt FROM documents WHERE data_room_id = ?",
+                            "SELECT COUNT(*) as cnt FROM documents WHERE data_room_id = %s",
                             (room_id,)
                         )
                         doc_count = _scur.fetchone()['cnt']
@@ -425,9 +477,9 @@ async def startup_event():
                             UPDATE data_rooms
                             SET processing_status = 'complete',
                                 progress_percent = 100,
-                                total_documents = ?,
-                                completed_at = datetime('now')
-                            WHERE id = ?
+                                total_documents = %s,
+                                completed_at = CURRENT_TIMESTAMP
+                            WHERE id = %s
                         """, (doc_count, room_id))
 
                         logger.info(f"[stall-guard] Recovered stalled data room {room_id} ({doc_count} docs)")
@@ -450,8 +502,6 @@ async def startup_event():
                         )
                     """)
                     needs_reembed = [row['id'] for row in _scur.fetchall()]
-                finally:
-                    _sconn.close()
 
                 # Trigger reembed in a background thread so the event loop stays free
                 for room_id in needs_reembed:
@@ -485,7 +535,7 @@ async def startup_event():
     # Log server info
     logger.info(f"API server: http://{settings.host}:{settings.port}")
     logger.info(f"API docs: http://{settings.host}:{settings.port}/docs")
-    logger.info(f"Database: {settings.database_path}")
+    logger.info(f"Database: PostgreSQL ({settings.database_url.split('@')[-1] if '@' in settings.database_url else 'local'})")
     logger.info(f"Vector DB: {settings.chroma_db_path}")
 
 
@@ -495,6 +545,8 @@ async def shutdown_event():
     logger.info("Shutting down VC Due Diligence API server...")
     sync_service.stop()
     worker_pool.stop()
+    from app.job_queue import close_queue_pool
+    close_queue_pool()
 
 
 # ============================================================================
@@ -523,6 +575,12 @@ def require_data_room_access(
     if not settings.enable_sharing:
         return 'owner'
 
+    # If the user is not logged in, allow access. Sharing restricts between
+    # authenticated users, not against unauthenticated access. Password
+    # protection is handled separately by AccessPasswordMiddleware.
+    if not user_id and not user_email:
+        return 'owner'
+
     role = db.check_data_room_access(data_room_id, user_id, user_email)
     if role is None:
         raise HTTPException(status_code=403, detail="You do not have access to this data room")
@@ -538,8 +596,15 @@ async def health_check():
     Health check endpoint to verify system status.
     Returns comprehensive system metrics including Tier 3 components.
     """
-    # Check database exists
-    db_exists = Path(settings.database_path).exists()
+    # Check database connection
+    try:
+        import psycopg2 as _psycopg2_health
+        _hconn = _psycopg2_health.connect(settings.database_url)
+        _hconn.cursor().execute("SELECT 1")
+        _hconn.close()
+        db_exists = True
+    except Exception:
+        db_exists = False
 
     # Check vector DB exists
     vector_db_exists = Path(settings.chroma_db_path).exists()
@@ -1492,6 +1557,10 @@ async def create_data_room(
             uploaded_count += 1
             logger.info(f"Streamed & enqueued file {uploaded_count}/{total_files}: {safe_filename} ({file_info['size']} bytes)")
 
+        # Signal that all files are on disk and queued — moves bar off 0%
+        if uploaded_count > 0:
+            db.update_data_room_status(data_room_id, 'uploading', progress=3)
+
         logger.success(f"Data room {data_room_id} created with {uploaded_count} files — processing started")
 
         return {
@@ -1541,6 +1610,7 @@ async def create_data_room(
 async def upload_files_to_data_room(
     data_room_id: str,
     files: List[UploadFile] = File(...),
+    paths: Optional[str] = Form(None),
     identity: Dict = Depends(get_user_identity)
 ):
     """
@@ -1549,11 +1619,24 @@ async def upload_files_to_data_room(
     Used after creating a data room via POST /api/data-room/create (without files)
     so the frontend can navigate to the data room immediately while files upload
     in the background.
+
+    Args:
+        paths: Optional JSON-encoded list of relative folder paths (from webkitRelativePath),
+               one per file. Used to preserve folder hierarchy in the document tree sidebar.
     """
     try:
         data_room = db.get_data_room(data_room_id)
         if not data_room:
             raise HTTPException(status_code=404, detail="Data room not found")
+
+        # Parse optional relative paths for folder hierarchy display
+        relative_paths: List[Optional[str]] = []
+        if paths:
+            try:
+                import json
+                relative_paths = json.loads(paths)
+            except (json.JSONDecodeError, TypeError):
+                relative_paths = []
 
         data_room_path = Path(f"{settings.data_rooms_path}/{data_room_id}/raw")
         data_room_path.mkdir(parents=True, exist_ok=True)
@@ -1580,7 +1663,7 @@ async def upload_files_to_data_room(
         # Save all files in this batch concurrently
         saved_files = await asyncio.gather(*[_save_file(f) for f in files])
 
-        for safe_filename, file_path, file_info in saved_files:
+        for idx, (safe_filename, file_path, file_info) in enumerate(saved_files):
             if file_info['size'] == 0:
                 file_path.unlink()
                 logger.warning(f"Skipping empty file: {safe_filename}")
@@ -1592,13 +1675,17 @@ async def upload_files_to_data_room(
                 logger.warning(f"Skipping invalid file {safe_filename}: {error_msg}")
                 continue
 
+            # Get relative path for this file if provided (for folder hierarchy display)
+            rel_path = relative_paths[idx] if idx < len(relative_paths) else None
+
             file_type = Path(safe_filename).suffix.lower().replace('.', '')
             document_id = db.create_document(
                 data_room_id=data_room_id,
                 file_name=safe_filename,
                 file_path=str(file_path),
                 file_size=file_info['size'],
-                file_type=file_type
+                file_type=file_type,
+                relative_path=rel_path
             )
 
             job_queue.enqueue(
@@ -1616,6 +1703,10 @@ async def upload_files_to_data_room(
 
             uploaded_count += 1
             logger.info(f"[upload-files] Streamed & enqueued file {uploaded_count}/{batch_size}: {safe_filename} ({file_info['size']} bytes)")
+
+        # Signal that all files are on disk and queued — moves bar off 0%
+        if uploaded_count > 0:
+            db.update_data_room_status(data_room_id, 'uploading', progress=3)
 
         logger.success(f"[upload-files] {uploaded_count} files uploaded to data room {data_room_id}")
 
@@ -1649,7 +1740,7 @@ def get_data_room_status(
     """
     try:
         # Retry logic to handle race condition on newly created data rooms
-        # SQLite WAL mode + connection pool may delay visibility of new writes
+        # Connection pool may delay visibility of new writes
         data_room = None
         for attempt in range(3):
             data_room = db.get_data_room(data_room_id)
@@ -1816,6 +1907,79 @@ async def ask_question(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/data-room/{data_room_id}/question/stream")
+async def ask_question_stream(
+    data_room_id: str,
+    request: QuestionRequest,
+    identity: Dict = Depends(get_user_identity)
+):
+    """
+    Streaming version of the question endpoint.
+    Returns SSE events as the answer is generated by Claude.
+    """
+    # Verify data room exists
+    data_room = db.get_data_room(data_room_id)
+    if not data_room:
+        raise HTTPException(status_code=404, detail=f"Data room not found: {data_room_id}")
+
+    if settings.enable_sharing:
+        require_data_room_access(
+            data_room_id, identity["user_id"], identity["user_email"]
+        )
+
+    logger.info(f"Streaming question for {data_room_id}: {request.question}")
+
+    from tools.answer_question import answer_question_stream
+
+    def event_generator():
+        """Run the blocking generator in the current thread (called via StreamingResponse)."""
+        import time
+        start_time = time.time()
+        full_answer = None
+
+        for event in answer_question_stream(
+            question=request.question,
+            data_room_id=data_room_id,
+            filters=request.filters,
+            model=settings.claude_model,
+        ):
+            yield event
+
+            # Try to save the query when we get the final 'done' event
+            try:
+                import json as _json
+                if event.startswith("data: "):
+                    payload = _json.loads(event[6:].strip())
+                    if payload.get("type") == "done":
+                        meta = payload.get("metadata", {})
+                        full_answer = meta.get("answer", "")
+                        try:
+                            db.save_query(
+                                data_room_id=data_room_id,
+                                question=request.question,
+                                answer=full_answer,
+                                sources=meta.get("sources", []),
+                                confidence_score=meta.get("confidence_score"),
+                                response_time_ms=meta.get("response_time_ms"),
+                                tokens_used=meta.get("tokens_used"),
+                                cost=meta.get("cost"),
+                                user_id=identity["user_id"],
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to save streamed query: {e}")
+            except Exception:
+                pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.delete("/api/data-room/{data_room_id}/questions/{question_id}")
 def delete_question(
     data_room_id: str,
@@ -1891,10 +2055,10 @@ async def reprocess_data_room_endpoint(data_room_id: str, background_tasks: Back
         if not file_paths:
             raise HTTPException(status_code=400, detail="No uploaded files found on disk for reprocessing")
 
-        # Clear existing chunks from SQLite
+        # Clear existing chunks from database
         with db.get_db_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("DELETE FROM chunks WHERE data_room_id = ?", (data_room_id,))
+            cursor.execute("DELETE FROM chunks WHERE data_room_id = %s", (data_room_id,))
             deleted_count = cursor.rowcount
             conn.commit()
             logger.info(f"[{data_room_id}] Cleared {deleted_count} existing chunks from DB")
@@ -2161,8 +2325,11 @@ def delete_data_room_endpoint(
         import shutil
         data_room_path = Path(f"{settings.data_rooms_path}/{data_room_id}")
         if data_room_path.exists():
-            shutil.rmtree(data_room_path)
-            logger.info(f"Deleted data room directory: {data_room_path}")
+            try:
+                shutil.rmtree(data_room_path)
+                logger.info(f"Deleted data room directory: {data_room_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete data room directory: {e}")
 
         # Delete database records (cascades to documents, chunks, queries, etc.)
         db.delete_data_room(data_room_id)
@@ -3182,6 +3349,65 @@ async def export_memo_docx(data_room_id: str, memo_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/api/data-room/{data_room_id}/memo/{memo_id}/save-to-drive")
+async def save_memo_to_drive(
+    data_room_id: str,
+    memo_id: str,
+    identity: Dict = Depends(get_user_identity)
+):
+    """Save memo as a DOCX file to the user's Google Drive."""
+    try:
+        from app.database import get_memo_by_id, get_data_room
+        from tools.memo_exporter import generate_memo_docx
+
+        user_id = identity.get('user_id')
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        # Get memo
+        memo = get_memo_by_id(memo_id)
+        if not memo:
+            raise HTTPException(status_code=404, detail="Memo not found")
+        if memo.get("data_room_id") != data_room_id:
+            raise HTTPException(status_code=404, detail="Memo not found for this data room")
+        if memo.get("status") != "complete":
+            raise HTTPException(status_code=400, detail="Memo is not complete yet")
+
+        # Get data room for company name
+        data_room = get_data_room(data_room_id)
+        company_name = data_room.get("company_name", "Company") if data_room else "Company"
+
+        # Generate DOCX
+        docx_buffer = generate_memo_docx(memo, company_name)
+        docx_bytes = docx_buffer.getvalue()
+
+        # Create filename
+        safe_company_name = "".join(c for c in company_name if c.isalnum() or c in (' ', '-', '_')).strip()
+        filename = f"{safe_company_name}_Investment_Memo.docx"
+
+        # Upload to Google Drive
+        drive_service = get_drive_service(user_id)
+        result = drive_service.upload_file(
+            name=filename,
+            content=docx_bytes,
+            mime_type='application/vnd.openxmlformats-officedocument.wordprocessingml.document'
+        )
+
+        logger.info(f"Saved memo {memo_id} to Google Drive: {result.get('id')}")
+
+        return {
+            "file_id": result.get('id'),
+            "web_view_link": result.get('webViewLink'),
+            "file_name": filename
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to save memo to Drive: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # Utility Endpoints
 
 @app.get("/api/costs")
@@ -3390,8 +3616,11 @@ async def google_auth_callback(
             except Exception as invite_err:
                 logger.warning(f"Failed to auto-accept invites: {invite_err}")
 
-        # Redirect to frontend — use the base_url stored during login initiation
-        base_url = stored_state.get('base_url', f"{request.url.scheme}://{request.url.netloc}")
+        # Redirect to frontend — in dev mode the frontend runs on a different port
+        if _serve_frontend:
+            base_url = stored_state.get('base_url', f"{request.url.scheme}://{request.url.netloc}")
+        else:
+            base_url = settings.frontend_url.rstrip("/")
         frontend_url = f"{base_url}/auth/callback?user_id={user_id}&email={email}"
         return RedirectResponse(url=frontend_url)
 
@@ -3400,7 +3629,10 @@ async def google_auth_callback(
     except Exception as e:
         logger.error(f"OAuth callback failed: {e}")
         # Redirect to frontend with error
-        base_url = f"{request.url.scheme}://{request.url.netloc}"
+        if _serve_frontend:
+            base_url = f"{request.url.scheme}://{request.url.netloc}"
+        else:
+            base_url = settings.frontend_url.rstrip("/")
         return RedirectResponse(url=f"{base_url}/auth/callback?error={str(e)}")
 
 
@@ -4507,13 +4739,18 @@ async def retry_failed_files(connection_id: str, background_tasks: BackgroundTas
 
         count = db.reset_failed_synced_files(connection_id)
 
-        if count > 0:
+        # Also check for pending files that were never processed
+        pending_count = db.count_pending_synced_files(connection_id)
+
+        if count > 0 or pending_count > 0:
+            # Reset folder stage so the sync service doesn't skip it
+            db.update_connected_folder_stage(connection_id, sync_stage='processing')
             # Trigger immediate sync after reset
             background_tasks.add_task(sync_service.trigger_sync, connection_id)
 
         return {
-            "message": f"Reset {count} failed files for retry",
-            "count": count,
+            "message": f"Reset {count} failed files, {pending_count} pending files queued for retry",
+            "count": count + pending_count,
             "folder_id": connection_id
         }
 
@@ -4987,9 +5224,19 @@ async def agent_get_file_text(user_id: str, file_id: str):
 if _serve_frontend:
     from fastapi.staticfiles import StaticFiles
 
-    # Serve static assets (JS, CSS, images)
+    # Serve hashed static assets with aggressive caching (1 year, immutable)
     if (_frontend_dist / "assets").exists():
-        app.mount("/assets", StaticFiles(directory=str(_frontend_dist / "assets")), name="static-assets")
+        _assets_dir = str(_frontend_dist / "assets")
+
+        @app.get("/assets/{file_path:path}")
+        async def serve_asset(file_path: str):
+            full = Path(_assets_dir) / file_path
+            if full.exists() and full.is_file():
+                return FileResponse(
+                    str(full),
+                    headers={"Cache-Control": "public, max-age=31536000, immutable"},
+                )
+            raise HTTPException(status_code=404)
 
     # SPA catch-all: all non-API routes return index.html
     @app.get("/{full_path:path}")

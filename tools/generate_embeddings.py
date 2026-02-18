@@ -1,9 +1,12 @@
 """
-Embedding generation tool using OpenAI API.
-Batches requests, implements rate limiting, and caches results.
-Supports parallel processing for faster embedding generation.
+Embedding generation tool with local (fastembed) and OpenAI API backends.
+Supports parallel processing, batching, rate limiting, and caching.
 
-Tier 3 optimized with:
+Backends:
+- Local (fastembed): CPU-based ONNX inference, no API calls, ~2000 chunks/sec
+- OpenAI API: Cloud-based, rate-limited, higher quality but slower
+
+Tier 3 optimized (OpenAI backend) with:
 - Adaptive rate limiting (5,000 RPM, 5M TPM)
 - Circuit breaker for resilience
 - Redis caching for duplicate text detection
@@ -15,6 +18,7 @@ import os
 import re
 import time
 import asyncio
+import threading
 from pathlib import Path
 from typing import Dict, List, Any, Optional, Tuple
 import json
@@ -46,6 +50,120 @@ try:
     REDIS_CACHE_ENABLED = True
 except ImportError:
     REDIS_CACHE_ENABLED = False
+
+# Import fastembed for local embeddings
+try:
+    from fastembed import TextEmbedding
+    FASTEMBED_AVAILABLE = True
+except ImportError:
+    FASTEMBED_AVAILABLE = False
+    logger.debug("fastembed not available. Install with: pip install fastembed")
+
+# Resolve embedding provider from config
+try:
+    from app.config import settings as _settings
+    _EMBEDDING_PROVIDER = _settings.embedding_provider
+    _LOCAL_MODEL_NAME = _settings.local_embedding_model
+except ImportError:
+    _EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
+    _LOCAL_MODEL_NAME = os.getenv("LOCAL_EMBEDDING_MODEL", "BAAI/bge-small-en-v1.5")
+
+
+# ============================================================
+# Local Embedding Generator (fastembed)
+# ============================================================
+
+# Module-level singleton — model loads once, shared across all workers
+_local_model = None
+_local_model_lock = threading.Lock()
+
+
+def _get_local_model() -> "TextEmbedding":
+    """Get or lazily create the singleton fastembed model."""
+    global _local_model
+    if _local_model is None:
+        with _local_model_lock:
+            if _local_model is None:
+                if not FASTEMBED_AVAILABLE:
+                    raise ImportError(
+                        "fastembed is not installed. Run: pip install fastembed"
+                    )
+                logger.info(f"Loading local embedding model: {_LOCAL_MODEL_NAME}")
+                start = time.time()
+                _local_model = TextEmbedding(model_name=_LOCAL_MODEL_NAME)
+                logger.success(
+                    f"Local embedding model loaded in {time.time() - start:.1f}s"
+                )
+    return _local_model
+
+
+class LocalEmbeddingGenerator:
+    """
+    Local embedding generator using fastembed (ONNX-based CPU inference).
+
+    ~2000 chunks/second on 8 vCPU. No API calls, no rate limits, no cost.
+    Thread-safe: the underlying ONNX model is shared across all workers.
+    """
+
+    def __init__(self, batch_size: int = 512):
+        self.batch_size = batch_size
+        self.total_tokens = 0
+        self.total_cost = 0.0  # Always 0 for local
+        self.last_error = None
+        self._sync_lock = threading.Lock()
+
+    def generate(self, chunks: List[Dict[str, Any]], parallel: bool = True) -> List[Dict[str, Any]]:
+        """Generate embeddings for chunks using local model."""
+        if not chunks:
+            return []
+
+        texts = [chunk["chunk_text"] for chunk in chunks]
+        logger.info(f"Generating local embeddings for {len(texts)} chunks")
+        start = time.time()
+
+        try:
+            model = _get_local_model()
+            embeddings = list(model.embed(texts, batch_size=self.batch_size))
+
+            for chunk, emb in zip(chunks, embeddings):
+                chunk["embedding"] = emb.tolist()
+
+            elapsed = time.time() - start
+            rate = len(texts) / elapsed if elapsed > 0 else 0
+            logger.success(
+                f"Local embeddings: {len(texts)} chunks in {elapsed:.1f}s "
+                f"({rate:.0f} chunks/sec)"
+            )
+            return chunks
+
+        except Exception as e:
+            logger.error(f"Local embedding failed: {e}")
+            self.last_error = str(e)
+            for chunk in chunks:
+                chunk["embedding"] = None
+                chunk["embedding_failed"] = True
+                chunk["embedding_error"] = str(e)
+            return chunks
+
+    def _generate_batch(self, texts: List[str]) -> Optional[List[List[float]]]:
+        """
+        Generate embeddings for a batch of texts.
+        Matches the EmbeddingGenerator interface used by generate_embeddings_streaming.
+        """
+        try:
+            model = _get_local_model()
+            embeddings = list(model.embed(texts, batch_size=self.batch_size))
+            return [emb.tolist() for emb in embeddings]
+        except Exception as e:
+            logger.error(f"Local batch embedding failed: {e}")
+            self.last_error = str(e)
+            return None
+
+    def embed_query(self, query: str) -> List[float]:
+        """Embed a single query string. Used by semantic_search."""
+        model = _get_local_model()
+        embeddings = list(model.embed([query]))
+        return embeddings[0].tolist()
 
 
 class EmbeddingGenerator:
@@ -633,32 +751,29 @@ def generate_embeddings(
 ) -> List[Dict[str, Any]]:
     """
     Convenience function to generate embeddings.
+    Automatically uses local (fastembed) or OpenAI based on EMBEDDING_PROVIDER config.
 
     Args:
         chunks: List of chunk dictionaries
         api_key: OpenAI API key (optional, uses env var if not provided)
-        model: Embedding model to use
+        model: Embedding model to use (OpenAI only)
         batch_size: Batch size for API calls
-        max_concurrent: Maximum concurrent API requests (default: 5)
-        parallel: Use parallel processing (default: True, 3-5x faster)
+        max_concurrent: Maximum concurrent API requests (OpenAI only)
+        parallel: Use parallel processing (default: True)
 
     Returns:
         Chunks with embeddings added
-
-    Example:
-        >>> from chunk_documents import chunk_documents
-        >>> from parse_pdf import parse_pdf
-        >>> parsed = parse_pdf("pitch_deck.pdf")
-        >>> chunks = chunk_documents(parsed)
-        >>> chunks_with_embeddings = generate_embeddings(chunks)
-        >>> print(f"Generated {len(chunks_with_embeddings)} embeddings")
     """
+    if _EMBEDDING_PROVIDER == "local" and FASTEMBED_AVAILABLE:
+        generator = LocalEmbeddingGenerator(batch_size=min(batch_size, 512))
+        return generator.generate(chunks, parallel=parallel)
+
     generator = EmbeddingGenerator(
         api_key=api_key,
         model=model,
         batch_size=batch_size,
         max_concurrent=max_concurrent,
-        use_circuit_breaker=False  # Batch processing relies on retry logic; circuit breaker causes cascade failures
+        use_circuit_breaker=False
     )
 
     return generator.generate(chunks, parallel=parallel)
@@ -673,25 +788,17 @@ def generate_embeddings_streaming(
 ):
     """
     Generate embeddings in streaming mode, yielding batches for immediate processing.
-
-    Uses parallel workers to process multiple API batches concurrently while
-    yielding results in order for immediate indexing.
+    Automatically uses local (fastembed) or OpenAI based on EMBEDDING_PROVIDER config.
 
     Args:
         chunks: List of chunk dictionaries with 'chunk_text' field
         api_key: OpenAI API key (optional, uses env var if not provided)
-        model: Embedding model to use
+        model: Embedding model to use (OpenAI only)
         batch_size: Number of chunks per batch
-        max_concurrent: Maximum parallel API requests (default: 5)
+        max_concurrent: Maximum parallel API requests (OpenAI only)
 
     Yields:
         List of chunk dicts with embeddings added (one batch at a time)
-
-    Example:
-        >>> for batch in generate_embeddings_streaming(chunks):
-        ...     index_to_vectordb(data_room_id, batch)
-        ...     db.create_chunks(batch)
-        ...     del batch  # Free memory
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -699,22 +806,33 @@ def generate_embeddings_streaming(
         logger.warning("No chunks provided for streaming embeddings")
         return
 
-    generator = EmbeddingGenerator(
-        api_key=api_key,
-        model=model,
-        batch_size=batch_size,
-        max_concurrent=max_concurrent,
-        use_circuit_breaker=False  # Batch processing relies on retry logic; circuit breaker causes cascade failures
-    )
+    # Choose generator based on provider
+    use_local = _EMBEDDING_PROVIDER == "local" and FASTEMBED_AVAILABLE
+    if use_local:
+        generator = LocalEmbeddingGenerator(batch_size=min(batch_size, 512))
+        # Local embeddings are fast — use larger batches, fewer workers
+        effective_batch_size = min(batch_size, 2048)
+        workers = min(4, os.cpu_count() or 2)
+    else:
+        generator = EmbeddingGenerator(
+            api_key=api_key,
+            model=model,
+            batch_size=batch_size,
+            max_concurrent=max_concurrent,
+            use_circuit_breaker=False
+        )
+        effective_batch_size = batch_size
+        workers = min(max_concurrent, (len(chunks) + effective_batch_size - 1) // effective_batch_size)
 
     # Split chunks into batches
     all_batches = []
-    for i in range(0, len(chunks), batch_size):
-        all_batches.append((i, chunks[i:i + batch_size]))
+    for i in range(0, len(chunks), effective_batch_size):
+        all_batches.append((i, chunks[i:i + effective_batch_size]))
 
     total_batches = len(all_batches)
-    workers = min(max_concurrent, total_batches)
-    logger.info(f"Streaming embeddings: {len(chunks)} chunks in {total_batches} batches, {workers} parallel workers")
+    workers = min(workers, total_batches)
+    provider_label = "local" if use_local else "OpenAI"
+    logger.info(f"Streaming embeddings ({provider_label}): {len(chunks)} chunks in {total_batches} batches, {workers} workers")
 
     # Process all batches with a single persistent executor, yield as each completes
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="embed-stream") as executor:
@@ -748,7 +866,10 @@ def generate_embeddings_streaming(
                     chunk['embedding_error'] = str(e)
             yield batch_chunks
 
-    logger.success(f"Streaming complete: {generator.total_tokens:,} tokens, ${generator.total_cost:.4f}")
+    logger.success(
+        f"Streaming complete ({provider_label}): "
+        f"{generator.total_tokens:,} tokens, ${generator.total_cost:.4f}"
+    )
 
 
 def main():

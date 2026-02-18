@@ -62,9 +62,12 @@ def parse_file_by_type(
         return parse_pdf(file_path, use_ocr=use_ocr, max_ocr_pages=max_ocr_pages)
 
     elif file_type in ('.xlsx', '.xls', '.csv'):
-        if use_financial_excel and file_type != '.csv':
+        file_size_mb = file_path_obj.stat().st_size / (1024 * 1024)
+        if use_financial_excel and file_type != '.csv' and file_size_mb <= 10:
             from tools.parse_excel_financial import parse_excel_financial
             return parse_excel_financial(file_path)
+        if file_size_mb > 10:
+            logger.info(f"Using basic parser for large Excel file ({file_size_mb:.1f} MB): {file_path_obj.name}")
         return parse_excel(file_path)
 
     elif file_type in ('.docx', '.doc'):

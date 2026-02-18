@@ -1,16 +1,16 @@
 """
 Database initialization tool for VC Due Diligence system.
-Creates SQLite schema and initializes ChromaDB client.
+Creates PostgreSQL schema and initializes ChromaDB client.
 """
 
-import sqlite3
+import psycopg2
 import os
 from pathlib import Path
 from datetime import datetime
 from loguru import logger
 
-# Configuration (reads from env vars for container deployments, falls back to local .tmp/)
-DB_PATH = Path(os.getenv("DATABASE_PATH", ".tmp/due_diligence.db"))
+# Configuration
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://noesis:password@localhost:5432/noesis")
 CHROMA_DB_PATH = Path(os.getenv("CHROMA_DB_PATH", ".tmp/chroma_db"))
 DATA_ROOMS_PATH = Path(os.getenv("DATA_ROOMS_PATH", ".tmp/data_rooms"))
 LOGS_PATH = Path(os.getenv("LOGS_PATH", ".tmp/logs"))
@@ -19,7 +19,6 @@ LOGS_PATH = Path(os.getenv("LOGS_PATH", ".tmp/logs"))
 def init_directories():
     """Create necessary directories for the application."""
     directories = [
-        DB_PATH.parent,
         CHROMA_DB_PATH,
         DATA_ROOMS_PATH,
         LOGS_PATH
@@ -30,17 +29,40 @@ def init_directories():
         logger.info(f"Created directory: {directory}")
 
 
+def _column_exists(cursor, table_name: str, column_name: str) -> bool:
+    """Check if a column exists in a table using information_schema."""
+    cursor.execute("""
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = %s AND column_name = %s
+    """, (table_name, column_name))
+    return cursor.fetchone() is not None
+
+
 def init_database():
-    """Initialize SQLite database with complete schema."""
+    """Initialize PostgreSQL database with complete schema."""
 
-    # Ensure parent directory exists
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    # Connect to database
-    conn = sqlite3.connect(str(DB_PATH))
+    conn = psycopg2.connect(DATABASE_URL)
     cursor = conn.cursor()
 
-    logger.info(f"Initializing database at {DB_PATH}")
+    logger.info(f"Initializing PostgreSQL database")
+
+    # Create users table FIRST (referenced by other tables)
+    cursor.execute("""
+    CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        email TEXT UNIQUE NOT NULL,
+        name TEXT,
+        picture_url TEXT,
+        google_id TEXT UNIQUE,
+        access_token TEXT,
+        refresh_token TEXT,
+        token_expires_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login_at TIMESTAMP,
+        is_active BOOLEAN DEFAULT TRUE
+    )
+    """)
+    logger.info("Created table: users")
 
     # Create data_rooms table
     cursor.execute("""
@@ -51,11 +73,11 @@ def init_database():
         analyst_email TEXT,
         security_level TEXT CHECK(security_level IN ('local_only', 'cloud_enabled')) DEFAULT 'local_only',
         processing_status TEXT CHECK(processing_status IN ('uploading', 'parsing', 'indexing', 'extracting', 'complete', 'failed')) DEFAULT 'uploading',
-        progress_percent REAL DEFAULT 0,
+        progress_percent DOUBLE PRECISION DEFAULT 0,
         total_documents INTEGER DEFAULT 0,
         total_chunks INTEGER DEFAULT 0,
-        estimated_cost REAL,
-        actual_cost REAL DEFAULT 0,
+        estimated_cost DOUBLE PRECISION,
+        actual_cost DOUBLE PRECISION DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         completed_at TIMESTAMP,
         error_message TEXT,
@@ -65,10 +87,8 @@ def init_database():
     """)
     logger.info("Created table: data_rooms")
 
-    # Migration: Add error_message column if it doesn't exist (for existing databases)
-    cursor.execute("PRAGMA table_info(data_rooms)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if 'error_message' not in columns:
+    # Migration: Add error_message column if it doesn't exist
+    if not _column_exists(cursor, 'data_rooms', 'error_message'):
         cursor.execute("ALTER TABLE data_rooms ADD COLUMN error_message TEXT")
         logger.info("Added error_message column to data_rooms (migration)")
 
@@ -94,6 +114,11 @@ def init_database():
     )
     """)
     logger.info("Created table: documents")
+
+    # Migration: Add relative_path column for folder hierarchy of uploaded files
+    if not _column_exists(cursor, 'documents', 'relative_path'):
+        cursor.execute("ALTER TABLE documents ADD COLUMN relative_path TEXT")
+        logger.info("Added relative_path column to documents (migration)")
 
     # Create chunks table
     cursor.execute("""
@@ -126,12 +151,12 @@ def init_database():
         question TEXT NOT NULL,
         answer TEXT,
         sources TEXT,
-        confidence_score REAL,
+        confidence_score DOUBLE PRECISION,
         conversation_id TEXT,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         response_time_ms INTEGER,
         tokens_used INTEGER,
-        cost REAL,
+        cost DOUBLE PRECISION,
         FOREIGN KEY (data_room_id) REFERENCES data_rooms(id) ON DELETE CASCADE,
         FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL
     )
@@ -159,9 +184,9 @@ def init_database():
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         completed_at TIMESTAMP,
         tokens_used INTEGER,
-        cost REAL,
-        ticket_size REAL,
-        post_money_valuation REAL,
+        cost DOUBLE PRECISION,
+        ticket_size DOUBLE PRECISION,
+        post_money_valuation DOUBLE PRECISION,
         valuation_methods TEXT,
         analyst_feedback TEXT,
         metadata TEXT,
@@ -169,30 +194,6 @@ def init_database():
     )
     """)
     logger.info("Created table: memos")
-
-    # Migration: Update memos CHECK constraint to include 'cancelled' (for existing databases)
-    cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='memos'")
-    memos_sql_row = cursor.fetchone()
-    if memos_sql_row and "'cancelled'" not in (memos_sql_row[0] or ""):
-        conn.execute("PRAGMA writable_schema = ON")
-        cursor.execute("""
-            UPDATE sqlite_master
-            SET sql = REPLACE(sql,
-                '''generating'', ''complete'', ''partial'', ''failed''',
-                '''generating'', ''complete'', ''partial'', ''cancelled'', ''failed''')
-            WHERE type='table' AND name='memos'
-        """)
-        # Also try the variant without 'partial' for older DBs
-        cursor.execute("""
-            UPDATE sqlite_master
-            SET sql = REPLACE(sql,
-                '''generating'', ''complete'', ''failed''',
-                '''generating'', ''complete'', ''partial'', ''cancelled'', ''failed''')
-            WHERE type='table' AND name='memos'
-        """)
-        conn.execute("PRAGMA writable_schema = OFF")
-        conn.execute("PRAGMA integrity_check")
-        logger.info("Updated memos CHECK constraint to include 'cancelled' (migration)")
 
     # Create memo_chat_messages table for persisting memo chat history
     cursor.execute("""
@@ -205,7 +206,7 @@ def init_database():
         updated_section_key TEXT,
         updated_section_content TEXT,
         tokens_used INTEGER DEFAULT 0,
-        cost REAL DEFAULT 0,
+        cost DOUBLE PRECISION DEFAULT 0,
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
         FOREIGN KEY (memo_id) REFERENCES memos(id) ON DELETE CASCADE,
         FOREIGN KEY (data_room_id) REFERENCES data_rooms(id) ON DELETE CASCADE
@@ -254,29 +255,11 @@ def init_database():
         operation TEXT,
         input_tokens INTEGER,
         output_tokens INTEGER,
-        cost REAL,
+        cost DOUBLE PRECISION,
         timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
     """)
     logger.info("Created table: api_usage")
-
-    # Create users table for Google OAuth
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS users (
-        id TEXT PRIMARY KEY,
-        email TEXT UNIQUE NOT NULL,
-        name TEXT,
-        picture_url TEXT,
-        google_id TEXT UNIQUE,
-        access_token TEXT,
-        refresh_token TEXT,
-        token_expires_at TIMESTAMP,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        last_login_at TIMESTAMP,
-        is_active INTEGER DEFAULT 1
-    )
-    """)
-    logger.info("Created table: users")
 
     # Create connected_folders table for Google Drive sync
     cursor.execute("""
@@ -305,19 +288,17 @@ def init_database():
     """)
     logger.info("Created table: connected_folders")
 
-    # Migration: Add sync_stage columns if they don't exist (for existing databases)
-    cursor.execute("PRAGMA table_info(connected_folders)")
-    columns = [col[1] for col in cursor.fetchall()]
-    if 'sync_stage' not in columns:
+    # Migration: Add sync_stage columns if they don't exist
+    if not _column_exists(cursor, 'connected_folders', 'sync_stage'):
         cursor.execute("ALTER TABLE connected_folders ADD COLUMN sync_stage TEXT DEFAULT 'idle'")
         logger.info("Added sync_stage column to connected_folders (migration)")
-    if 'discovered_files' not in columns:
+    if not _column_exists(cursor, 'connected_folders', 'discovered_files'):
         cursor.execute("ALTER TABLE connected_folders ADD COLUMN discovered_files INTEGER DEFAULT 0")
         logger.info("Added discovered_files column to connected_folders (migration)")
-    if 'discovered_folders' not in columns:
+    if not _column_exists(cursor, 'connected_folders', 'discovered_folders'):
         cursor.execute("ALTER TABLE connected_folders ADD COLUMN discovered_folders INTEGER DEFAULT 0")
         logger.info("Added discovered_folders column to connected_folders (migration)")
-    if 'current_folder_path' not in columns:
+    if not _column_exists(cursor, 'connected_folders', 'current_folder_path'):
         cursor.execute("ALTER TABLE connected_folders ADD COLUMN current_folder_path TEXT")
         logger.info("Added current_folder_path column to connected_folders (migration)")
 
@@ -429,7 +410,7 @@ def init_database():
         risk_assessment TEXT,
         investment_thesis_notes TEXT,
         executive_summary TEXT,
-        analysis_cost REAL DEFAULT 0,
+        analysis_cost DOUBLE PRECISION DEFAULT 0,
         tokens_used INTEGER DEFAULT 0,
         processing_time_ms INTEGER DEFAULT 0,
         error_message TEXT,
@@ -449,7 +430,7 @@ def init_database():
         data_room_id TEXT NOT NULL,
         metric_name TEXT NOT NULL,
         category TEXT,
-        metric_value REAL,
+        metric_value DOUBLE PRECISION,
         metric_unit TEXT,
         period TEXT,
         cell_reference TEXT,
@@ -498,7 +479,7 @@ def init_database():
     conn.commit()
     conn.close()
 
-    logger.success(f"Database initialized successfully at {DB_PATH}")
+    logger.success("PostgreSQL database initialized successfully")
 
 
 def init_chromadb():
@@ -548,7 +529,8 @@ def verify_installation():
         'uvicorn',
         'sqlalchemy',
         'pydantic',
-        'loguru'
+        'loguru',
+        'psycopg2'
     ]
 
     missing_packages = []
@@ -585,15 +567,10 @@ def main():
     verify_installation()
 
     logger.success("System initialization complete!")
-    logger.info(f"Database location: {DB_PATH.absolute()}")
+    logger.info(f"Database: PostgreSQL ({DATABASE_URL.split('@')[-1] if '@' in DATABASE_URL else DATABASE_URL})")
     logger.info(f"ChromaDB location: {CHROMA_DB_PATH.absolute()}")
     logger.info(f"Data rooms storage: {DATA_ROOMS_PATH.absolute()}")
     logger.info(f"Logs location: {LOGS_PATH.absolute()}")
-    logger.info("\nNext steps:")
-    logger.info("1. Copy .env.example to .env and add your API keys")
-    logger.info("2. Install dependencies: pip install -r requirements.txt")
-    logger.info("3. Run tests: pytest tests/")
-    logger.info("4. Start building tools (parse_pdf.py, etc.)")
 
 
 if __name__ == "__main__":

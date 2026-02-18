@@ -1,20 +1,20 @@
 """
 Database utilities for VC Due Diligence system.
-Provides functions for querying and updating SQLite database.
+Provides functions for querying and updating PostgreSQL database.
 
 Includes:
-- Connection pooling for high-throughput operations
+- Connection pooling via psycopg2
 - Batch insert optimization
-- Performance-tuned PRAGMA settings
 """
 
-import sqlite3
+import psycopg2
+import psycopg2.pool
+import psycopg2.extras
 import json
 import uuid
 import threading
 import time
 from pathlib import Path
-from queue import Queue, Empty
 from typing import Optional, List, Dict, Any
 from datetime import datetime
 from contextlib import contextmanager
@@ -29,145 +29,67 @@ from app.config import settings
 
 class ConnectionPool:
     """
-    Thread-safe SQLite connection pool for high-throughput operations.
+    Thread-safe PostgreSQL connection pool using psycopg2.
 
     Features:
     - Reusable connections to reduce connection overhead
-    - Automatic connection health checking
     - Configurable pool size
     - Thread-safe connection management
     """
 
     def __init__(
         self,
-        db_path: str,
+        database_url: str,
         pool_size: int = 10,
         timeout: float = 30.0
     ):
-        """
-        Initialize connection pool.
-
-        Args:
-            db_path: Path to SQLite database
-            pool_size: Number of connections in pool
-            timeout: Connection timeout in seconds
-        """
-        self.db_path = db_path
+        self.database_url = database_url
         self.pool_size = pool_size
         self.timeout = timeout
-        self._pool: Queue = Queue(maxsize=pool_size)
+        self._pool: Optional[psycopg2.pool.ThreadedConnectionPool] = None
         self._lock = threading.Lock()
-        self._created = 0
         self._initialized = False
-
-    def _create_connection(self) -> sqlite3.Connection:
-        """Create a new database connection with optimized settings."""
-        conn = sqlite3.connect(
-            self.db_path,
-            timeout=self.timeout,
-            check_same_thread=False
-        )
-        conn.row_factory = sqlite3.Row
-
-        # Performance optimizations
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=30000")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.execute("PRAGMA mmap_size=268435456")  # 256MB memory-mapped I/O
-
-        return conn
 
     def _initialize_pool(self) -> None:
         """Initialize the connection pool."""
         with self._lock:
             if self._initialized:
                 return
-
-            for _ in range(self.pool_size):
-                try:
-                    conn = self._create_connection()
-                    self._pool.put(conn)
-                    self._created += 1
-                except Exception as e:
-                    logger.error(f"Failed to create pool connection: {e}")
-
+            self._pool = psycopg2.pool.ThreadedConnectionPool(
+                minconn=2,
+                maxconn=self.pool_size,
+                dsn=self.database_url
+            )
             self._initialized = True
-            logger.info(f"Connection pool initialized with {self._created} connections")
-
-    def _check_connection(self, conn: sqlite3.Connection) -> bool:
-        """Check if connection is healthy."""
-        try:
-            conn.execute("SELECT 1")
-            return True
-        except Exception:
-            return False
+            logger.info(f"PostgreSQL connection pool initialized (max={self.pool_size})")
 
     @contextmanager
     def get_connection(self):
-        """
-        Get a connection from the pool.
-
-        Yields:
-            sqlite3.Connection: A database connection
-
-        The connection is automatically returned to the pool after use.
-        """
+        """Get a connection from the pool."""
         if not self._initialized:
             self._initialize_pool()
 
-        conn = None
+        conn = self._pool.getconn()
+        conn.cursor_factory = psycopg2.extras.RealDictCursor
         try:
-            conn = self._pool.get(timeout=self.timeout)
-
-            # Verify connection is healthy
-            if not self._check_connection(conn):
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                conn = self._create_connection()
-
             yield conn
-
-        except Empty:
-            # Pool exhausted, create temporary connection
-            logger.warning("Connection pool exhausted, creating temporary connection")
-            conn = self._create_connection()
-            yield conn
-            conn.close()
-            conn = None
-
+        except Exception:
+            conn.rollback()
+            raise
         finally:
-            if conn is not None:
-                try:
-                    # Rollback any uncommitted transactions
-                    conn.rollback()
-                    self._pool.put(conn)
-                except Exception as e:
-                    logger.warning(f"Error returning connection to pool: {e}")
+            self._pool.putconn(conn)
 
     def close_all(self) -> None:
         """Close all connections in the pool."""
-        with self._lock:
-            while not self._pool.empty():
-                try:
-                    conn = self._pool.get_nowait()
-                    conn.close()
-                except Exception:
-                    pass
+        if self._pool:
+            self._pool.closeall()
             self._initialized = False
-            self._created = 0
             logger.info("Connection pool closed")
 
     def get_stats(self) -> Dict[str, Any]:
         """Get pool statistics."""
         return {
             "pool_size": self.pool_size,
-            "created": self._created,
-            "available": self._pool.qsize(),
-            "in_use": self._created - self._pool.qsize(),
             "initialized": self._initialized
         }
 
@@ -181,7 +103,7 @@ def get_db_pool() -> ConnectionPool:
     global _db_pool
     if _db_pool is None:
         _db_pool = ConnectionPool(
-            db_path=settings.database_path,
+            database_url=settings.database_url,
             pool_size=settings.db_pool_size,
             timeout=30.0
         )
@@ -192,10 +114,7 @@ def get_db_pool() -> ConnectionPool:
 def get_db_connection():
     """
     Context manager for database connections.
-    Ensures connections are properly closed after use.
-    Uses WAL mode for better concurrent access.
-
-    For high-throughput operations, uses the connection pool.
+    Uses the connection pool for efficient connection reuse.
     """
     pool = get_db_pool()
     with pool.get_connection() as conn:
@@ -208,19 +127,15 @@ def get_db_connection_simple():
     Simple context manager for database connections (non-pooled).
     Use for one-off operations or when pool is not needed.
     """
-    conn = sqlite3.connect(settings.database_path, timeout=30.0)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    conn = psycopg2.connect(settings.database_url, cursor_factory=psycopg2.extras.RealDictCursor)
     try:
         yield conn
     finally:
         conn.close()
 
 
-def dict_from_row(row: sqlite3.Row) -> Dict[str, Any]:
-    """Convert sqlite3.Row to dictionary."""
+def dict_from_row(row) -> Optional[Dict[str, Any]]:
+    """Convert database row to dictionary."""
     return dict(row) if row else None
 
 
@@ -270,15 +185,15 @@ def run_migrations():
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_connected_files_drive_id ON connected_files(drive_file_id)")
 
             # Migration: Add user_id column to data_rooms for ownership
-            cursor.execute("PRAGMA table_info(data_rooms)")
-            dr_columns = [col[1] for col in cursor.fetchall()]
+            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'data_rooms'")
+            dr_columns = [col['column_name'] for col in cursor.fetchall()]
             if 'user_id' not in dr_columns:
                 cursor.execute("ALTER TABLE data_rooms ADD COLUMN user_id TEXT REFERENCES users(id)")
                 logger.info("Added user_id column to data_rooms table")
 
             # Migration: Add user_id column to queries for per-user filtering
-            cursor.execute("PRAGMA table_info(queries)")
-            q_columns = [col[1] for col in cursor.fetchall()]
+            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'queries'")
+            q_columns = [col['column_name'] for col in cursor.fetchall()]
             if 'user_id' not in q_columns:
                 cursor.execute("ALTER TABLE queries ADD COLUMN user_id TEXT REFERENCES users(id)")
                 logger.info("Added user_id column to queries table")
@@ -327,8 +242,8 @@ def run_migrations():
             cursor.execute("CREATE INDEX IF NOT EXISTS idx_mcm_data_room ON memo_chat_messages(data_room_id)")
 
             # Migration: Add missing memo columns for existing databases
-            cursor.execute("PRAGMA table_info(memos)")
-            memo_columns = {col[1] for col in cursor.fetchall()}
+            cursor.execute("SELECT column_name FROM information_schema.columns WHERE table_name = 'memos'")
+            memo_columns = {col['column_name'] for col in cursor.fetchall()}
             memo_additions = {
                 'proposed_investment_terms': 'TEXT',
                 'valuation_analysis': 'TEXT',
@@ -343,25 +258,25 @@ def run_migrations():
 
             # Migration: Deduplicate documents and add UNIQUE(data_room_id, file_name)
             # Check if the unique index already exists
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_documents_unique_file'")
+            cursor.execute("SELECT indexname FROM pg_indexes WHERE indexname = 'idx_documents_unique_file'")
             if not cursor.fetchone():
                 # Deduplicate: keep the record with best parse_status for each (data_room_id, file_name)
                 cursor.execute("""
                     SELECT data_room_id, file_name, COUNT(*) as cnt
                     FROM documents
                     GROUP BY data_room_id, file_name
-                    HAVING cnt > 1
+                    HAVING COUNT(*) > 1
                 """)
                 dup_groups = cursor.fetchall()
                 if dup_groups:
                     total_removed = 0
                     for dup in dup_groups:
-                        dr_id = dup[0]
-                        fname = dup[1]
+                        dr_id = dup['data_room_id']
+                        fname = dup['file_name']
                         # Keep the one with best status; among ties, keep latest
                         cursor.execute("""
                             SELECT id FROM documents
-                            WHERE data_room_id = ? AND file_name = ?
+                            WHERE data_room_id = %s AND file_name = %s
                             ORDER BY
                                 CASE parse_status
                                     WHEN 'parsed' THEN 1
@@ -374,9 +289,9 @@ def run_migrations():
                         """, (dr_id, fname))
                         keep_row = cursor.fetchone()
                         if keep_row:
-                            keep_id = keep_row[0]
+                            keep_id = keep_row['id']
                             cursor.execute(
-                                "DELETE FROM documents WHERE data_room_id = ? AND file_name = ? AND id != ?",
+                                "DELETE FROM documents WHERE data_room_id = %s AND file_name = %s AND id != %s",
                                 (dr_id, fname, keep_id)
                             )
                             total_removed += cursor.rowcount
@@ -459,7 +374,7 @@ def create_data_room(
             INSERT INTO data_rooms (
                 id, company_name, analyst_name, analyst_email,
                 security_level, total_documents, processing_status, user_id
-            ) VALUES (?, ?, ?, ?, ?, ?, 'uploading', ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'uploading', %s)
         """, (data_room_id, company_name, analyst_name, analyst_email,
               security_level, total_documents, user_id))
         conn.commit()
@@ -487,7 +402,7 @@ def get_data_room(data_room_id: str) -> Optional[Dict[str, Any]]:
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM data_rooms WHERE id = ?", (data_room_id,))
+        cursor.execute("SELECT * FROM data_rooms WHERE id = %s", (data_room_id,))
         row = cursor.fetchone()
         return dict_from_row(row)
 
@@ -520,36 +435,36 @@ def update_data_room_status(
         cursor = conn.cursor()
 
         # Build dynamic query based on provided parameters
-        fields = ["processing_status = ?"]
+        fields = ["processing_status = %s"]
         values = [status]
 
         if progress is not None:
             # Enforce monotonic progress — never decrease (except reset to 0 for reprocessing)
             if progress == 0:
-                fields.append("progress_percent = ?")
+                fields.append("progress_percent = %s")
             else:
-                fields.append("progress_percent = MAX(COALESCE(progress_percent, 0), ?)")
+                fields.append("progress_percent = GREATEST(COALESCE(progress_percent, 0), %s)")
             values.append(progress)
 
         if completed_at is not None:
-            fields.append("completed_at = ?")
+            fields.append("completed_at = %s")
             values.append(completed_at)
 
         if error_message is not None:
-            fields.append("error_message = ?")
+            fields.append("error_message = %s")
             values.append(error_message)
 
         if total_chunks is not None:
-            fields.append("total_chunks = ?")
+            fields.append("total_chunks = %s")
             values.append(total_chunks)
 
         if total_documents is not None:
-            fields.append("total_documents = ?")
+            fields.append("total_documents = %s")
             values.append(total_documents)
 
         values.append(data_room_id)
 
-        query = f"UPDATE data_rooms SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE data_rooms SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
         return cursor.rowcount > 0
@@ -569,14 +484,14 @@ def delete_data_room(data_room_id: str) -> bool:
         cursor = conn.cursor()
 
         # Delete in order of dependencies (child tables first)
-        cursor.execute("DELETE FROM chunks WHERE data_room_id = ?", (data_room_id,))
-        cursor.execute("DELETE FROM queries WHERE data_room_id = ?", (data_room_id,))
-        cursor.execute("DELETE FROM documents WHERE data_room_id = ?", (data_room_id,))
-        cursor.execute("DELETE FROM processing_logs WHERE data_room_id = ?", (data_room_id,))
-        cursor.execute("DELETE FROM analysis_cache WHERE data_room_id = ?", (data_room_id,))
-        cursor.execute("DELETE FROM api_usage WHERE data_room_id = ?", (data_room_id,))
-        cursor.execute("DELETE FROM job_queue WHERE data_room_id = ?", (data_room_id,))
-        cursor.execute("DELETE FROM data_rooms WHERE id = ?", (data_room_id,))
+        cursor.execute("DELETE FROM chunks WHERE data_room_id = %s", (data_room_id,))
+        cursor.execute("DELETE FROM queries WHERE data_room_id = %s", (data_room_id,))
+        cursor.execute("DELETE FROM documents WHERE data_room_id = %s", (data_room_id,))
+        cursor.execute("DELETE FROM processing_logs WHERE data_room_id = %s", (data_room_id,))
+        cursor.execute("DELETE FROM analysis_cache WHERE data_room_id = %s", (data_room_id,))
+        cursor.execute("DELETE FROM api_usage WHERE data_room_id = %s", (data_room_id,))
+        cursor.execute("DELETE FROM job_queue WHERE data_room_id = %s", (data_room_id,))
+        cursor.execute("DELETE FROM data_rooms WHERE id = %s", (data_room_id,))
 
         conn.commit()
         logger.info(f"Deleted data room: {data_room_id}")
@@ -598,8 +513,8 @@ def update_data_room_cost(data_room_id: str, cost: float) -> bool:
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE data_rooms
-            SET actual_cost = COALESCE(actual_cost, 0) + ?
-            WHERE id = ?
+            SET actual_cost = COALESCE(actual_cost, 0) + %s
+            WHERE id = %s
         """, (cost, data_room_id))
         conn.commit()
         return cursor.rowcount > 0
@@ -621,7 +536,7 @@ def list_data_rooms(limit: int = 50) -> List[Dict[str, Any]]:
             SELECT *
             FROM data_rooms
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (limit,))
         return [dict_from_row(row) for row in cursor.fetchall()]
 
@@ -657,7 +572,7 @@ def add_data_room_member(
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM users WHERE email = ?", (invited_email,))
+        cursor.execute("SELECT id FROM users WHERE email = %s", (invited_email,))
         user_row = cursor.fetchone()
         if user_row:
             existing_user_id = user_row[0] if isinstance(user_row, tuple) else user_row['id']
@@ -667,7 +582,7 @@ def add_data_room_member(
         cursor.execute("""
             INSERT INTO data_room_members (
                 id, data_room_id, user_id, invited_email, role, status, invited_by, accepted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (member_id, data_room_id, existing_user_id, invited_email, role, status, invited_by, accepted_at))
         conn.commit()
 
@@ -691,8 +606,8 @@ def accept_data_room_invite(data_room_id: str, user_id: str, user_email: str) ->
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE data_room_members
-            SET user_id = ?, status = 'accepted', accepted_at = ?
-            WHERE data_room_id = ? AND invited_email = ? AND status = 'pending'
+            SET user_id = %s, status = 'accepted', accepted_at = %s
+            WHERE data_room_id = %s AND invited_email = %s AND status = 'pending'
         """, (user_id, datetime.now().isoformat(), data_room_id, user_email))
         conn.commit()
         return cursor.rowcount > 0
@@ -713,7 +628,7 @@ def revoke_data_room_member(data_room_id: str, member_id: str) -> bool:
         cursor = conn.cursor()
         cursor.execute("""
             DELETE FROM data_room_members
-            WHERE id = ? AND data_room_id = ? AND role != 'owner'
+            WHERE id = %s AND data_room_id = %s AND role != 'owner'
         """, (member_id, data_room_id))
         conn.commit()
         return cursor.rowcount > 0
@@ -735,7 +650,7 @@ def get_data_room_members(data_room_id: str) -> List[Dict[str, Any]]:
             SELECT drm.*, u.name, u.picture_url
             FROM data_room_members drm
             LEFT JOIN users u ON drm.user_id = u.id
-            WHERE drm.data_room_id = ? AND drm.status != 'revoked'
+            WHERE drm.data_room_id = %s AND drm.status != 'revoked'
             ORDER BY drm.role ASC, drm.created_at ASC
         """, (data_room_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -759,19 +674,19 @@ def get_user_data_rooms(user_id: str, user_email: str, limit: int = 50) -> List[
             SELECT dr.*,
                 CASE
                     WHEN dr.user_id IS NULL THEN 'legacy'
-                    WHEN dr.user_id = ? THEN 'owner'
+                    WHEN dr.user_id = %s THEN 'owner'
                     ELSE 'member'
                 END as user_role
             FROM data_rooms dr
             LEFT JOIN data_room_members drm ON dr.id = drm.data_room_id
-                AND (drm.user_id = ? OR drm.invited_email = ?)
+                AND (drm.user_id = %s OR drm.invited_email = %s)
                 AND drm.status = 'accepted'
             WHERE dr.user_id IS NULL
-                OR dr.user_id = ?
+                OR dr.user_id = %s
                 OR drm.id IS NOT NULL
             GROUP BY dr.id
             ORDER BY dr.created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (user_id, user_id, user_email, user_id, limit))
         return [dict_from_row(row) for row in cursor.fetchall()]
 
@@ -799,7 +714,7 @@ def check_data_room_access(
         cursor = conn.cursor()
 
         # Check if data room exists
-        cursor.execute("SELECT user_id FROM data_rooms WHERE id = ?", (data_room_id,))
+        cursor.execute("SELECT user_id FROM data_rooms WHERE id = %s", (data_room_id,))
         room = cursor.fetchone()
         if not room:
             return None
@@ -819,16 +734,16 @@ def check_data_room_access(
             conditions = []
             params = [data_room_id]
             if user_id:
-                conditions.append("user_id = ?")
+                conditions.append("user_id = %s")
                 params.append(user_id)
             if user_email:
-                conditions.append("invited_email = ?")
+                conditions.append("invited_email = %s")
                 params.append(user_email)
 
             where_clause = " OR ".join(conditions)
             cursor.execute(f"""
                 SELECT role FROM data_room_members
-                WHERE data_room_id = ? AND ({where_clause}) AND status = 'accepted'
+                WHERE data_room_id = %s AND ({where_clause}) AND status = 'accepted'
                 LIMIT 1
             """, params)
             member = cursor.fetchone()
@@ -853,8 +768,8 @@ def auto_accept_pending_invites(user_id: str, user_email: str) -> int:
         cursor = conn.cursor()
         cursor.execute("""
             UPDATE data_room_members
-            SET user_id = ?, status = 'accepted', accepted_at = ?
-            WHERE invited_email = ? AND status = 'pending'
+            SET user_id = %s, status = 'accepted', accepted_at = %s
+            WHERE invited_email = %s AND status = 'pending'
         """, (user_id, datetime.now().isoformat(), user_email))
         conn.commit()
         count = cursor.rowcount
@@ -873,7 +788,8 @@ def create_document(
     file_path: str,
     file_size: int,
     file_type: Optional[str] = None,
-    document_id: Optional[str] = None
+    document_id: Optional[str] = None,
+    relative_path: Optional[str] = None
 ) -> str:
     """
     Create a new document record.
@@ -885,6 +801,7 @@ def create_document(
         file_size: File size in bytes
         file_type: File type (pdf, xlsx, etc.)
         document_id: Optional custom ID
+        relative_path: Optional folder-relative path for display in document tree
 
     Returns:
         Document ID
@@ -895,18 +812,19 @@ def create_document(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR IGNORE INTO documents (
+            INSERT INTO documents (
                 id, data_room_id, file_name, file_path,
-                file_size, file_type, parse_status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                file_size, file_type, parse_status, relative_path
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'pending', %s)
+            ON CONFLICT (data_room_id, file_name) DO NOTHING
         """, (document_id, data_room_id, file_name, file_path,
-              file_size, file_type))
+              file_size, file_type, relative_path))
         conn.commit()
 
         # If insert was ignored (duplicate), return the existing ID
         if cursor.rowcount == 0:
             cursor.execute(
-                "SELECT id FROM documents WHERE data_room_id = ? AND file_name = ?",
+                "SELECT id FROM documents WHERE data_room_id = %s AND file_name = %s",
                 (data_room_id, file_name)
             )
             row = cursor.fetchone()
@@ -931,7 +849,7 @@ def get_document_by_name(data_room_id: str, file_name: str) -> Optional[Dict[str
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT * FROM documents WHERE data_room_id = ? AND file_name = ?",
+            "SELECT * FROM documents WHERE data_room_id = %s AND file_name = %s",
             (data_room_id, file_name)
         )
         row = cursor.fetchone()
@@ -961,24 +879,24 @@ def update_document_status(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        fields = ["parse_status = ?", "parsed_at = CURRENT_TIMESTAMP"]
+        fields = ["parse_status = %s", "parsed_at = CURRENT_TIMESTAMP"]
         values = [status]
 
         if page_count is not None:
-            fields.append("page_count = ?")
+            fields.append("page_count = %s")
             values.append(page_count)
 
         if token_count is not None:
-            fields.append("token_count = ?")
+            fields.append("token_count = %s")
             values.append(token_count)
 
         if error_message is not None:
-            fields.append("error_message = ?")
+            fields.append("error_message = %s")
             values.append(error_message)
 
         values.append(document_id)
 
-        query = f"UPDATE documents SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE documents SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
 
@@ -999,7 +917,7 @@ def get_documents_by_data_room(data_room_id: str) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM documents
-            WHERE data_room_id = ?
+            WHERE data_room_id = %s
             ORDER BY uploaded_at DESC
         """, (data_room_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -1044,7 +962,7 @@ def find_document_by_filename(
 
         # Tier 1: exact match
         cursor.execute(
-            "SELECT id FROM documents WHERE data_room_id = ? AND file_name = ?",
+            "SELECT id FROM documents WHERE data_room_id = %s AND file_name = %s",
             (data_room_id, target_filename)
         )
         row = cursor.fetchone()
@@ -1053,7 +971,7 @@ def find_document_by_filename(
 
         # Tier 2: case-insensitive match
         cursor.execute(
-            "SELECT id, file_name FROM documents WHERE data_room_id = ? AND LOWER(file_name) = ?",
+            "SELECT id, file_name FROM documents WHERE data_room_id = %s AND LOWER(file_name) = %s",
             (data_room_id, target_lower)
         )
         row = cursor.fetchone()
@@ -1067,7 +985,7 @@ def find_document_by_filename(
 
         # Tier 3: stem match (fetch all for this data room since no SQL stem function)
         cursor.execute(
-            "SELECT id, file_name FROM documents WHERE data_room_id = ?",
+            "SELECT id, file_name FROM documents WHERE data_room_id = %s",
             (data_room_id,)
         )
         for doc_row in cursor.fetchall():
@@ -1079,23 +997,24 @@ def find_document_by_filename(
                 )
                 return doc_id
 
-        # Tier 4: atomic find-or-create using INSERT OR IGNORE
+        # Tier 4: atomic find-or-create using INSERT ON CONFLICT
         if create_if_missing and file_path:
             file_type = _Path(target_filename).suffix.lower().lstrip('.')
             new_id = f"doc_{uuid.uuid4().hex[:12]}"
 
             cursor.execute("""
-                INSERT OR IGNORE INTO documents (
+                INSERT INTO documents (
                     id, data_room_id, file_name, file_path,
                     file_size, file_type, parse_status
-                ) VALUES (?, ?, ?, ?, ?, ?, 'pending')
+                ) VALUES (%s, %s, %s, %s, %s, %s, 'pending')
+                ON CONFLICT (data_room_id, file_name) DO NOTHING
             """, (new_id, data_room_id, target_filename, file_path,
                   file_size, file_type))
             conn.commit()
 
             # SELECT to get the actual ID (ours or the concurrent winner's)
             cursor.execute(
-                "SELECT id FROM documents WHERE data_room_id = ? AND file_name = ?",
+                "SELECT id FROM documents WHERE data_room_id = %s AND file_name = %s",
                 (data_room_id, target_filename)
             )
             row = cursor.fetchone()
@@ -1141,11 +1060,11 @@ def get_documents_with_paths(data_room_id: str) -> List[Dict[str, Any]]:
                 d.parse_status,
                 d.uploaded_at,
                 d.parsed_at,
-                sf.file_path
+                COALESCE(sf.file_path, d.relative_path) as file_path
             FROM documents d
             LEFT JOIN synced_files sf ON sf.document_id = d.id
-            WHERE d.data_room_id = ?
-            ORDER BY sf.file_path ASC NULLS LAST, d.file_name ASC
+            WHERE d.data_room_id = %s
+            ORDER BY COALESCE(sf.file_path, d.relative_path) ASC NULLS LAST, d.file_name ASC
         """, (data_room_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
 
@@ -1180,13 +1099,14 @@ def create_chunks(chunks: List[Dict[str, Any]]) -> int:
         cursor = conn.cursor()
 
         # Prepare all values for batch insert (much faster than individual inserts)
+        # Strip NUL bytes from text — PostgreSQL TEXT columns reject \x00
         values = [
             (
                 f"chunk_{uuid.uuid4().hex[:12]}",
                 chunk['document_id'],
                 chunk['data_room_id'],
                 chunk['chunk_index'],
-                chunk['chunk_text'],
+                chunk['chunk_text'].replace('\x00', ''),
                 chunk.get('token_count'),
                 chunk.get('page_number'),
                 chunk.get('section_title'),
@@ -1201,7 +1121,7 @@ def create_chunks(chunks: List[Dict[str, Any]]) -> int:
                 id, document_id, data_room_id, chunk_index,
                 chunk_text, token_count, page_number,
                 section_title, chunk_type, embedding_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, values)
 
         conn.commit()
@@ -1216,7 +1136,6 @@ def create_chunks_batch_optimized(
     Create chunks in optimized batches with transaction batching.
 
     This function is optimized for high-throughput bulk inserts:
-    - Uses BEGIN IMMEDIATE for better concurrency
     - Processes in configurable batch sizes
     - Uses executemany for 10-50x faster inserts
 
@@ -1240,13 +1159,14 @@ def create_chunks_batch_optimized(
         for i in range(0, len(chunks), batch_size):
             batch = chunks[i:i + batch_size]
 
+            # Strip NUL bytes from text — PostgreSQL TEXT columns reject \x00
             values = [
                 (
                     f"chunk_{uuid.uuid4().hex[:12]}",
                     chunk['document_id'],
                     chunk['data_room_id'],
                     chunk['chunk_index'],
-                    chunk['chunk_text'],
+                    chunk['chunk_text'].replace('\x00', ''),
                     chunk.get('token_count'),
                     chunk.get('page_number'),
                     chunk.get('section_title'),
@@ -1257,15 +1177,12 @@ def create_chunks_batch_optimized(
             ]
 
             try:
-                # Use BEGIN IMMEDIATE for better write concurrency
-                cursor.execute("BEGIN IMMEDIATE")
-
                 cursor.executemany("""
                     INSERT INTO chunks (
                         id, document_id, data_room_id, chunk_index,
                         chunk_text, token_count, page_number,
                         section_title, chunk_type, embedding_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                 """, values)
 
                 conn.commit()
@@ -1328,7 +1245,7 @@ def get_chunks_without_embeddings(data_room_id: str) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM chunks
-            WHERE data_room_id = ? AND embedding_id IS NULL
+            WHERE data_room_id = %s AND embedding_id IS NULL
             ORDER BY chunk_index ASC
         """, (data_room_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -1348,7 +1265,7 @@ def update_chunk_embedding_id(chunk_id: str, embedding_id: str) -> bool:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE chunks SET embedding_id = ? WHERE id = ?",
+            "UPDATE chunks SET embedding_id = %s WHERE id = %s",
             (embedding_id, chunk_id)
         )
         conn.commit()
@@ -1375,16 +1292,64 @@ def get_chunks_by_data_room(
         if limit:
             cursor.execute("""
                 SELECT * FROM chunks
-                WHERE data_room_id = ?
+                WHERE data_room_id = %s
                 ORDER BY created_at DESC
-                LIMIT ?
+                LIMIT %s
             """, (data_room_id, limit))
         else:
             cursor.execute("""
                 SELECT * FROM chunks
-                WHERE data_room_id = ?
+                WHERE data_room_id = %s
                 ORDER BY created_at DESC
             """, (data_room_id,))
+
+        return [dict_from_row(row) for row in cursor.fetchall()]
+
+
+def search_chunks_by_keywords(
+    data_room_id: str,
+    keywords: List[str],
+    limit: int = 15
+) -> List[Dict[str, Any]]:
+    """
+    Search chunks by keyword matching (ILIKE) on chunk_text.
+    Joins with documents table to include file_name and document_category.
+
+    Args:
+        data_room_id: Data room ID
+        keywords: List of keywords to search for (OR logic)
+        limit: Maximum results to return
+
+    Returns:
+        List of chunk records with document metadata
+    """
+    if not keywords:
+        return []
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+
+        # Build OR conditions for each keyword
+        conditions = []
+        params: list = [data_room_id]
+        for kw in keywords:
+            conditions.append("c.chunk_text ILIKE %s")
+            params.append(f"%{kw}%")
+
+        where_clause = " OR ".join(conditions)
+        params.append(limit)
+
+        cursor.execute(f"""
+            SELECT c.id, c.document_id, c.data_room_id, c.chunk_index,
+                   c.chunk_text, c.token_count, c.page_number, c.section_title,
+                   c.chunk_type, c.embedding_id, c.metadata,
+                   d.file_name, d.document_category
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.data_room_id = %s AND ({where_clause})
+            ORDER BY c.chunk_index ASC
+            LIMIT %s
+        """, params)
 
         return [dict_from_row(row) for row in cursor.fetchall()]
 
@@ -1434,7 +1399,7 @@ def save_query(
                 id, data_room_id, question, answer, sources,
                 confidence_score, analyst_email, conversation_id,
                 response_time_ms, tokens_used, cost, user_id
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             query_id, data_room_id, question, answer,
             json.dumps(sources), confidence_score, analyst_email,
@@ -1470,15 +1435,15 @@ def get_query_history(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        conditions = ["data_room_id = ?"]
+        conditions = ["data_room_id = %s"]
         params: list = [data_room_id]
 
         if conversation_id:
-            conditions.append("conversation_id = ?")
+            conditions.append("conversation_id = %s")
             params.append(conversation_id)
 
         if filter_user_id:
-            conditions.append("user_id = ?")
+            conditions.append("user_id = %s")
             params.append(filter_user_id)
 
         where_clause = " AND ".join(conditions)
@@ -1491,7 +1456,7 @@ def get_query_history(
             LEFT JOIN users u ON q.user_id = u.id
             WHERE {where_clause}
             ORDER BY q.created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, params)
 
         queries = []
@@ -1510,7 +1475,7 @@ def delete_question(question_id: str, user_id: str) -> bool:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "DELETE FROM queries WHERE id = ? AND user_id = ?",
+            "DELETE FROM queries WHERE id = %s AND user_id = %s",
             (question_id, user_id)
         )
         conn.commit()
@@ -1553,7 +1518,7 @@ def log_processing_stage(
             INSERT INTO processing_logs (
                 id, data_room_id, document_id, stage, status,
                 message, error_details, duration_ms
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             log_id, data_room_id, document_id, stage, status,
             message, error_details, duration_ms
@@ -1583,15 +1548,15 @@ def get_processing_logs(
         if data_room_id:
             cursor.execute("""
                 SELECT * FROM processing_logs
-                WHERE data_room_id = ?
+                WHERE data_room_id = %s
                 ORDER BY timestamp DESC
-                LIMIT ?
+                LIMIT %s
             """, (data_room_id, limit))
         else:
             cursor.execute("""
                 SELECT * FROM processing_logs
                 ORDER BY timestamp DESC
-                LIMIT ?
+                LIMIT %s
             """, (limit,))
 
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -1633,7 +1598,7 @@ def track_api_usage(
             INSERT INTO api_usage (
                 id, data_room_id, provider, model, operation,
                 input_tokens, output_tokens, cost
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             usage_id, data_room_id, provider, model, operation,
             input_tokens, output_tokens, cost
@@ -1673,8 +1638,8 @@ def get_api_costs(
                     SUM(output_tokens) as total_output_tokens,
                     COUNT(*) as total_calls
                 FROM api_usage
-                WHERE data_room_id = ?
-                AND timestamp >= datetime('now', '-' || ? || ' days')
+                WHERE data_room_id = %s
+                AND timestamp >= CURRENT_TIMESTAMP - (%s * interval '1 day')
             """, (data_room_id, days))
         else:
             cursor.execute("""
@@ -1684,7 +1649,7 @@ def get_api_costs(
                     SUM(output_tokens) as total_output_tokens,
                     COUNT(*) as total_calls
                 FROM api_usage
-                WHERE timestamp >= datetime('now', '-' || ? || ' days')
+                WHERE timestamp >= CURRENT_TIMESTAMP - (%s * interval '1 day')
             """, (days,))
 
         summary = dict_from_row(cursor.fetchone())
@@ -1694,15 +1659,15 @@ def get_api_costs(
             cursor.execute("""
                 SELECT provider, SUM(cost) as cost, COUNT(*) as calls
                 FROM api_usage
-                WHERE data_room_id = ?
-                AND timestamp >= datetime('now', '-' || ? || ' days')
+                WHERE data_room_id = %s
+                AND timestamp >= CURRENT_TIMESTAMP - (%s * interval '1 day')
                 GROUP BY provider
             """, (data_room_id, days))
         else:
             cursor.execute("""
                 SELECT provider, SUM(cost) as cost, COUNT(*) as calls
                 FROM api_usage
-                WHERE timestamp >= datetime('now', '-' || ? || ' days')
+                WHERE timestamp >= CURRENT_TIMESTAMP - (%s * interval '1 day')
                 GROUP BY provider
             """, (days,))
 
@@ -1741,14 +1706,14 @@ def save_analysis_cache(
         # Delete old version if exists
         cursor.execute("""
             DELETE FROM analysis_cache
-            WHERE data_room_id = ? AND analysis_type = ? AND version = ?
+            WHERE data_room_id = %s AND analysis_type = %s AND version = %s
         """, (data_room_id, analysis_type, version))
 
         # Insert new cache
         cursor.execute("""
             INSERT INTO analysis_cache (
                 id, data_room_id, analysis_type, extracted_data, version
-            ) VALUES (?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s)
         """, (
             cache_id, data_room_id, analysis_type,
             json.dumps(extracted_data), version
@@ -1778,7 +1743,7 @@ def get_analysis_cache(
         cursor = conn.cursor()
         cursor.execute("""
             SELECT extracted_data FROM analysis_cache
-            WHERE data_room_id = ? AND analysis_type = ? AND version = ?
+            WHERE data_room_id = %s AND analysis_type = %s AND version = %s
         """, (data_room_id, analysis_type, version))
 
         row = cursor.fetchone()
@@ -1819,7 +1784,7 @@ def create_or_update_user(
         cursor = conn.cursor()
 
         # Check if user exists
-        cursor.execute("SELECT id FROM users WHERE email = ?", (email,))
+        cursor.execute("SELECT id FROM users WHERE email = %s", (email,))
         existing = cursor.fetchone()
 
         if existing:
@@ -1829,26 +1794,26 @@ def create_or_update_user(
             values = []
 
             if name:
-                fields.append("name = ?")
+                fields.append("name = %s")
                 values.append(name)
             if picture_url:
-                fields.append("picture_url = ?")
+                fields.append("picture_url = %s")
                 values.append(picture_url)
             if google_id:
-                fields.append("google_id = ?")
+                fields.append("google_id = %s")
                 values.append(google_id)
             if access_token:
-                fields.append("access_token = ?")
+                fields.append("access_token = %s")
                 values.append(access_token)
             if refresh_token:
-                fields.append("refresh_token = ?")
+                fields.append("refresh_token = %s")
                 values.append(refresh_token)
             if token_expires_at:
-                fields.append("token_expires_at = ?")
+                fields.append("token_expires_at = %s")
                 values.append(token_expires_at)
 
             values.append(user_id)
-            query = f"UPDATE users SET {', '.join(fields)} WHERE id = ?"
+            query = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
             cursor.execute(query, values)
             logger.info(f"Updated user: {email}")
         else:
@@ -1858,7 +1823,7 @@ def create_or_update_user(
                 INSERT INTO users (
                     id, email, name, picture_url, google_id,
                     access_token, refresh_token, token_expires_at, last_login_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
             """, (user_id, email, name, picture_url, google_id,
                   access_token, refresh_token, token_expires_at))
             logger.info(f"Created new user: {email}")
@@ -1871,7 +1836,7 @@ def get_user_by_id(user_id: str) -> Optional[Dict[str, Any]]:
     """Get user by ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))
+        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
         return dict_from_row(cursor.fetchone())
 
 
@@ -1879,7 +1844,7 @@ def get_user_by_email(email: str) -> Optional[Dict[str, Any]]:
     """Get user by email."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM users WHERE email = ?", (email,))
+        cursor.execute("SELECT * FROM users WHERE email = %s", (email,))
         return dict_from_row(cursor.fetchone())
 
 
@@ -1893,18 +1858,18 @@ def update_user_tokens(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        fields = ["access_token = ?"]
+        fields = ["access_token = %s"]
         values = [access_token]
 
         if refresh_token:
-            fields.append("refresh_token = ?")
+            fields.append("refresh_token = %s")
             values.append(refresh_token)
         if token_expires_at:
-            fields.append("token_expires_at = ?")
+            fields.append("token_expires_at = %s")
             values.append(token_expires_at)
 
         values.append(user_id)
-        query = f"UPDATE users SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE users SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
 
@@ -1915,7 +1880,7 @@ def delete_user(user_id: str) -> bool:
     """Delete a user and revoke access."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        cursor.execute("DELETE FROM users WHERE id = %s", (user_id,))
         conn.commit()
         return cursor.rowcount > 0
 
@@ -1949,7 +1914,7 @@ def create_connected_folder(
 
         # Check if folder is already connected for this user
         cursor.execute(
-            "SELECT id FROM connected_folders WHERE user_id = ? AND folder_id = ?",
+            "SELECT id FROM connected_folders WHERE user_id = %s AND folder_id = %s",
             (user_id, folder_id)
         )
         existing = cursor.fetchone()
@@ -1957,7 +1922,7 @@ def create_connected_folder(
             # Update data_room_id if a new one is provided (reconnection scenario)
             if data_room_id:
                 cursor.execute(
-                    "UPDATE connected_folders SET data_room_id = ?, sync_status = 'syncing' WHERE id = ?",
+                    "UPDATE connected_folders SET data_room_id = %s, sync_status = 'syncing' WHERE id = %s",
                     (data_room_id, existing['id'])
                 )
                 conn.commit()
@@ -1971,7 +1936,7 @@ def create_connected_folder(
         cursor.execute("""
             INSERT INTO connected_folders (
                 id, user_id, folder_id, folder_name, folder_path, data_room_id, sync_status, sync_stage
-            ) VALUES (?, ?, ?, ?, ?, ?, 'syncing', 'idle')
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'syncing', 'idle')
         """, (connection_id, user_id, folder_id, folder_name, folder_path, data_room_id))
         conn.commit()
 
@@ -1983,7 +1948,7 @@ def get_connected_folder(connection_id: str) -> Optional[Dict[str, Any]]:
     """Get connected folder by ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM connected_folders WHERE id = ?", (connection_id,))
+        cursor.execute("SELECT * FROM connected_folders WHERE id = %s", (connection_id,))
         return dict_from_row(cursor.fetchone())
 
 
@@ -1993,7 +1958,7 @@ def get_connected_folders_by_user(user_id: str) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM connected_folders
-            WHERE user_id = ?
+            WHERE user_id = %s
             ORDER BY created_at DESC
         """, (user_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -2008,7 +1973,7 @@ def get_active_connected_folders() -> List[Dict[str, Any]]:
             FROM connected_folders cf
             JOIN users u ON cf.user_id = u.id
             WHERE cf.sync_status IN ('active', 'syncing')
-            AND u.is_active = 1
+            AND u.is_active = TRUE
             ORDER BY cf.last_sync_at ASC NULLS FIRST
         """)
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -2026,27 +1991,27 @@ def update_connected_folder_status(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        fields = ["sync_status = ?"]
+        fields = ["sync_status = %s"]
         values = [sync_status]
 
         if sync_status == 'syncing' or sync_status == 'active':
             fields.append("last_sync_at = CURRENT_TIMESTAMP")
 
         if sync_page_token is not None:
-            fields.append("sync_page_token = ?")
+            fields.append("sync_page_token = %s")
             values.append(sync_page_token)
         if total_files is not None:
-            fields.append("total_files = ?")
+            fields.append("total_files = %s")
             values.append(total_files)
         if processed_files is not None:
-            fields.append("processed_files = ?")
+            fields.append("processed_files = %s")
             values.append(processed_files)
         if error_message is not None:
-            fields.append("error_message = ?")
+            fields.append("error_message = %s")
             values.append(error_message)
 
         values.append(connection_id)
-        query = f"UPDATE connected_folders SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE connected_folders SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
 
@@ -2057,7 +2022,7 @@ def delete_connected_folder(connection_id: str) -> bool:
     """Delete a connected folder."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM connected_folders WHERE id = ?", (connection_id,))
+        cursor.execute("DELETE FROM connected_folders WHERE id = %s", (connection_id,))
         conn.commit()
         logger.info(f"Deleted connected folder: {connection_id}")
         return cursor.rowcount > 0
@@ -2088,24 +2053,24 @@ def update_connected_folder_stage(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        fields = ["sync_stage = ?"]
+        fields = ["sync_stage = %s"]
         values = [sync_stage]
 
         if discovered_files is not None:
-            fields.append("discovered_files = ?")
+            fields.append("discovered_files = %s")
             values.append(discovered_files)
         if discovered_folders is not None:
-            fields.append("discovered_folders = ?")
+            fields.append("discovered_folders = %s")
             values.append(discovered_folders)
         if current_folder_path is not None:
-            fields.append("current_folder_path = ?")
+            fields.append("current_folder_path = %s")
             values.append(current_folder_path)
         if error_message is not None:
-            fields.append("error_message = ?")
+            fields.append("error_message = %s")
             values.append(error_message)
 
         values.append(connection_id)
-        query = f"UPDATE connected_folders SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE connected_folders SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
 
@@ -2148,7 +2113,7 @@ def create_connected_file(
             INSERT INTO connected_files (
                 id, user_id, drive_file_id, file_name, file_path,
                 mime_type, file_size, data_room_id, sync_status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'pending')
         """, (file_id, user_id, drive_file_id, file_name, file_path,
               mime_type, file_size, data_room_id))
         conn.commit()
@@ -2161,7 +2126,7 @@ def get_connected_file(file_id: str) -> Optional[Dict[str, Any]]:
     """Get a connected file by ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM connected_files WHERE id = ?", (file_id,))
+        cursor.execute("SELECT * FROM connected_files WHERE id = %s", (file_id,))
         row = cursor.fetchone()
         if row:
             return dict(row)
@@ -2174,7 +2139,7 @@ def get_connected_files_by_user(user_id: str) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM connected_files
-            WHERE user_id = ?
+            WHERE user_id = %s
             ORDER BY created_at DESC
         """, (user_id,))
         return [dict(row) for row in cursor.fetchall()]
@@ -2186,7 +2151,7 @@ def get_connected_files_by_data_room(data_room_id: str) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM connected_files
-            WHERE data_room_id = ?
+            WHERE data_room_id = %s
             ORDER BY created_at DESC
         """, (data_room_id,))
         return [dict(row) for row in cursor.fetchall()]
@@ -2215,21 +2180,21 @@ def update_connected_file_status(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        fields = ["sync_status = ?"]
+        fields = ["sync_status = %s"]
         values = [sync_status]
 
         if local_file_path is not None:
-            fields.append("local_file_path = ?")
+            fields.append("local_file_path = %s")
             values.append(local_file_path)
         if document_id is not None:
-            fields.append("document_id = ?")
+            fields.append("document_id = %s")
             values.append(document_id)
         if error_message is not None:
-            fields.append("error_message = ?")
+            fields.append("error_message = %s")
             values.append(error_message)
 
         values.append(file_id)
-        query = f"UPDATE connected_files SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE connected_files SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
 
@@ -2240,7 +2205,7 @@ def delete_connected_file(file_id: str) -> bool:
     """Delete a connected file."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("DELETE FROM connected_files WHERE id = ?", (file_id,))
+        cursor.execute("DELETE FROM connected_files WHERE id = %s", (file_id,))
         conn.commit()
         logger.info(f"Deleted connected file: {file_id}")
         return cursor.rowcount > 0
@@ -2257,7 +2222,7 @@ def check_connected_file_exists(user_id: str, drive_file_id: str) -> Optional[st
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id FROM connected_files
-            WHERE user_id = ? AND drive_file_id = ?
+            WHERE user_id = %s AND drive_file_id = %s
         """, (user_id, drive_file_id))
         row = cursor.fetchone()
         if row:
@@ -2278,7 +2243,7 @@ def get_connected_file_with_data_room(user_id: str, drive_file_id: str) -> Optio
             SELECT cf.*, dr.processing_status as dr_status, dr.progress_percent as dr_progress
             FROM connected_files cf
             LEFT JOIN data_rooms dr ON cf.data_room_id = dr.id
-            WHERE cf.user_id = ? AND cf.drive_file_id = ?
+            WHERE cf.user_id = %s AND cf.drive_file_id = %s
         """, (user_id, drive_file_id))
         row = cursor.fetchone()
         return dict(row) if row else None
@@ -2304,7 +2269,7 @@ def cleanup_orphaned_data_rooms(older_than_minutes: int = 60) -> int:
             AND id NOT IN (SELECT DISTINCT data_room_id FROM connected_folders WHERE data_room_id IS NOT NULL)
             AND processing_status = 'uploading'
             AND progress_percent = 0
-            AND created_at < datetime('now', '-' || ? || ' minutes')
+            AND created_at < CURRENT_TIMESTAMP - (%s * interval '1 minute')
         """, (older_than_minutes,))
         conn.commit()
         deleted = cursor.rowcount
@@ -2342,10 +2307,15 @@ def create_folder_inventory(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO folder_inventory (
+            INSERT INTO folder_inventory (
                 id, connected_folder_id, drive_folder_id, folder_name,
                 folder_path, parent_folder_id, scan_status
-            ) VALUES (?, ?, ?, ?, ?, ?, 'scanning')
+            ) VALUES (%s, %s, %s, %s, %s, %s, 'scanning')
+            ON CONFLICT (connected_folder_id, drive_folder_id) DO UPDATE SET
+                folder_name = EXCLUDED.folder_name,
+                folder_path = EXCLUDED.folder_path,
+                parent_folder_id = EXCLUDED.parent_folder_id,
+                scan_status = EXCLUDED.scan_status
         """, (inventory_id, connected_folder_id, drive_folder_id, folder_name,
               folder_path, parent_folder_id))
         conn.commit()
@@ -2376,15 +2346,15 @@ def update_folder_inventory_counts(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        fields = ["file_count = ?", "total_size_bytes = ?", "scan_status = ?"]
+        fields = ["file_count = %s", "total_size_bytes = %s", "scan_status = %s"]
         values = [file_count, total_size_bytes, scan_status]
 
         if error_message is not None:
-            fields.append("error_message = ?")
+            fields.append("error_message = %s")
             values.append(error_message)
 
         values.append(inventory_id)
-        query = f"UPDATE folder_inventory SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE folder_inventory SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
 
@@ -2427,11 +2397,18 @@ def create_and_update_folder_inventory_batch(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.executemany("""
-            INSERT OR REPLACE INTO folder_inventory (
+            INSERT INTO folder_inventory (
                 id, connected_folder_id, drive_folder_id, folder_name,
                 folder_path, parent_folder_id, scan_status,
                 file_count, total_size_bytes
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (connected_folder_id, drive_folder_id) DO UPDATE SET
+                folder_name = EXCLUDED.folder_name,
+                folder_path = EXCLUDED.folder_path,
+                parent_folder_id = EXCLUDED.parent_folder_id,
+                scan_status = EXCLUDED.scan_status,
+                file_count = EXCLUDED.file_count,
+                total_size_bytes = EXCLUDED.total_size_bytes
         """, insert_values)
         conn.commit()
 
@@ -2458,7 +2435,7 @@ def reset_failed_synced_files(connection_id: Optional[str] = None) -> int:
                 UPDATE synced_files
                 SET sync_status = 'pending', error_message = NULL
                 WHERE sync_status IN ('failed', 'downloading', 'processing')
-                AND connected_folder_id = ?
+                AND connected_folder_id = %s
             """, (connection_id,))
         else:
             cursor.execute("""
@@ -2484,7 +2461,7 @@ def get_folder_inventory(connected_folder_id: str) -> List[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM folder_inventory
-            WHERE connected_folder_id = ?
+            WHERE connected_folder_id = %s
             ORDER BY folder_path ASC
         """, (connected_folder_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -2495,10 +2472,10 @@ def count_pending_synced_files(connected_folder_id: str) -> int:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT COUNT(*) FROM synced_files WHERE connected_folder_id = ? AND sync_status = 'pending'",
+            "SELECT COUNT(*) as cnt FROM synced_files WHERE connected_folder_id = %s AND sync_status = 'pending'",
             (connected_folder_id,)
         )
-        return cursor.fetchone()[0]
+        return cursor.fetchone()['cnt']
 
 
 def get_unscanned_inventory_folders(connected_folder_id: str) -> List[Dict[str, Any]]:
@@ -2507,7 +2484,7 @@ def get_unscanned_inventory_folders(connected_folder_id: str) -> List[Dict[str, 
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM folder_inventory
-            WHERE connected_folder_id = ? AND scan_status IN ('pending', 'scanning')
+            WHERE connected_folder_id = %s AND scan_status IN ('pending', 'scanning')
             ORDER BY folder_path ASC
         """, (connected_folder_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -2518,7 +2495,7 @@ def update_folder_inventory_scan_status(inventory_id: str, scan_status: str) -> 
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "UPDATE folder_inventory SET scan_status = ? WHERE id = ?",
+            "UPDATE folder_inventory SET scan_status = %s WHERE id = %s",
             (scan_status, inventory_id)
         )
         conn.commit()
@@ -2538,7 +2515,7 @@ def delete_folder_inventory(connected_folder_id: str) -> bool:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "DELETE FROM folder_inventory WHERE connected_folder_id = ?",
+            "DELETE FROM folder_inventory WHERE connected_folder_id = %s",
             (connected_folder_id,)
         )
         conn.commit()
@@ -2559,7 +2536,7 @@ def get_all_pending_synced_files(connected_folder_id: str) -> List[Dict[str, Any
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM synced_files
-            WHERE connected_folder_id = ?
+            WHERE connected_folder_id = %s
             AND sync_status = 'pending'
             ORDER BY created_at ASC
         """, (connected_folder_id,))
@@ -2585,10 +2562,16 @@ def create_synced_file(
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute("""
-            INSERT OR REPLACE INTO synced_files (
+            INSERT INTO synced_files (
                 id, connected_folder_id, drive_file_id, file_name,
                 file_path, mime_type, file_size, drive_modified_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (connected_folder_id, drive_file_id) DO UPDATE SET
+                file_name = EXCLUDED.file_name,
+                file_path = EXCLUDED.file_path,
+                mime_type = EXCLUDED.mime_type,
+                file_size = EXCLUDED.file_size,
+                drive_modified_time = EXCLUDED.drive_modified_time
         """, (synced_file_id, connected_folder_id, drive_file_id, file_name,
               file_path, mime_type, file_size, drive_modified_time))
         conn.commit()
@@ -2629,10 +2612,16 @@ def create_synced_files_batch(files: List[Dict[str, Any]]) -> List[str]:
     with get_db_connection() as conn:
         cursor = conn.cursor()
         cursor.executemany("""
-            INSERT OR REPLACE INTO synced_files (
+            INSERT INTO synced_files (
                 id, connected_folder_id, drive_file_id, file_name,
                 file_path, mime_type, file_size, drive_modified_time
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (connected_folder_id, drive_file_id) DO UPDATE SET
+                file_name = EXCLUDED.file_name,
+                file_path = EXCLUDED.file_path,
+                mime_type = EXCLUDED.mime_type,
+                file_size = EXCLUDED.file_size,
+                drive_modified_time = EXCLUDED.drive_modified_time
         """, values)
         conn.commit()
 
@@ -2645,7 +2634,7 @@ def get_synced_files_by_folder(connected_folder_id: str) -> List[Dict[str, Any]]
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM synced_files
-            WHERE connected_folder_id = ?
+            WHERE connected_folder_id = %s
             ORDER BY file_name ASC
         """, (connected_folder_id,))
         return [dict_from_row(row) for row in cursor.fetchall()]
@@ -2657,10 +2646,10 @@ def get_pending_synced_files(connected_folder_id: str, limit: int = 10) -> List[
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM synced_files
-            WHERE connected_folder_id = ?
+            WHERE connected_folder_id = %s
             AND sync_status IN ('pending', 'failed')
             ORDER BY created_at ASC
-            LIMIT ?
+            LIMIT %s
         """, (connected_folder_id, limit))
         return [dict_from_row(row) for row in cursor.fetchall()]
 
@@ -2676,21 +2665,21 @@ def update_synced_file_status(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        fields = ["sync_status = ?", "last_synced_at = CURRENT_TIMESTAMP"]
+        fields = ["sync_status = %s", "last_synced_at = CURRENT_TIMESTAMP"]
         values = [sync_status]
 
         if local_file_path:
-            fields.append("local_file_path = ?")
+            fields.append("local_file_path = %s")
             values.append(local_file_path)
         if document_id:
-            fields.append("document_id = ?")
+            fields.append("document_id = %s")
             values.append(document_id)
         if error_message is not None:
-            fields.append("error_message = ?")
+            fields.append("error_message = %s")
             values.append(error_message)
 
         values.append(synced_file_id)
-        query = f"UPDATE synced_files SET {', '.join(fields)} WHERE id = ?"
+        query = f"UPDATE synced_files SET {', '.join(fields)} WHERE id = %s"
         cursor.execute(query, values)
         conn.commit()
 
@@ -2700,27 +2689,29 @@ def update_synced_file_status(
 def count_synced_files_by_status(connected_folder_id: str, sync_status: str = None) -> int:
     """Count synced files for a folder, optionally filtered by status."""
     with get_db_connection() as conn:
+        cursor = conn.cursor()
         if sync_status:
-            cursor = conn.execute(
-                "SELECT COUNT(*) FROM synced_files WHERE connected_folder_id = ? AND sync_status = ?",
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM synced_files WHERE connected_folder_id = %s AND sync_status = %s",
                 (connected_folder_id, sync_status)
             )
         else:
-            cursor = conn.execute(
-                "SELECT COUNT(*) FROM synced_files WHERE connected_folder_id = ?",
+            cursor.execute(
+                "SELECT COUNT(*) as cnt FROM synced_files WHERE connected_folder_id = %s",
                 (connected_folder_id,)
             )
-        return cursor.fetchone()[0]
+        return cursor.fetchone()['cnt']
 
 
 def count_processed_synced_files(connected_folder_id: str) -> int:
     """Count processed synced files (complete + failed) for a folder."""
     with get_db_connection() as conn:
-        cursor = conn.execute(
-            "SELECT COUNT(*) FROM synced_files WHERE connected_folder_id = ? AND sync_status IN ('complete', 'failed')",
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) as cnt FROM synced_files WHERE connected_folder_id = %s AND sync_status IN ('complete', 'failed')",
             (connected_folder_id,)
         )
-        return cursor.fetchone()[0]
+        return cursor.fetchone()['cnt']
 
 
 def check_file_exists_in_sync(connected_folder_id: str, drive_file_id: str) -> Optional[Dict[str, Any]]:
@@ -2729,7 +2720,7 @@ def check_file_exists_in_sync(connected_folder_id: str, drive_file_id: str) -> O
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM synced_files
-            WHERE connected_folder_id = ? AND drive_file_id = ?
+            WHERE connected_folder_id = %s AND drive_file_id = %s
         """, (connected_folder_id, drive_file_id))
         return dict_from_row(cursor.fetchone())
 
@@ -2741,9 +2732,9 @@ def get_recently_completed_synced_files(connected_folder_id: str, limit: int = 5
         cursor.execute("""
             SELECT file_name, mime_type
             FROM synced_files
-            WHERE connected_folder_id = ? AND sync_status = 'complete'
+            WHERE connected_folder_id = %s AND sync_status = 'complete'
             ORDER BY last_synced_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (connected_folder_id, limit))
         return [dict_from_row(row) for row in cursor.fetchall()]
 
@@ -2755,17 +2746,17 @@ def get_synced_file_type_counts(connected_folder_id: str) -> Dict[str, int]:
         cursor.execute("""
             SELECT
                 CASE
-                    WHEN mime_type LIKE '%pdf%' THEN 'pdf'
-                    WHEN mime_type LIKE '%spreadsheet%' OR mime_type LIKE '%excel%'
-                         OR mime_type LIKE '%csv%' THEN 'spreadsheet'
-                    WHEN mime_type LIKE '%document%' OR mime_type LIKE '%msword%'
-                         OR mime_type LIKE '%wordprocessing%' THEN 'document'
-                    WHEN mime_type LIKE '%presentation%' OR mime_type LIKE '%powerpoint%' THEN 'presentation'
+                    WHEN mime_type LIKE '%%pdf%%' THEN 'pdf'
+                    WHEN mime_type LIKE '%%spreadsheet%%' OR mime_type LIKE '%%excel%%'
+                         OR mime_type LIKE '%%csv%%' THEN 'spreadsheet'
+                    WHEN mime_type LIKE '%%document%%' OR mime_type LIKE '%%msword%%'
+                         OR mime_type LIKE '%%wordprocessing%%' THEN 'document'
+                    WHEN mime_type LIKE '%%presentation%%' OR mime_type LIKE '%%powerpoint%%' THEN 'presentation'
                     ELSE 'other'
                 END AS file_category,
                 COUNT(*) AS count
             FROM synced_files
-            WHERE connected_folder_id = ?
+            WHERE connected_folder_id = %s
             GROUP BY file_category
         """, (connected_folder_id,))
         return {row['file_category']: row['count'] for row in cursor.fetchall()}
@@ -2778,7 +2769,7 @@ def get_current_processing_file(connected_folder_id: str) -> Optional[Dict[str, 
         cursor.execute("""
             SELECT file_name, sync_status
             FROM synced_files
-            WHERE connected_folder_id = ? AND sync_status IN ('downloading', 'processing')
+            WHERE connected_folder_id = %s AND sync_status IN ('downloading', 'processing')
             ORDER BY last_synced_at DESC
             LIMIT 1
         """, (connected_folder_id,))
@@ -2844,31 +2835,31 @@ def save_financial_analysis(
         cursor = conn.cursor()
 
         # Check if analysis already exists
-        cursor.execute("SELECT id FROM financial_analyses WHERE id = ?", (analysis_id,))
+        cursor.execute("SELECT id FROM financial_analyses WHERE id = %s", (analysis_id,))
         existing = cursor.fetchone()
 
         if existing:
             # Update existing analysis
             cursor.execute("""
                 UPDATE financial_analyses SET
-                    status = ?,
-                    model_structure = ?,
-                    extracted_metrics = ?,
-                    time_series = ?,
-                    missing_metrics = ?,
-                    validation_results = ?,
-                    insights = ?,
-                    follow_up_questions = ?,
-                    key_metrics_summary = ?,
-                    risk_assessment = ?,
-                    investment_thesis_notes = ?,
-                    executive_summary = ?,
-                    analysis_cost = ?,
-                    tokens_used = ?,
-                    processing_time_ms = ?,
-                    error_message = ?,
+                    status = %s,
+                    model_structure = %s,
+                    extracted_metrics = %s,
+                    time_series = %s,
+                    missing_metrics = %s,
+                    validation_results = %s,
+                    insights = %s,
+                    follow_up_questions = %s,
+                    key_metrics_summary = %s,
+                    risk_assessment = %s,
+                    investment_thesis_notes = %s,
+                    executive_summary = %s,
+                    analysis_cost = %s,
+                    tokens_used = %s,
+                    processing_time_ms = %s,
+                    error_message = %s,
                     updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?
+                WHERE id = %s
             """, (
                 status,
                 json.dumps(model_structure) if model_structure else None,
@@ -2898,7 +2889,7 @@ def save_financial_analysis(
                     key_metrics_summary, risk_assessment, investment_thesis_notes,
                     executive_summary, analysis_cost, tokens_used, processing_time_ms,
                     error_message
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 analysis_id, data_room_id, document_id, file_name, status,
                 json.dumps(model_structure) if model_structure else None,
@@ -2950,7 +2941,7 @@ def save_financial_metrics(
 
         # Delete existing metrics for this analysis
         cursor.execute(
-            "DELETE FROM financial_metrics WHERE financial_analysis_id = ?",
+            "DELETE FROM financial_metrics WHERE financial_analysis_id = %s",
             (financial_analysis_id,)
         )
 
@@ -2962,7 +2953,7 @@ def save_financial_metrics(
                     id, financial_analysis_id, data_room_id, metric_name,
                     category, metric_value, metric_unit, period,
                     cell_reference, confidence, source_sheet, notes
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 metric_id,
                 financial_analysis_id,
@@ -3002,14 +2993,14 @@ def get_financial_analysis(
         if data_room_id:
             cursor.execute("""
                 SELECT * FROM financial_analyses
-                WHERE document_id = ? AND data_room_id = ?
+                WHERE document_id = %s AND data_room_id = %s
                 ORDER BY created_at DESC
                 LIMIT 1
             """, (document_id, data_room_id))
         else:
             cursor.execute("""
                 SELECT * FROM financial_analyses
-                WHERE document_id = ?
+                WHERE document_id = %s
                 ORDER BY created_at DESC
                 LIMIT 1
             """, (document_id,))
@@ -3052,7 +3043,7 @@ def get_financial_analyses_by_data_room(data_room_id: str) -> List[Dict[str, Any
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM financial_analyses
-            WHERE data_room_id = ?
+            WHERE data_room_id = %s
             ORDER BY created_at DESC
         """, (data_room_id,))
 
@@ -3099,15 +3090,15 @@ def get_financial_metrics_by_data_room(
     with get_db_connection() as conn:
         cursor = conn.cursor()
 
-        query = "SELECT * FROM financial_metrics WHERE data_room_id = ?"
+        query = "SELECT * FROM financial_metrics WHERE data_room_id = %s"
         params = [data_room_id]
 
         if category:
-            query += " AND category = ?"
+            query += " AND category = %s"
             params.append(category)
 
         if metric_name:
-            query += " AND metric_name LIKE ?"
+            query += " AND metric_name LIKE %s"
             params.append(f"%{metric_name}%")
 
         query += " ORDER BY period DESC, metric_name ASC"
@@ -3128,7 +3119,7 @@ def get_document_by_id(document_id: str) -> Optional[Dict[str, Any]]:
     """
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM documents WHERE id = ?", (document_id,))
+        cursor.execute("SELECT * FROM documents WHERE id = %s", (document_id,))
         return dict_from_row(cursor.fetchone())
 
 
@@ -3146,7 +3137,7 @@ def check_financial_analysis_exists(document_id: str) -> bool:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT id FROM financial_analyses
-            WHERE document_id = ? AND status = 'complete'
+            WHERE document_id = %s AND status = 'complete'
         """, (document_id,))
         return cursor.fetchone() is not None
 
@@ -3166,10 +3157,11 @@ def save_memo(
     """Create a new memo record with status 'generating'."""
     import json
     with get_db_connection() as conn:
+        cursor = conn.cursor()
         valuation_methods_json = json.dumps(valuation_methods) if valuation_methods else None
-        conn.execute("""
+        cursor.execute("""
             INSERT INTO memos (id, data_room_id, version, status, created_at, ticket_size, post_money_valuation, valuation_methods)
-            VALUES (?, ?, ?, 'generating', ?, ?, ?, ?)
+            VALUES (%s, %s, %s, 'generating', %s, %s, %s, %s)
         """, (memo_id, data_room_id, version, datetime.now().isoformat(), ticket_size, post_money_valuation, valuation_methods_json))
         conn.commit()
     return memo_id
@@ -3193,12 +3185,13 @@ def update_memo_section(
         raise ValueError(f"Invalid section key: {section_key}")
 
     with get_db_connection() as conn:
-        conn.execute(f"""
+        cursor = conn.cursor()
+        cursor.execute(f"""
             UPDATE memos
-            SET {section_key} = ?,
-                tokens_used = COALESCE(tokens_used, 0) + ?,
-                cost = COALESCE(cost, 0) + ?
-            WHERE id = ?
+            SET {section_key} = %s,
+                tokens_used = COALESCE(tokens_used, 0) + %s,
+                cost = COALESCE(cost, 0) + %s
+            WHERE id = %s
         """, (content, tokens_used, cost, memo_id))
         conn.commit()
 
@@ -3210,15 +3203,16 @@ def update_memo_status(
 ):
     """Update memo status and optionally set full_memo."""
     with get_db_connection() as conn:
+        cursor = conn.cursor()
         if full_memo:
-            conn.execute("""
+            cursor.execute("""
                 UPDATE memos
-                SET status = ?, full_memo = ?, completed_at = ?
-                WHERE id = ?
+                SET status = %s, full_memo = %s, completed_at = %s
+                WHERE id = %s
             """, (status, full_memo, datetime.now().isoformat(), memo_id))
         else:
-            conn.execute("""
-                UPDATE memos SET status = ? WHERE id = ?
+            cursor.execute("""
+                UPDATE memos SET status = %s WHERE id = %s
             """, (status, memo_id))
         conn.commit()
 
@@ -3230,10 +3224,11 @@ def update_memo_deal_terms(
 ) -> None:
     """Update deal terms on an existing memo."""
     with get_db_connection() as conn:
-        conn.execute("""
+        cursor = conn.cursor()
+        cursor.execute("""
             UPDATE memos
-            SET ticket_size = ?, post_money_valuation = ?
-            WHERE id = ?
+            SET ticket_size = %s, post_money_valuation = %s
+            WHERE id = %s
         """, (ticket_size, post_money_valuation, memo_id))
         conn.commit()
 
@@ -3242,8 +3237,9 @@ def update_memo_metadata(memo_id: str, metadata: dict) -> None:
     """Save chart data / metadata JSON to memo record."""
     import json
     with get_db_connection() as conn:
-        conn.execute(
-            "UPDATE memos SET metadata = ? WHERE id = ?",
+        cursor = conn.cursor()
+        cursor.execute(
+            "UPDATE memos SET metadata = %s WHERE id = %s",
             (json.dumps(metadata), memo_id)
         )
         conn.commit()
@@ -3255,7 +3251,7 @@ def get_latest_memo(data_room_id: str) -> Optional[Dict[str, Any]]:
         cursor = conn.cursor()
         cursor.execute("""
             SELECT * FROM memos
-            WHERE data_room_id = ?
+            WHERE data_room_id = %s
             ORDER BY created_at DESC
             LIMIT 1
         """, (data_room_id,))
@@ -3267,7 +3263,7 @@ def get_memo_by_id(memo_id: str) -> Optional[Dict[str, Any]]:
     """Get a memo by its ID."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM memos WHERE id = ?", (memo_id,))
+        cursor.execute("SELECT * FROM memos WHERE id = %s", (memo_id,))
         row = cursor.fetchone()
         return dict(row) if row else None
 
@@ -3276,9 +3272,9 @@ def check_memo_cancelled(memo_id: str) -> bool:
     """Check if a memo has been cancelled. Used by the generator loop."""
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM memos WHERE id = ?", (memo_id,))
+        cursor.execute("SELECT status FROM memos WHERE id = %s", (memo_id,))
         row = cursor.fetchone()
-        return row is not None and row[0] == "cancelled"
+        return row is not None and row['status'] == "cancelled"
 
 
 # ============================================================================
@@ -3320,7 +3316,7 @@ def save_memo_chat_message(
                 id, memo_id, data_room_id, role, content,
                 updated_section_key, updated_section_content,
                 tokens_used, cost
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             message_id, memo_id, data_room_id, role, content,
             updated_section_key, updated_section_content,
@@ -3352,9 +3348,9 @@ def get_memo_chat_history(
                    updated_section_key, updated_section_content,
                    tokens_used, cost, created_at
             FROM memo_chat_messages
-            WHERE memo_id = ?
+            WHERE memo_id = %s
             ORDER BY created_at ASC
-            LIMIT ?
+            LIMIT %s
         """, (memo_id, limit))
 
         messages = []

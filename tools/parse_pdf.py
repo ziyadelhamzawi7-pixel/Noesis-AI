@@ -39,6 +39,15 @@ except ImportError:
     OCR_AVAILABLE = False
     logger.debug("OCR packages not available. Install pytesseract and pdf2image for OCR support.")
 
+# Google Document AI (optional, fast cloud OCR)
+try:
+    from google.cloud import documentai_v1 as documentai
+    from google.api_core.client_options import ClientOptions
+    DOCUMENT_AI_AVAILABLE = True
+except ImportError:
+    DOCUMENT_AI_AVAILABLE = False
+    logger.debug("Google Document AI not available. Install google-cloud-documentai for fast cloud OCR.")
+
 
 class PDFParser:
     """PDF parsing with multiple extraction strategies."""
@@ -108,15 +117,42 @@ class PDFParser:
             chars_per_page = text_len / page_count
             if chars_per_page < 50:
                 if use_ocr:
-                    logger.info("Low text content detected, attempting OCR...")
-                    ocr_text = self._extract_text_with_ocr(max_pages=max_ocr_pages)
+                    ocr_text = ""
+                    ocr_errors = []
+
+                    from app.config import settings
+                    if settings.ocr_provider == "google_document_ai":
+                        logger.info("Low text content detected, attempting Document AI OCR...")
+                        try:
+                            ocr_text = self._extract_text_with_document_ai(max_pages=max_ocr_pages)
+                        except RuntimeError as e:
+                            ocr_errors.append(f"Document AI: {e}")
+                            logger.warning(f"Document AI OCR failed: {e}")
+
+                    # Fall back to pytesseract if Document AI wasn't used or failed
+                    if not ocr_text or not ocr_text.strip():
+                        if settings.ocr_provider != "google_document_ai":
+                            logger.info("Low text content detected, attempting pytesseract OCR...")
+                        elif ocr_errors:
+                            logger.info("Falling back to pytesseract OCR...")
+                        if OCR_AVAILABLE:
+                            try:
+                                ocr_text = self._extract_text_with_ocr(max_pages=max_ocr_pages)
+                            except Exception as e:
+                                ocr_errors.append(f"pytesseract: {e}")
+                                logger.warning(f"pytesseract OCR failed: {e}")
+                        else:
+                            ocr_errors.append("pytesseract: not installed (install pytesseract and pdf2image)")
+
                     if ocr_text and len(ocr_text.strip()) > len(result["text"].strip()):
                         result["text"] = ocr_text
                         result["method"] = "ocr"
-                        # Update page text as well
                         result["pages"] = [{"page_number": i+1, "text": part, "char_count": len(part)}
                                           for i, part in enumerate(ocr_text.split("\n\n"))]
                         logger.success(f"OCR extracted {len(ocr_text)} characters")
+                    elif ocr_errors:
+                        result["error"] = f"Document appears to be scanned/image-only but OCR failed: {'; '.join(ocr_errors)}"
+                        logger.error(result["error"])
                     else:
                         result["needs_ocr"] = True
                         logger.warning("OCR did not improve text extraction")
@@ -358,6 +394,100 @@ class PDFParser:
             logger.warning(f"pdfplumber table extraction failed: {e}")
 
         return tables
+
+    def _extract_text_with_document_ai(self, max_pages: int = 50) -> str:
+        """Extract text from PDF using Google Document AI (fast cloud OCR).
+
+        Args:
+            max_pages: Maximum number of pages to OCR.
+
+        Returns:
+            Extracted text string, or empty string on failure.
+
+        Raises:
+            RuntimeError: If Document AI is unavailable, not configured, or fails.
+                The caller should handle fallback to pytesseract.
+        """
+        if not DOCUMENT_AI_AVAILABLE:
+            raise RuntimeError("google-cloud-documentai package not installed")
+
+        from app.config import settings
+
+        project_id = settings.google_document_ai_project
+        location = settings.google_document_ai_location
+        processor_id = settings.google_document_ai_processor_id
+
+        if not all([project_id, processor_id]):
+            raise RuntimeError("Document AI not configured (missing project or processor ID)")
+
+        try:
+            # Read the PDF file
+            with open(self.file_path, 'rb') as f:
+                pdf_content = f.read()
+
+            # Check page count — Document AI sync API handles up to 15 pages per request.
+            # For larger PDFs, split into batches and process in parallel.
+            import PyPDF2
+            with open(self.file_path, 'rb') as f:
+                reader = PyPDF2.PdfReader(f)
+                total_pages = len(reader.pages)
+
+            if total_pages > max_pages:
+                logger.warning(f"Skipping OCR: {self.file_path.name} has {total_pages} pages (limit: {max_pages})")
+                return ""
+
+            logger.info(f"Running Document AI OCR on {self.file_path.name} ({total_pages} pages)...")
+
+            opts = ClientOptions(api_endpoint=f"{location}-documentai.googleapis.com")
+            client = documentai.DocumentProcessorServiceClient(client_options=opts)
+            resource_name = client.processor_path(project_id, location, processor_id)
+
+            if total_pages <= 15:
+                # Single sync request for small PDFs (fastest path)
+                raw_document = documentai.RawDocument(content=pdf_content, mime_type="application/pdf")
+                request = documentai.ProcessRequest(name=resource_name, raw_document=raw_document)
+                result = client.process_document(request=request)
+                text = result.document.text
+            else:
+                # Split into page batches and process in parallel for larger PDFs
+                import io
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                from PyPDF2 import PdfWriter
+
+                batch_size = 15
+                page_batches = []
+                for start in range(0, total_pages, batch_size):
+                    end = min(start + batch_size, total_pages)
+                    writer = PdfWriter()
+                    for page_num in range(start, end):
+                        writer.add_page(reader.pages[page_num])
+                    batch_bytes = io.BytesIO()
+                    writer.write(batch_bytes)
+                    page_batches.append((start, batch_bytes.getvalue()))
+
+                def _process_batch(batch_info):
+                    start_page, batch_content = batch_info
+                    raw_doc = documentai.RawDocument(content=batch_content, mime_type="application/pdf")
+                    req = documentai.ProcessRequest(name=resource_name, raw_document=raw_doc)
+                    resp = client.process_document(request=req)
+                    return start_page, resp.document.text
+
+                text_parts = [None] * len(page_batches)
+                max_workers = min(8, len(page_batches))
+                with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                    futures = {executor.submit(_process_batch, batch): i for i, batch in enumerate(page_batches)}
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        _, batch_text = future.result()
+                        text_parts[idx] = batch_text
+
+                text = "\n\n".join(part for part in text_parts if part)
+
+            logger.success(f"Document AI OCR extracted {len(text)} characters from {total_pages} pages")
+            return text
+
+        except Exception as e:
+            raise RuntimeError(f"Document AI OCR failed: {e}") from e
 
     def _extract_text_with_ocr(self, max_pages: int = 50) -> str:
         """Extract text from PDF using OCR (for image-based PDFs).

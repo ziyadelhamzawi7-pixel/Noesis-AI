@@ -1,6 +1,7 @@
 """
 Semantic search tool using ChromaDB vector similarity.
 Retrieves relevant document chunks for analyst queries.
+Supports both local (fastembed) and OpenAI embeddings for query encoding.
 """
 
 import sys
@@ -25,6 +26,13 @@ load_dotenv()
 
 # Configuration
 CHROMA_DB_PATH = os.getenv("CHROMA_DB_PATH", ".tmp/chroma_db")
+
+# Resolve embedding provider
+try:
+    from app.config import settings as _app_settings
+    _EMBEDDING_PROVIDER = _app_settings.embedding_provider
+except ImportError:
+    _EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "local")
 
 # Thread-safe singleton cache for SemanticSearch instances
 _instance_cache: Dict[str, "SemanticSearch"] = {}
@@ -57,10 +65,11 @@ class SemanticSearch:
 
         Args:
             persist_directory: ChromaDB storage path
-            openai_api_key: OpenAI API key
-            embedding_model: Model for query embeddings
+            openai_api_key: OpenAI API key (only needed when EMBEDDING_PROVIDER=openai)
+            embedding_model: Model for query embeddings (OpenAI only)
         """
         self.persist_directory = persist_directory or CHROMA_DB_PATH
+        self._use_local = _EMBEDDING_PROVIDER == "local"
 
         # Initialize ChromaDB client
         self.chroma_client = chromadb.PersistentClient(
@@ -68,15 +77,18 @@ class SemanticSearch:
             settings=Settings(anonymized_telemetry=False)
         )
 
-        # Store credentials for thread-local OpenAI client creation (httpx.Client is not thread-safe)
-        self._openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
-        if not self._openai_api_key:
-            raise ValueError("OpenAI API key not found")
-
-        self._thread_local = threading.local()
-        self.embedding_model = embedding_model
-
-        logger.info(f"Semantic search initialized with model: {embedding_model}")
+        if self._use_local:
+            # Local embeddings — no OpenAI key needed for search
+            self._local_generator = None  # Lazy init
+            logger.info("Semantic search initialized with local embeddings (fastembed)")
+        else:
+            # OpenAI embeddings
+            self._openai_api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+            if not self._openai_api_key:
+                raise ValueError("OpenAI API key not found")
+            self._thread_local = threading.local()
+            self.embedding_model = embedding_model
+            logger.info(f"Semantic search initialized with OpenAI model: {embedding_model}")
 
     def _get_openai_client(self) -> OpenAI:
         """Get a thread-local OpenAI client (httpx.Client is not thread-safe)."""
@@ -149,7 +161,24 @@ class SemanticSearch:
             return []
 
     def _embed_query(self, query: str) -> List[float]:
-        """Generate embedding for search query."""
+        """Generate embedding for search query using the configured provider."""
+        if self._use_local:
+            return self._embed_query_local(query)
+        return self._embed_query_openai(query)
+
+    def _embed_query_local(self, query: str) -> List[float]:
+        """Generate query embedding using local fastembed model."""
+        try:
+            if self._local_generator is None:
+                from tools.generate_embeddings import LocalEmbeddingGenerator
+                self._local_generator = LocalEmbeddingGenerator()
+            return self._local_generator.embed_query(query)
+        except Exception as e:
+            logger.error(f"Failed to embed query (local): {e}")
+            raise
+
+    def _embed_query_openai(self, query: str) -> List[float]:
+        """Generate query embedding using OpenAI API."""
         try:
             response = self._get_openai_client().embeddings.create(
                 model=self.embedding_model,
@@ -158,7 +187,7 @@ class SemanticSearch:
             return response.data[0].embedding
 
         except Exception as e:
-            logger.error(f"Failed to embed query: {e}")
+            logger.error(f"Failed to embed query (OpenAI): {e}")
             raise
 
     def _build_where_filter(self, filters: Dict[str, Any]) -> Dict[str, Any]:

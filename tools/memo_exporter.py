@@ -33,6 +33,27 @@ MEMO_SECTIONS = [
     ("investment_recommendation", "Investment Recommendation"),
 ]
 
+# LaTeX artifact patterns to strip from content
+_LATEX_PATTERNS = [
+    (r'\\text\{([^}]*)\}', r'\1'),       # \text{...} -> ...
+    (r'\\\$', '$'),                        # \$ -> $
+    (r'\\%', '%'),                         # \% -> %
+    (r'\\&', '&'),                         # \& -> &
+    (r'\\times', '\u00d7'),                # \times -> ×
+    (r'\\approx', '\u2248'),               # \approx -> ≈
+    (r'\\leq', '\u2264'),                  # \leq -> ≤
+    (r'\\geq', '\u2265'),                  # \geq -> ≥
+    (r'\\infty', '\u221e'),                # \infty -> ∞
+    (r'\$([^$]+)\$', r'\1'),               # $...$ (inline math) -> ...
+]
+
+
+def _strip_latex(text: str) -> str:
+    """Remove common LaTeX artifacts from text."""
+    for pattern, replacement in _LATEX_PATTERNS:
+        text = re.sub(pattern, replacement, text)
+    return text
+
 
 def _setup_styles(doc: Document) -> None:
     """Configure document styles for consistent formatting."""
@@ -60,12 +81,50 @@ def _setup_styles(doc: Document) -> None:
     h2_style.paragraph_format.space_before = Pt(12)
     h2_style.paragraph_format.space_after = Pt(6)
 
+    # Heading 3 style (sub-subsections)
+    h3_style = styles['Heading 3']
+    h3_style.font.size = Pt(11)
+    h3_style.font.bold = True
+    h3_style.font.color.rgb = RGBColor(50, 50, 50)
+    h3_style.paragraph_format.space_before = Pt(10)
+    h3_style.paragraph_format.space_after = Pt(4)
+
     # Normal style (body text)
     normal_style = styles['Normal']
     normal_style.font.size = Pt(11)
     normal_style.font.name = 'Calibri'
     normal_style.paragraph_format.space_after = Pt(8)
     normal_style.paragraph_format.line_spacing = 1.15
+
+
+def _add_page_numbers(doc: Document) -> None:
+    """Add page numbers to the footer (right-aligned)."""
+    for section in doc.sections:
+        footer = section.footer
+        footer.is_linked_to_previous = False
+        para = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+        para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+
+        # Add PAGE field
+        run = para.add_run()
+        fld_char_begin = OxmlElement('w:fldChar')
+        fld_char_begin.set(qn('w:fldCharType'), 'begin')
+        run._r.append(fld_char_begin)
+
+        run2 = para.add_run()
+        instr_text = OxmlElement('w:instrText')
+        instr_text.set(qn('xml:space'), 'preserve')
+        instr_text.text = ' PAGE '
+        run2._r.append(instr_text)
+
+        run3 = para.add_run()
+        fld_char_end = OxmlElement('w:fldChar')
+        fld_char_end.set(qn('w:fldCharType'), 'end')
+        run3._r.append(fld_char_end)
+
+        for r in [run, run2, run3]:
+            r.font.size = Pt(9)
+            r.font.color.rgb = RGBColor(128, 128, 128)
 
 
 def _add_cover_page(
@@ -86,6 +145,7 @@ def _add_cover_page(
     run = title.add_run(company_name)
     run.bold = True
     run.font.size = Pt(32)
+    run.font.name = 'Calibri'
 
     # Subtitle
     subtitle = doc.add_paragraph()
@@ -93,6 +153,7 @@ def _add_cover_page(
     run = subtitle.add_run("Investment Memo")
     run.font.size = Pt(18)
     run.font.color.rgb = RGBColor(100, 100, 100)
+    run.font.name = 'Calibri'
 
     doc.add_paragraph()
     doc.add_paragraph()
@@ -125,12 +186,18 @@ def _add_cover_page(
             row.cells[0].text = "Ownership"
             row.cells[1].text = f"{ownership:.2f}%"
 
-        # Style the table
+        # Style the deal terms table
         for row in table.rows:
-            for cell in row.cells:
+            for idx, cell in enumerate(row.cells):
                 cell.paragraphs[0].alignment = WD_ALIGN_PARAGRAPH.CENTER
+                _set_cell_borders(cell)
                 for run in cell.paragraphs[0].runs:
                     run.font.size = Pt(12)
+                    run.font.name = 'Calibri'
+                    if idx == 0:
+                        run.font.color.rgb = RGBColor(100, 100, 100)
+                    else:
+                        run.bold = True
 
     doc.add_paragraph()
     doc.add_paragraph()
@@ -267,13 +334,33 @@ def _add_table_to_docx(doc: Document, headers: List[str], rows: List[List[str]])
                 _set_cell_shading(cell, 'F8F8FA')
 
 
+def _add_horizontal_rule(doc: Document) -> None:
+    """Add a thin horizontal line as a visual separator."""
+    para = doc.add_paragraph()
+    para.paragraph_format.space_before = Pt(6)
+    para.paragraph_format.space_after = Pt(6)
+    # Create a bottom border on the paragraph to simulate a horizontal rule
+    p_pr = para._p.get_or_add_pPr()
+    p_borders = OxmlElement('w:pBdr')
+    bottom = OxmlElement('w:bottom')
+    bottom.set(qn('w:val'), 'single')
+    bottom.set(qn('w:sz'), '6')
+    bottom.set(qn('w:space'), '1')
+    bottom.set(qn('w:color'), 'CCCCCC')
+    p_borders.append(bottom)
+    p_pr.append(p_borders)
+
+
 def _markdown_to_docx(doc: Document, content: str) -> None:
     """
     Convert markdown content to Word paragraphs.
-    Handles basic markdown: headers, bold, italic, bullets, numbered lists, tables.
+    Handles basic markdown: headers, bold, italic, bullets, numbered lists, tables, horizontal rules.
     """
     if not content:
         return
+
+    # Strip LaTeX artifacts from the entire content
+    content = _strip_latex(content)
 
     lines = content.split('\n')
     i = 0
@@ -285,6 +372,12 @@ def _markdown_to_docx(doc: Document, content: str) -> None:
             i += 1
             continue
 
+        # Handle horizontal rules (---, ***, ___)
+        if re.match(r'^[-*_]{3,}\s*$', line):
+            _add_horizontal_rule(doc)
+            i += 1
+            continue
+
         # Handle markdown tables
         if line.startswith('|'):
             headers, rows, i = _parse_markdown_table(lines, i)
@@ -293,11 +386,11 @@ def _markdown_to_docx(doc: Document, content: str) -> None:
 
         # Handle headers (## Header)
         if line.startswith('### '):
-            para = doc.add_paragraph(line[4:], style='Heading 2')
+            doc.add_paragraph(line[4:], style='Heading 3')
         elif line.startswith('## '):
-            para = doc.add_paragraph(line[3:], style='Heading 2')
+            doc.add_paragraph(line[3:], style='Heading 2')
         elif line.startswith('# '):
-            para = doc.add_paragraph(line[2:], style='Heading 1')
+            doc.add_paragraph(line[2:], style='Heading 1')
 
         # Handle bullet points
         elif line.startswith('- ') or line.startswith('* '):
@@ -515,6 +608,9 @@ def generate_memo_docx(
     # Set up styles
     _setup_styles(doc)
 
+    # Add page numbers to footer
+    _add_page_numbers(doc)
+
     # Add cover page
     _add_cover_page(
         doc,
@@ -539,10 +635,14 @@ def generate_memo_docx(
         except (json.JSONDecodeError, TypeError, AttributeError):
             pass
 
-    # Add each section
+    # Add each section (page break before each for clean layout)
     for i, (key, label) in enumerate(MEMO_SECTIONS, 1):
         content = memo.get(key)
         if content:
+            # Page break before each major section (except the first, which follows TOC)
+            if i > 1:
+                doc.add_page_break()
+
             # Section header
             doc.add_paragraph(f"{i}. {label}", style='Heading 1')
 
@@ -555,9 +655,6 @@ def generate_memo_docx(
                 for _chart_id, buf in chart_image_list:
                     doc.add_picture(buf, width=Inches(5.5))
                     doc.add_paragraph()
-
-            # Add some spacing between sections
-            doc.add_paragraph()
 
     # Save to BytesIO buffer
     buffer = BytesIO()
