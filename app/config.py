@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     monthly_budget_alert: float = float(os.getenv("MONTHLY_BUDGET_ALERT", "45.0"))
 
     # Database
-    database_path: str = os.getenv("DATABASE_PATH", ".tmp/due_diligence.db")
+    database_url: str = os.getenv("DATABASE_URL", "postgresql://noesis:password@localhost:5432/noesis")
     chroma_db_path: str = os.getenv("CHROMA_DB_PATH", ".tmp/chroma_db")
     data_rooms_path: str = os.getenv("DATA_ROOMS_PATH", ".tmp/data_rooms")
 
@@ -55,18 +55,22 @@ class Settings(BaseSettings):
     max_file_size_mb: int = int(os.getenv("MAX_FILE_SIZE_MB", "100"))
 
     # Performance & Scaling Settings
-    parse_timeout_seconds: int = int(os.getenv("PARSE_TIMEOUT_SECONDS", "300"))
+    parse_timeout_seconds: int = int(os.getenv("PARSE_TIMEOUT_SECONDS", "180"))
     max_parse_workers: int = int(os.getenv("MAX_PARSE_WORKERS", "8"))
     max_ocr_pages: int = int(os.getenv("MAX_OCR_PAGES", "50"))
+    ocr_provider: str = os.getenv("OCR_PROVIDER", "google_document_ai")  # "google_document_ai" | "tesseract"
+    google_document_ai_project: str = os.getenv("GOOGLE_DOCUMENT_AI_PROJECT", "")
+    google_document_ai_location: str = os.getenv("GOOGLE_DOCUMENT_AI_LOCATION", "us")
+    google_document_ai_processor_id: str = os.getenv("GOOGLE_DOCUMENT_AI_PROCESSOR_ID", "")
     max_concurrent_jobs: int = int(os.getenv("MAX_CONCURRENT_JOBS", "10"))
     max_file_memory_mb: int = int(os.getenv("MAX_FILE_MEMORY_MB", "500"))
     job_retry_attempts: int = int(os.getenv("JOB_RETRY_ATTEMPTS", "3"))
-    job_poll_interval_seconds: float = float(os.getenv("JOB_POLL_INTERVAL", "1"))
+    job_poll_interval_seconds: float = float(os.getenv("JOB_POLL_INTERVAL", "0.1"))
 
     # Rate Limiting for Google Drive Sync
     drive_sync_max_downloads_per_minute: int = int(os.getenv("DRIVE_SYNC_MAX_DOWNLOADS", "600"))
     drive_sync_max_processing_per_minute: int = int(os.getenv("DRIVE_SYNC_MAX_PROCESSING", "600"))
-    embedding_max_concurrent: int = int(os.getenv("EMBEDDING_MAX_CONCURRENT", "50"))
+    embedding_max_concurrent: int = int(os.getenv("EMBEDDING_MAX_CONCURRENT", "100"))
 
     # OpenAI API Rate Limits (Tier 4: 10K RPM, 10M TPM for text-embedding-3-small)
     openai_tier: int = int(os.getenv("OPENAI_TIER", "4"))
@@ -76,10 +80,10 @@ class Settings(BaseSettings):
     embedding_backoff_multiplier: float = float(os.getenv("EMBEDDING_BACKOFF_MULTIPLIER", "1.5"))
 
     # Worker Pool Auto-Scaling
-    min_workers: int = int(os.getenv("MIN_WORKERS", "3"))
-    max_workers: int = int(os.getenv("MAX_WORKERS", "6"))
-    scale_up_threshold: int = int(os.getenv("SCALE_UP_THRESHOLD", "5"))
-    scale_down_threshold: int = int(os.getenv("SCALE_DOWN_THRESHOLD", "3"))
+    min_workers: int = int(os.getenv("MIN_WORKERS", "8"))
+    max_workers: int = int(os.getenv("MAX_WORKERS", "20"))
+    scale_up_threshold: int = int(os.getenv("SCALE_UP_THRESHOLD", "3"))
+    scale_down_threshold: int = int(os.getenv("SCALE_DOWN_THRESHOLD", "1"))
 
     # Memory Management
     memory_limit_percent: float = float(os.getenv("MEMORY_LIMIT_PERCENT", "80"))
@@ -103,6 +107,13 @@ class Settings(BaseSettings):
     drive_api_rate_limit_per_minute: int = int(os.getenv("DRIVE_API_RATE_LIMIT_PER_MINUTE", "600"))
     oauth_state_ttl_seconds: int = int(os.getenv("OAUTH_STATE_TTL_SECONDS", "600"))
     drive_download_chunk_size: int = int(os.getenv("DRIVE_DOWNLOAD_CHUNK_SIZE", "5242880"))
+
+    # Memo Web Search
+    memo_web_search_enabled: bool = os.getenv("MEMO_WEB_SEARCH_ENABLED", "True").lower() == "true"
+
+    # Q&A Web Search
+    qa_web_search_enabled: bool = os.getenv("QA_WEB_SEARCH_ENABLED", "True").lower() == "true"
+    qa_web_search_max_uses: int = int(os.getenv("QA_WEB_SEARCH_MAX_USES", "10"))
 
     # Sharing Feature
     enable_sharing: bool = os.getenv("ENABLE_SHARING", "True").lower() == "true"
@@ -142,9 +153,9 @@ def validate_settings() -> bool:
     if not settings.openai_api_key:
         errors.append("OPENAI_API_KEY not set")
 
-    # Check database path is writable
-    db_path = Path(settings.database_path)
-    db_path.parent.mkdir(parents=True, exist_ok=True)
+    # Check database URL is set
+    if not settings.database_url:
+        errors.append("DATABASE_URL not set")
 
     # Check chroma db path is writable
     chroma_path = Path(settings.chroma_db_path)

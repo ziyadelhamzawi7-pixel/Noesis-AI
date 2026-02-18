@@ -4,8 +4,8 @@ Generates structured investment memos from data room documents.
 """
 
 import os
+import re
 import time
-import signal
 import threading
 from typing import Dict, List, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,7 +41,7 @@ SECTIONS = [
             "Write a concise Proposed Investment Terms section for a VC investment memo. "
             "Present the key deal terms in a clean markdown table with two columns (Term, Details). "
             "Include rows for: Round Type, Total Round Size, Investment Amount, Post-Money Valuation, "
-            "Investor Ownership %, Investment Vehicle (SAFE/Convertible Note/Priced Round), and Lead Investor if known. "
+            "Investor Ownership %, and Lead Investor if known. "
             "If the analyst provided deal parameters (Investment Amount or Post-Money Valuation), "
             "use those exact values in the table instead of values from the data room. "
             "IMPORTANT: Include exactly ONE row for Post-Money Valuation showing only the single latest number. "
@@ -49,7 +49,9 @@ SECTIONS = [
             "and document recency to identify the most recent round. Do not list prior-round valuations. "
             "Only include terms that are found in the data room documents or provided by the analyst. Keep it factual, no analysis."
         ),
-        "use_opus": False,
+        "use_opus": True,
+        "web_search_max_uses": 0,
+        "web_search_guidance": "",
     },
     {
         "key": "executive_summary",
@@ -63,9 +65,21 @@ SECTIONS = [
             "Write a concise executive summary for a VC investment memo. "
             "Cover: what the company does, the problem it solves, business model, "
             "key traction metrics, and why this could be a compelling investment opportunity. "
-            "Use 2-3 paragraphs."
+            "Use 2-3 paragraphs.\n\n"
+            "Apply critical judgment throughout: if the company's stated metrics seem "
+            "unusually strong, note that and consider whether they are cherry-picked or "
+            "sustainable. If the business model has obvious unit economics challenges, "
+            "mention them alongside the opportunity. Distinguish between proven traction "
+            "and aspirational projections. Where external data is available, use it to "
+            "contextualize the company's claims."
         ),
-        "use_opus": False,
+        "use_opus": True,
+        "web_search_max_uses": 2,
+        "web_search_guidance": (
+            "Search for recent news about {company_name}, any press coverage, and verify "
+            "key claims the company makes about its product and traction. Look for independent "
+            "validation of the metrics they cite."
+        ),
     },
     {
         "key": "market_analysis",
@@ -78,9 +92,25 @@ SECTIONS = [
         "system_prompt": (
             "Write the Market Analysis section of a VC investment memo. "
             "Cover: market size (TAM/SAM/SOM if available), growth trends, "
-            "competitive landscape, key competitors, and the company's competitive advantages."
+            "competitive landscape, key competitors, and the company's competitive advantages.\n\n"
+            "Present market size estimates as your own synthesized assessment, drawing on both company "
+            "materials and independent research. When figures from different sources conflict, present "
+            "a range (e.g., 'The addressable market is estimated at $2-3B') rather than attributing "
+            "each figure to a separate source. Assess whether the SAM is realistic given the company's "
+            "current positioning, geography, and product capabilities. For the competitive landscape, "
+            "identify competitors the company may have omitted and assess whether the stated competitive "
+            "advantages are durable or easily replicated. If growth trends are cited, evaluate whether "
+            "recent data supports or contradicts those projections."
         ),
-        "use_opus": False,
+        "use_opus": True,
+        "web_search_max_uses": 4,
+        "web_search_guidance": (
+            "Search for independent market size estimates for {industry}, recent market research "
+            "reports, growth rate data from research firms (Gartner, IDC, Statista, CB Insights). "
+            "Verify the company's TAM/SAM/SOM claims against external sources. Search for named "
+            "competitors to {company_name} and their recent funding rounds, market share, and "
+            "product updates. Identify competitors the data room may have omitted."
+        ),
     },
     {
         "key": "team_assessment",
@@ -93,9 +123,22 @@ SECTIONS = [
         "system_prompt": (
             "Write the Team Assessment section of a VC investment memo. "
             "Cover: founder backgrounds and relevant experience, team completeness, "
-            "key hires, advisory board, and any concerns about the team."
+            "key hires, advisory board, and any concerns about the team.\n\n"
+            "Assess whether the founders' backgrounds genuinely qualify them to solve this "
+            "specific problem — relevant domain expertise matters more than general prestige. "
+            "Identify gaps in the team: is there a CTO for a deep-tech company? Is there "
+            "sales leadership for a B2B play? Evaluate whether advisors are genuinely engaged "
+            "or merely lending their names. Note any concentration risk if the company depends "
+            "heavily on a single founder."
         ),
-        "use_opus": False,
+        "use_opus": True,
+        "web_search_max_uses": 3,
+        "web_search_guidance": (
+            "Search for the founders' professional backgrounds, previous companies, "
+            "notable achievements, and any public information about key team members of "
+            "{company_name}. Look for previous startup exits, relevant domain expertise, "
+            "and any red flags."
+        ),
     },
     {
         "key": "product_technology",
@@ -108,14 +151,25 @@ SECTIONS = [
         "system_prompt": (
             "Write the Product & Technology section of a VC investment memo. "
             "Cover: product description, technology stack, technical moat/IP, "
-            "product roadmap, and current stage of development."
+            "product roadmap, and current stage of development.\n\n"
+            "Critically assess the technical moat: is the claimed IP genuine and defensible, "
+            "or is this a market-execution play dressed up as a technology play? Evaluate "
+            "whether the product roadmap is realistic given the team size and funding stage. "
+            "If the company claims proprietary technology, consider whether established players "
+            "could replicate it with their existing resources and data advantages."
         ),
-        "use_opus": False,
+        "use_opus": True,
+        "web_search_max_uses": 2,
+        "web_search_guidance": (
+            "Search for competing products and technologies in the {industry} space. "
+            "Look for product reviews, technical comparisons, and any public information "
+            "about {company_name}'s technology differentiation claims."
+        ),
     },
     {
         "key": "financial_analysis",
         "label": "Financial Analysis",
-        "phase": 2,
+        "phase": 1,
         "search_queries": [
             "revenue growth MRR ARR burn rate runway profitability",
             "unit economics CAC LTV gross margin operating expenses",
@@ -125,25 +179,45 @@ SECTIONS = [
             "Write the Financial Analysis section of a VC investment memo. "
             "Cover: current revenue and growth trajectory, burn rate and runway, "
             "unit economics (CAC/LTV), margin profile, funding history, "
-            "and financial projections. Use specific numbers where available."
+            "and financial projections. Use specific numbers where available.\n\n"
+            "Scrutinize the numbers: if revenue growth looks exceptional, examine whether "
+            "it is organic or driven by unsustainable customer acquisition spend. Compare "
+            "unit economics against industry benchmarks — a CAC/LTV ratio that looks good in "
+            "isolation may be poor for the sector. Question whether financial projections are "
+            "grounded in current run-rate data or represent hockey-stick optimism. Note any "
+            "discrepancies between different documents in the data room (e.g., pitch deck "
+            "numbers vs. financial model numbers). Assess runway implications honestly."
         ),
         "use_opus": True,
+        "web_search_max_uses": 3,
+        "web_search_guidance": (
+            "Search for industry benchmarks for key metrics: typical CAC, LTV, gross margins, "
+            "burn rates, and growth rates for {industry} companies at this stage. Find comparable "
+            "company financial data to benchmark {company_name}'s performance."
+        ),
     },
     {
         "key": "valuation_analysis",
         "label": "Valuation Analysis",
-        "phase": 2,
+        "phase": 1,
         "search_queries": [
             "valuation revenue multiple ARR MRR growth rate comparable companies funding round",
             "financial projections cash flow forecast exit potential market multiples",
         ],
         "system_prompt": None,  # Dynamic - built based on selected valuation methods
-        "use_opus": False,
+        "use_opus": True,
+        "web_search_max_uses": 5,
+        "web_search_guidance": (
+            "Search for comparable company valuations in {industry}, recent funding rounds "
+            "at similar stages, public market multiples (EV/Revenue, EV/ARR) for comparable "
+            "companies, and recent M&A transactions in this sector. Look for data from "
+            "PitchBook, Crunchbase, or public filings to ground the valuation analysis."
+        ),
     },
     {
         "key": "risks_concerns",
         "label": "Risks & Concerns",
-        "phase": 2,
+        "phase": 1,
         "search_queries": [
             "risks challenges concerns regulatory competition threats",
             "weaknesses dependencies concentration customer churn",
@@ -152,26 +226,40 @@ SECTIONS = [
             "Write the Risks & Concerns section of a VC investment memo. "
             "Cover: key risks (market, execution, technical, regulatory), "
             "dependencies, concentration risks, and any red flags identified. "
-            "Be thorough and honest."
+            "Be thorough and honest.\n\n"
+            "Go beyond the obvious: identify risks the company itself may not have flagged. "
+            "Consider customer concentration, key-person dependency, regulatory trajectory, "
+            "competitive response risk, and technology obsolescence. For each risk, assess "
+            "both likelihood and potential severity. If the data room is notably silent on "
+            "certain risk categories (e.g., no mention of regulatory environment in a fintech), "
+            "flag that gap explicitly."
         ),
-        "use_opus": False,
+        "use_opus": True,
+        "web_search_max_uses": 3,
+        "web_search_guidance": (
+            "Search for any negative press, regulatory challenges, lawsuits, or controversies "
+            "related to {company_name} or the {industry} industry. Look for emerging competitive "
+            "threats, regulatory changes, and market headwinds that could affect this investment."
+        ),
     },
     {
         "key": "outcome_scenario_analysis",
         "label": "Outcome Scenario Analysis",
-        "phase": 3,
+        "phase": 2,
         "search_queries": [
             "revenue growth MRR ARR valuation exit potential IPO acquisition",
             "funding raised valuation cap table investors round terms",
             "market size TAM total addressable market opportunity upside",
         ],
         "system_prompt": (
-            "Write an Outcome Scenario Analysis section for a VC investment memo. "
-            "Produce a single markdown table modeling 6 potential outcomes. "
-            "The table must have these columns: Outcome, Exit Value, Exit Date, Gross Proceeds, Mult., IRR.\n\n"
-            "In the **Outcome** column, put the scenario name in bold followed by a period, "
-            "then a 2-3 sentence description of what happens in that scenario — all within the same cell. "
-            "Use <br> tags for line breaks within the cell.\n\n"
+            "Write an Outcome Scenario Analysis section for a VC investment memo.\n\n"
+            "Structure the output as follows:\n\n"
+            "1. A brief introductory paragraph (2-3 sentences) framing the analysis.\n\n"
+            "2. A compact markdown table with these columns: Scenario, Exit Value, Exit Date, Gross Proceeds, Mult., IRR.\n"
+            "   The Scenario column should contain ONLY the scenario name in bold (e.g., **Wipeout**). "
+            "   Keep every cell short. Do NOT put descriptions, line breaks, or <br> tags inside the table.\n\n"
+            "3. After the table, a ### Scenario Details subsection with a paragraph for each scenario. "
+            "   Format each as: **Scenario Name.** 2-3 sentences describing what happens.\n\n"
             "The 6 scenarios (from worst to best) are:\n"
             "1. **Wipeout** — Company fails, total loss.\n"
             "2. **No Growth** — Stagnates, sold at a loss or small return.\n"
@@ -182,14 +270,24 @@ SECTIONS = [
             "Base exit values, multiples, and IRRs on the company's current metrics, "
             "market size, competitive position, and funding stage found in the data room. "
             "Use the investment terms from the Proposed Investment Terms section as the basis "
-            "for calculating ownership, proceeds, and returns."
+            "for calculating ownership, proceeds, and returns.\n\n"
+            "Ground your scenarios in reality: the 'Home Run' scenario should be plausible, "
+            "not fantastical. Base exit multiples on actual comparable transactions where possible. "
+            "If the company's sector has few large exits historically, the probability weighting "
+            "should reflect that. Avoid anchoring all scenarios to the company's own projections."
         ),
         "use_opus": True,
+        "web_search_max_uses": 2,
+        "web_search_guidance": (
+            "Search for recent exit multiples in {industry}, comparable M&A transactions, "
+            "and IPO valuations for similar companies. Use this data to calibrate realistic "
+            "exit scenarios."
+        ),
     },
     {
         "key": "investment_recommendation",
         "label": "Investment Recommendation",
-        "phase": 3,
+        "phase": 2,
         "search_queries": [
             "investment opportunity valuation terms deal structure",
             "company strengths growth potential return thesis",
@@ -199,64 +297,22 @@ SECTIONS = [
             "Synthesize all the analysis from prior sections into a clear recommendation. "
             "Cover: investment thesis, key strengths, key concerns, "
             "and overall recommendation (invest / pass / more info needed). "
-            "Do NOT include a 'Suggested Next Steps' subsection."
+            "Do NOT include a 'Suggested Next Steps' subsection.\n\n"
+            "Be decisive but intellectually honest: if the evidence is mixed, say so. "
+            "Weigh the strength of the team and market opportunity against the valuation "
+            "and execution risks. If recommending investment, articulate clearly what must "
+            "go right. If recommending a pass, explain what would change your mind. "
+            "Avoid generic bullish language — ground every claim in specific evidence from "
+            "the analysis."
         ),
         "use_opus": True,
+        "web_search_max_uses": 1,
+        "web_search_guidance": (
+            "If needed, verify any final claims or do a quick check on {company_name}'s "
+            "most recent news or developments that could affect the investment decision."
+        ),
     },
 ]
-
-class SonnetTokenTracker:
-    """
-    Thread-safe tracker for Sonnet API input token usage within a rolling
-    60-second window. Calculates the minimum cooldown needed before making
-    additional Sonnet calls without exceeding the rate limit.
-    """
-
-    WINDOW_SECONDS = 60
-    RATE_LIMIT = 30_000          # input tokens per minute
-    SAFETY_MARGIN_SECONDS = 5
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._calls: List[Tuple[float, int]] = []
-
-    def record(self, input_tokens: int) -> None:
-        """Record a Sonnet API call that just completed."""
-        with self._lock:
-            self._calls.append((time.time(), input_tokens))
-
-    def required_wait(self) -> float:
-        """
-        Return the number of seconds to sleep before the next Sonnet call.
-        Prunes expired entries, then checks if the rolling window has capacity.
-        """
-        with self._lock:
-            now = time.time()
-            cutoff = now - self.WINDOW_SECONDS
-            self._calls = [(ts, tok) for ts, tok in self._calls if ts > cutoff]
-
-            if not self._calls:
-                return 0.0
-
-            total_in_window = sum(tok for _, tok in self._calls)
-            if total_in_window < self.RATE_LIMIT:
-                return 0.0
-
-            # Find the earliest call whose expiry brings us under the limit
-            calls_sorted = sorted(self._calls, key=lambda x: x[0])
-            tokens_to_shed = total_in_window - self.RATE_LIMIT
-            shed = 0
-            wait_until = now
-
-            for ts, tok in calls_sorted:
-                shed += tok
-                wait_until = ts + self.WINDOW_SECONDS
-                if shed >= tokens_to_shed:
-                    break
-
-            wait = wait_until - now + self.SAFETY_MARGIN_SECONDS
-            return max(wait, 0.0)
-
 
 # Model pricing (per 1M tokens)
 PRICING = {
@@ -506,7 +562,6 @@ class MemoGenerator:
         self.total_tokens = 0
         self.total_cost = 0.0
         self._stats_lock = threading.Lock()
-        self._sonnet_tracker = SonnetTokenTracker()
 
     def _get_client(self) -> Anthropic:
         """Get a thread-local Anthropic client (httpx.Client is not thread-safe)."""
@@ -514,14 +569,72 @@ class MemoGenerator:
             self._thread_local.client = Anthropic(api_key=self._api_key)
         return self._thread_local.client
 
+    def _extract_company_context(self) -> Dict[str, str]:
+        """
+        Extract company name, industry, and key details from data room documents
+        via a quick semantic search + Haiku call. Used to target web searches.
+        """
+        try:
+            chunks = semantic_search(
+                query="company name overview industry sector product",
+                data_room_id=self.data_room_id,
+                top_k=5,
+            )
+        except Exception as e:
+            logger.warning(f"Company context search failed: {e}")
+            return {"company_name": "the company", "industry": "this industry"}
+
+        if not chunks:
+            return {"company_name": "the company", "industry": "this industry"}
+
+        context = "\n".join(c["chunk_text"][:300] for c in chunks[:5])
+
+        prompt = (
+            "From the following data room excerpts, extract:\n"
+            "- company_name: The company's name\n"
+            "- industry: The industry/sector (e.g., 'fintech', 'healthtech', 'B2B SaaS')\n"
+            "- competitors: Comma-separated list of named competitors (if mentioned)\n"
+            "- geography: Primary market geography\n\n"
+            "Respond ONLY in this format:\n"
+            "company_name: <value>\n"
+            "industry: <value>\n"
+            "competitors: <value>\n"
+            "geography: <value>\n\n"
+            f"Excerpts:\n{context}"
+        )
+
+        haiku_model = os.getenv("CLAUDE_HAIKU_MODEL", "claude-3-5-haiku-20241022")
+        try:
+            response = self._get_client().messages.create(
+                model=haiku_model,
+                max_tokens=200,
+                temperature=0,
+                timeout=15,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            text = response.content[0].text
+            result = {}
+            for line in text.strip().split("\n"):
+                if ":" in line:
+                    key, val = line.split(":", 1)
+                    result[key.strip().lower().replace(" ", "_")] = val.strip()
+            return {
+                "company_name": result.get("company_name", "the company"),
+                "industry": result.get("industry", "this industry"),
+                "competitors": result.get("competitors", ""),
+                "geography": result.get("geography", ""),
+            }
+        except Exception as e:
+            logger.warning(f"Company context extraction failed: {e}")
+            return {"company_name": "the company", "industry": "this industry"}
+
     def generate_memo(self, memo_id: str, save_section_fn=None, update_status_fn=None, deal_params: Optional[Dict[str, Any]] = None, check_cancelled_fn=None, save_metadata_fn=None):
         """
         Generate memo sections in parallel phases with section-level error recovery.
 
         Phases:
-            1 (parallel): proposed_investment_terms, executive_summary, market_analysis, team_assessment, product_technology
-            2 (parallel): financial_analysis, valuation_analysis, risks_concerns
-            3 (sequential): outcome_scenario_analysis, investment_recommendation
+            1: All analysis sections run concurrently (8 sections)
+            2: Synthesis sections that need phase-1 context (outcome_scenario_analysis, investment_recommendation)
 
         Args:
             memo_id: Memo record ID
@@ -535,7 +648,12 @@ class MemoGenerator:
         completed_sections: Dict[str, str] = {}
         failed_sections: List[str] = []
 
-        for phase in [1, 2, 3]:
+        # Extract company context for targeted web searches
+        logger.info("Extracting company context for web search targeting...")
+        self._company_context = self._extract_company_context()
+        logger.info(f"Company context: {self._company_context}")
+
+        for phase in [1, 2]:
             # Check if cancelled before starting each phase
             if check_cancelled_fn and check_cancelled_fn(memo_id):
                 logger.info(f"Memo {memo_id} cancelled by user — stopping generation")
@@ -550,67 +668,19 @@ class MemoGenerator:
             # Snapshot prior sections so parallel threads share the same context
             prior_snapshot = dict(completed_sections)
 
-            # Split into Opus and Sonnet sections — they have separate API rate limits
-            opus_sections = [s for s in phase_sections if s.get("use_opus")]
-            sonnet_sections = [s for s in phase_sections if not s.get("use_opus")]
-
-            # Start Opus sections in background immediately (separate rate limit)
-            opus_futures = {}
-            executor = ThreadPoolExecutor(max_workers=max(len(opus_sections), 1)) if opus_sections else None
+            # Run all sections in the phase concurrently
+            futures = {}
+            executor = ThreadPoolExecutor(max_workers=len(phase_sections))
             try:
-                for section_def in opus_sections:
-                    logger.info(f"Generating section (Opus, background): {section_def['label']}")
+                for section_def in phase_sections:
+                    logger.info(f"Generating section (parallel): {section_def['label']}")
                     future = executor.submit(
                         self._generate_section, section_def, prior_snapshot, deal_params
                     )
-                    opus_futures[future] = section_def
+                    futures[future] = section_def
 
-                # Smart cooldown: only wait if this phase has Sonnet sections
-                # AND there are recent Sonnet tokens in the rolling window.
-                if phase > 1 and sonnet_sections:
-                    wait = self._sonnet_tracker.required_wait()
-                    if wait > 0:
-                        logger.info(f"Rate limit cooldown before phase {phase} Sonnet sections ({wait:.0f}s)")
-                        time.sleep(wait)
-                    else:
-                        logger.info(f"No cooldown needed before phase {phase} — Sonnet token window has capacity")
-
-                # Run Sonnet sections sequentially (rate limit too low for parallel)
-                for section_def in sonnet_sections:
-                    # Check cancellation between sequential sections
-                    if check_cancelled_fn and check_cancelled_fn(memo_id):
-                        logger.info(f"Memo {memo_id} cancelled by user — stopping generation")
-                        if update_status_fn:
-                            full_memo = self._compile_full_memo(completed_sections) if completed_sections else None
-                            update_status_fn(memo_id, "cancelled", full_memo)
-                        return completed_sections
-
-                    key = section_def["key"]
-                    label = section_def["label"]
-                    logger.info(f"Generating section: {label}")
-                    try:
-                        content, tokens, cost = self._generate_section(
-                            section_def, prior_snapshot, deal_params
-                        )
-                        completed_sections[key] = content
-                        if save_section_fn:
-                            save_section_fn(memo_id, key, content, tokens, cost)
-                        logger.success(f"Completed section: {label} ({tokens} tokens, ${cost:.4f})")
-                    except Exception as e:
-                        error_msg = str(e)
-                        logger.error(f"Section '{label}' failed: {error_msg}")
-                        failed_sections.append(key)
-                        placeholder = f"*Section generation failed: {error_msg}. Please retry memo generation.*"
-                        completed_sections[key] = placeholder
-                        if save_section_fn:
-                            try:
-                                save_section_fn(memo_id, key, placeholder, 0, 0.0)
-                            except Exception:
-                                pass
-
-                # Wait for background Opus sections to complete
-                for future in as_completed(opus_futures):
-                    section_def = opus_futures[future]
+                for future in as_completed(futures):
+                    section_def = futures[future]
                     key = section_def["key"]
                     label = section_def["label"]
                     try:
@@ -631,8 +701,7 @@ class MemoGenerator:
                             except Exception:
                                 pass
             finally:
-                if executor:
-                    executor.shutdown(wait=False)
+                executor.shutdown(wait=False)
 
         # Check if cancelled during the last phase before overwriting status
         if check_cancelled_fn and check_cancelled_fn(memo_id):
@@ -683,12 +752,13 @@ class MemoGenerator:
         model: str,
         max_tokens: int = 4096,
         max_retries: int = 3,
-        timeout_seconds: int = 120
-    ) -> Tuple[str, int, int]:
+        timeout_seconds: int = 120,
+        tools: Optional[List[Dict[str, Any]]] = None,
+    ) -> Tuple[str, int, int, int]:
         """
         Call Claude API with retry logic, response validation, and timeout.
 
-        Returns: (content_text, input_tokens, output_tokens)
+        Returns: (content_text, input_tokens, output_tokens, web_search_requests)
         """
         last_error = None
 
@@ -696,39 +766,79 @@ class MemoGenerator:
             try:
                 start = time.time()
 
-                response = self._get_client().messages.create(
-                    model=model,
-                    max_tokens=max_tokens,
-                    temperature=0.3,
-                    timeout=timeout_seconds,
-                    messages=[{"role": "user", "content": prompt}],
-                )
+                kwargs = {
+                    "model": model,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.3,
+                    "timeout": timeout_seconds,
+                    "messages": [{"role": "user", "content": prompt}],
+                }
+                if tools:
+                    kwargs["tools"] = tools
+
+                response = self._get_client().messages.create(**kwargs)
+
+                total_input = response.usage.input_tokens
+                total_output = response.usage.output_tokens
+                all_content = list(response.content)
+
+                # Handle pause_turn: Claude paused mid-turn (e.g. during web search)
+                # Feed partial response back to let it finish
+                if response.stop_reason == "pause_turn":
+                    continuation_messages = [
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": response.content},
+                    ]
+                    kwargs["messages"] = continuation_messages
+                    response2 = self._get_client().messages.create(**kwargs)
+                    all_content.extend(response2.content)
+                    total_input += response2.usage.input_tokens
+                    total_output += response2.usage.output_tokens
 
                 elapsed = time.time() - start
 
-                # Validate response structure
-                if not response.content:
-                    raise ValueError("Empty response.content from Claude API")
+                # Extract text from content blocks, skipping narration before/between tool calls.
+                # Web search responses interleave text + server_tool_use + web_search_tool_result blocks.
+                # Only keep text blocks after the last tool block (the final analysis).
+                if tools:
+                    last_tool_idx = -1
+                    for i, block in enumerate(all_content):
+                        if not hasattr(block, 'text'):
+                            last_tool_idx = i
+                    text_parts = []
+                    for i, block in enumerate(all_content):
+                        if hasattr(block, 'text') and i > last_tool_idx:
+                            text_parts.append(block.text)
+                    content = "".join(text_parts)
+                else:
+                    # Original path: single text block
+                    if not all_content:
+                        raise ValueError("Empty response.content from Claude API")
+                    first_block = all_content[0]
+                    if not hasattr(first_block, 'text'):
+                        raise ValueError(f"Unexpected response block type: {type(first_block)}")
+                    content = first_block.text
 
-                if len(response.content) == 0:
-                    raise ValueError("response.content is empty list")
-
-                first_block = response.content[0]
-                if not hasattr(first_block, 'text'):
-                    raise ValueError(f"Unexpected response block type: {type(first_block)}")
-
-                content = first_block.text
                 if not content or not content.strip():
                     raise ValueError("Response text is empty or whitespace")
 
-                logger.debug(f"Claude API call succeeded in {elapsed:.1f}s (attempt {attempt + 1})")
+                # Extract web search request count from usage
+                web_searches = 0
+                server_tool_use = getattr(response.usage, 'server_tool_use', None)
+                if server_tool_use:
+                    web_searches = getattr(server_tool_use, 'web_search_requests', 0)
 
-                return content, response.usage.input_tokens, response.usage.output_tokens
+                logger.debug(
+                    f"Claude API call succeeded in {elapsed:.1f}s (attempt {attempt + 1})"
+                    + (f", {web_searches} web searches" if web_searches else "")
+                )
+
+                return content, total_input, total_output, web_searches
 
             except RateLimitError as e:
                 last_error = e
                 if attempt < max_retries - 1:
-                    wait_time = 15 + (attempt * 15)  # 15, 30 seconds (rate limits are per-minute)
+                    wait_time = 30 + (attempt * 20)  # 30, 50 seconds (rate limits are per-minute)
                     logger.warning(f"Rate limit hit, retrying in {wait_time}s (attempt {attempt + 1}/{max_retries}): {e}")
                     time.sleep(wait_time)
                 else:
@@ -857,13 +967,58 @@ class MemoGenerator:
         if section_def["key"] == "valuation_analysis":
             system_prompt = self._build_valuation_prompt(deal_params)
 
-        # 6. Build prompt
-        prompt = f"""{system_prompt}
+        # 6. Build web search tool config (if enabled for this section)
+        web_search_max_uses = section_def.get("web_search_max_uses", 0)
+        tools = None
+        search_instruction = ""
 
-You are writing an investment memo for a venture capital firm based on data room documents.
-Be professional, analytical, and data-driven.
-Do NOT include source citations or references to the uploaded data room documents unless the user explicitly asks for them.
-If you use any information from outside the uploaded documents (general industry knowledge, market benchmarks, etc.), clearly note it as an external source.
+        # Check global config for web search toggle
+        web_search_globally_enabled = True
+        try:
+            from app.config import settings as app_settings
+            web_search_globally_enabled = app_settings.memo_web_search_enabled
+        except ImportError:
+            pass
+
+        if web_search_max_uses > 0 and web_search_globally_enabled:
+            tools = [{
+                "type": "web_search_20250305",
+                "name": "web_search",
+                "max_uses": web_search_max_uses,
+            }]
+
+            # Template company context into web search guidance
+            web_search_guidance = section_def.get("web_search_guidance", "")
+            if web_search_guidance and hasattr(self, '_company_context'):
+                try:
+                    guidance = web_search_guidance.format(**self._company_context)
+                except KeyError:
+                    guidance = web_search_guidance
+                search_instruction = (
+                    f"\n\n**Web Research Instructions**: You have access to web search. {guidance}\n"
+                    "When you find external data, weave it naturally into your analysis. "
+                    "Do not create a separate 'External Sources' subsection.\n"
+                    "Do not write any preamble or narration about your search process. "
+                    "Do not announce what you will search for. Write only the final analysis.\n"
+                )
+
+        # 7. Build prompt
+        prompt = f"""{system_prompt}
+{search_instruction}
+You are writing an investment memo for a venture capital firm based on data room documents and external research.
+Be professional, analytical, and data-driven. Apply critical thinking throughout: challenge assumptions,
+cross-reference claims against external data, and identify gaps or omissions in the available information.
+IMPORTANT: Do not use em dashes or en dashes in your writing. Use commas, colons, semicolons, or separate sentences instead.
+Do NOT use LaTeX commands or academic formatting artifacts such as \\cite, \\index, \\ref, \\textbf, \\emph, or any backslash commands. Write in plain markdown only.
+Write in impersonal third-person voice throughout. Do not use first person (I, we, my, our) or address the reader (you, your). Do not narrate your analysis process (e.g., "I'll extrapolate," "Let me analyze," "Looking at the data"). Do not use filler phrases like "It's worth noting," "It's important to consider," or "Interestingly." State conclusions directly.
+Do NOT refer to the company by its sector label alone (e.g., "the agritech," "the fintech," "the healthtech"). Always use the company's actual name or "the company" instead.
+Present all data and analysis as your own independent assessment. Never reference "the data room," "the pitch deck," or "the company's documents" as sources in the prose. When company-provided figures and external research differ, synthesize them into a range rather than attributing each separately.
+This memo is read as a single continuous document. The reader has already seen all prior sections.
+Do NOT re-introduce the company (e.g., avoid "CompanyName, a [industry] company" if the Executive Summary already covered this).
+Do NOT restate metrics, figures, or facts that were the primary focus of a prior section. Instead, reference them briefly only when directly relevant to your analysis.
+Each section should add new insight, not recap what came before. Only repeat a data point when it is essential context for a new argument being made in this section.
+Do NOT reference "the data room," "the pitch deck," or "uploaded documents" in your writing.
+If you use information from outside the company's own materials (general industry knowledge, market benchmarks, web research), clearly note it as an external source.
 {deal_context}
 
 Context from data room documents:
@@ -873,36 +1028,49 @@ Context from data room documents:
 
 Write the "{section_def['label']}" section now."""
 
-        # 7. Call Claude with retry logic (Opus gets more time, fewer retries since sections run in parallel)
+        # 8. Call Claude with retry logic
         model = self.opus_model if section_def.get("use_opus") else self.default_model
-        timeout = 180 if section_def.get("use_opus") else 90
+        # Increase timeouts when web search is enabled (each search adds 1-3s latency)
+        if tools:
+            timeout = 240 if section_def.get("use_opus") else 150
+        else:
+            timeout = 180 if section_def.get("use_opus") else 90
+
+        max_tokens = 5000 if tools else 4096
 
         start = time.time()
-        content, input_tokens, output_tokens = self._call_claude_with_retry(
+        content, input_tokens, output_tokens, web_searches = self._call_claude_with_retry(
             prompt=prompt,
             model=model,
-            max_tokens=4096,
+            max_tokens=max_tokens,
             max_retries=3,
-            timeout_seconds=timeout
+            timeout_seconds=timeout,
+            tools=tools,
         )
         elapsed = time.time() - start
 
-        # Track Sonnet token usage for rate-limit-aware cooldowns
-        if not section_def.get("use_opus"):
-            self._sonnet_tracker.record(input_tokens)
-
         total_tokens = input_tokens + output_tokens
 
+        # Cost = token cost + web search cost ($10 per 1000 searches)
         pricing = PRICING.get(model, {"input": 3.0, "output": 15.0})
-        cost = (input_tokens * pricing["input"] / 1_000_000) + (
+        token_cost = (input_tokens * pricing["input"] / 1_000_000) + (
             output_tokens * pricing["output"] / 1_000_000
         )
+        web_search_cost = web_searches * 0.01
+        cost = token_cost + web_search_cost
 
         with self._stats_lock:
             self.total_tokens += total_tokens
             self.total_cost += cost
 
-        logger.debug(f"Section generated in {elapsed:.1f}s, {total_tokens} tokens, ${cost:.4f}")
+        logger.debug(
+            f"Section generated in {elapsed:.1f}s, {total_tokens} tokens, ${cost:.4f}"
+            + (f", {web_searches} web searches" if web_searches else "")
+        )
+
+        # Strip LaTeX artifacts that Claude occasionally produces
+        content = re.sub(r'\\(?:cite|index|ref|label|textbf|textit|emph)\{[^}]*\}', '', content)
+        content = re.sub(r'\\(?:cite|index|ref|label)\b', '', content)
 
         return content, total_tokens, cost
 
@@ -952,9 +1120,9 @@ Write the "{section_def['label']}" section now."""
 
         single_method = len(methods) == 1
         conclusion = (
-            "Conclude with your recommended valuation range and whether the proposed terms are reasonable."
+            "Conclude with the recommended valuation range and whether the proposed terms are reasonable."
             if single_method else
-            "Conclude with a summary table comparing valuations from each method, your recommended range, and whether the proposed terms are reasonable."
+            "Conclude with a summary table comparing valuations from each method, the recommended range, and whether the proposed terms are reasonable."
         )
 
         return f"""Write the Valuation Analysis section of a VC investment memo.
@@ -963,7 +1131,8 @@ Perform a valuation analysis using the following method(s):
 For each method, show key assumptions and provide a valuation range (low / mid / high).
 
 {conclusion}
-"""
+
+Apply valuation skepticism: if the proposed valuation implies multiples significantly above comparable companies, explain why that premium is or is not justified. Consider whether the company's growth rate and margin profile warrant the asked price. If comparable data is limited, acknowledge the uncertainty rather than forcing a conclusion. When using web-sourced comparables, note the date and relevance of each data point."""
 
     def _compile_full_memo(self, sections: Dict[str, str]) -> str:
         """Compile all sections into a single markdown document."""
