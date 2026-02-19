@@ -20,6 +20,12 @@ from loguru import logger
 
 from app.config import settings
 
+
+class TokenRevokedError(Exception):
+    """Raised when a Google OAuth refresh token has been revoked or expired."""
+    pass
+
+
 # OAuth 2.0 scopes for Google Drive
 SCOPES = [
     'https://www.googleapis.com/auth/drive.readonly',  # Read-only access to Drive
@@ -170,7 +176,8 @@ class GoogleOAuthService:
             refresh_token: Google refresh token
 
         Returns:
-            Dict with new access token and expiry, or None if failed
+            Dict with new access token and expiry, or None if failed.
+            Raises TokenRevokedError if the refresh token has been revoked/expired.
         """
         try:
             credentials = Credentials(
@@ -196,6 +203,10 @@ class GoogleOAuthService:
             }
 
         except Exception as e:
+            error_str = str(e).lower()
+            if 'invalid_grant' in error_str or 'revoked' in error_str:
+                logger.warning(f"Token revoked or expired — user must re-authenticate: {e}")
+                raise TokenRevokedError(str(e))
             logger.error(f"Failed to refresh token: {e}")
             return None
 

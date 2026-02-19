@@ -24,7 +24,7 @@ from loguru import logger
 
 from app import database as db
 from app.google_drive import GoogleDriveService, SUPPORTED_MIME_TYPES
-from app.google_oauth import google_oauth_service
+from app.google_oauth import google_oauth_service, TokenRevokedError
 from app.config import settings
 from app.utils import RateLimiter, check_memory_available, get_available_memory_mb
 
@@ -339,7 +339,15 @@ class SyncService:
             with refresh_lock:
                 # Re-check after acquiring lock — another thread may have already refreshed
                 if self._token_needs_refresh(folder.get('token_expires_at')):
-                    new_tokens = google_oauth_service.refresh_access_token(refresh_token)
+                    try:
+                        new_tokens = google_oauth_service.refresh_access_token(refresh_token)
+                    except TokenRevokedError:
+                        # Token permanently invalid — clear stored tokens so user is prompted to re-auth
+                        db.update_user_tokens(user_id, access_token="", refresh_token="")
+                        raise Exception(
+                            "Google authorization expired — please disconnect and reconnect "
+                            "your Drive folder, or log out and log back in."
+                        )
                     if new_tokens:
                         access_token = new_tokens['access_token']
                         expires_at = new_tokens.get('expires_at')

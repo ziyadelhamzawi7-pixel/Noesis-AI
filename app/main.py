@@ -58,7 +58,7 @@ from app.models import (
     DataRoomMember,
 )
 from app import database as db
-from app.google_oauth import google_oauth_service
+from app.google_oauth import google_oauth_service, TokenRevokedError
 from app.google_drive import GoogleDriveService
 from app.sync_service import sync_service
 from app.email_service import send_invite_email
@@ -3884,10 +3884,38 @@ def get_drive_service(user_id: str) -> GoogleDriveService:
     if not user.get('access_token'):
         raise HTTPException(status_code=401, detail="User not authenticated with Google")
 
+    # Pre-check: if token is expired, try refreshing before creating Drive service
+    refresh_token = user.get('refresh_token')
+    access_token = user['access_token']
+    expires_at = user.get('token_expires_at')
+
+    if expires_at:
+        try:
+            from datetime import datetime, timedelta
+            expiry = datetime.fromisoformat(str(expires_at).replace('Z', '+00:00'))
+            if expiry <= datetime.now(expiry.tzinfo) + timedelta(minutes=5):
+                if refresh_token:
+                    try:
+                        new_tokens = google_oauth_service.refresh_access_token(refresh_token)
+                        if new_tokens:
+                            access_token = new_tokens['access_token']
+                            expires_at = new_tokens.get('expires_at')
+                            db.update_user_tokens(user_id, access_token=access_token, token_expires_at=expires_at)
+                    except TokenRevokedError:
+                        db.update_user_tokens(user_id, access_token="", refresh_token="")
+                        raise HTTPException(
+                            status_code=401,
+                            detail="Google authorization expired. Please log in again."
+                        )
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # If expiry parsing fails, let Drive service handle it
+
     return GoogleDriveService.from_tokens(
-        access_token=user['access_token'],
-        refresh_token=user.get('refresh_token'),
-        expires_at=user.get('token_expires_at')
+        access_token=access_token,
+        refresh_token=refresh_token,
+        expires_at=expires_at
     )
 
 

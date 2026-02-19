@@ -185,6 +185,11 @@ export default function ChatInterface() {
       if (initialLoad) {
         loadHistory();
         loadDocuments();
+        // Skip animation on remount — jump straight to actual progress
+        // so the counter doesn't flash "0/N" before animating up
+        if (status.parsed_documents > 0) {
+          setDisplayedParsed(status.parsed_documents);
+        }
       }
 
       // Enforce monotonic progress — never let progress_percent decrease

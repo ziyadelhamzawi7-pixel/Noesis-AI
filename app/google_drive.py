@@ -85,7 +85,14 @@ class GoogleDriveService:
         if self.credentials.expired or not self.credentials.token:
             with self._credentials_lock:
                 if self.credentials.expired or not self.credentials.token:
-                    self.credentials.refresh(GoogleAuthRequest())
+                    try:
+                        self.credentials.refresh(GoogleAuthRequest())
+                    except Exception as e:
+                        error_str = str(e).lower()
+                        if 'invalid_grant' in error_str or 'revoked' in error_str:
+                            from app.google_oauth import TokenRevokedError
+                            raise TokenRevokedError(str(e))
+                        raise
 
     @classmethod
     def from_tokens(
