@@ -658,7 +658,7 @@ def get_data_room_members(data_room_id: str) -> List[Dict[str, Any]]:
 
 def get_user_data_rooms(user_id: str, user_email: str, limit: int = 50) -> List[Dict[str, Any]]:
     """
-    Get data rooms accessible to a user (owned + shared + legacy).
+    Get data rooms accessible to a user (owned + shared).
 
     Args:
         user_id: User ID
@@ -673,7 +673,6 @@ def get_user_data_rooms(user_id: str, user_email: str, limit: int = 50) -> List[
         cursor.execute("""
             SELECT dr.*,
                 CASE
-                    WHEN dr.user_id IS NULL THEN 'legacy'
                     WHEN dr.user_id = %s THEN 'owner'
                     ELSE 'member'
                 END as user_role
@@ -681,8 +680,7 @@ def get_user_data_rooms(user_id: str, user_email: str, limit: int = 50) -> List[
             LEFT JOIN data_room_members drm ON dr.id = drm.data_room_id
                 AND (drm.user_id = %s OR drm.invited_email = %s)
                 AND drm.status = 'accepted'
-            WHERE dr.user_id IS NULL
-                OR dr.user_id = %s
+            WHERE dr.user_id = %s
                 OR drm.id IS NOT NULL
             GROUP BY dr.id
             ORDER BY dr.created_at DESC
@@ -721,9 +719,9 @@ def check_data_room_access(
 
         room_owner = room['user_id'] if room else None
 
-        # Legacy room (no owner) - accessible to all
+        # Unowned rooms are not accessible (no legacy sharing)
         if room_owner is None:
-            return 'legacy'
+            return None
 
         # Direct owner
         if user_id and room_owner == user_id:
