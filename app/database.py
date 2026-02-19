@@ -2712,6 +2712,21 @@ def count_synced_files_by_status(connected_folder_id: str, sync_status: str = No
         return cursor.fetchone()['cnt']
 
 
+def count_failed_synced_files_batch(folder_ids: List[str]) -> Dict[str, int]:
+    """Count failed synced files for multiple folders in a single query."""
+    if not folder_ids:
+        return {}
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT connected_folder_id, COUNT(*) as cnt
+            FROM synced_files
+            WHERE connected_folder_id = ANY(%s) AND sync_status = 'failed'
+            GROUP BY connected_folder_id
+        """, (folder_ids,))
+        return {row['connected_folder_id']: row['cnt'] for row in cursor.fetchall()}
+
+
 def count_processed_synced_files(connected_folder_id: str) -> int:
     """Count processed synced files (complete + failed) for a folder."""
     with get_db_connection() as conn:

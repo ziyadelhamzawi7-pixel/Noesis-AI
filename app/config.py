@@ -70,7 +70,7 @@ def _detect_system_resources() -> dict:
         embedding_max_concurrent = 25
 
     # DB pool should accommodate: max_workers × 3 (write threads per worker) + headroom
-    db_pool_size = max(10, max_workers * 3 + 5)
+    db_pool_size = max(15, max_workers * 3 + 10)
 
     return {
         "total_ram_mb": int(total_ram_mb),

@@ -2485,11 +2485,10 @@ def delete_data_room_endpoint(
 
         # Delete ChromaDB collection
         try:
-            from tools.index_to_vectordb import get_chroma_client
-            client = get_chroma_client()
-            collection_name = f"data_room_{data_room_id}"
-            client.delete_collection(collection_name)
-            logger.info(f"Deleted ChromaDB collection: {collection_name}")
+            from tools.index_to_vectordb import VectorDBIndexer
+            indexer = VectorDBIndexer()
+            indexer.delete_collection(data_room_id)
+            logger.info(f"Deleted ChromaDB collection for data room: {data_room_id}")
         except Exception as e:
             logger.warning(f"Failed to delete ChromaDB collection: {e}")
 
@@ -4687,10 +4686,12 @@ def list_connected_folders(user_id: str):
     try:
         folders = db.get_connected_folders_by_user(user_id)
 
-        # Build folder list with failed_files count for each
+        # Batch: get failed counts for all folders in one query (avoids N+1)
+        folder_ids = [f['id'] for f in folders]
+        failed_counts = db.count_failed_synced_files_batch(folder_ids)
+
         folder_list = []
         for f in folders:
-            failed_count = db.count_synced_files_by_status(f['id'], 'failed')
             folder_list.append(ConnectedFolder(
                 id=f['id'],
                 folder_id=f['folder_id'],
@@ -4702,7 +4703,7 @@ def list_connected_folders(user_id: str):
                 last_sync_at=f.get('last_sync_at'),
                 total_files=f.get('total_files', 0),
                 processed_files=f.get('processed_files', 0),
-                failed_files=failed_count,
+                failed_files=failed_counts.get(f['id'], 0),
                 discovered_files=f.get('discovered_files', 0),
                 discovered_folders=f.get('discovered_folders', 0),
                 current_folder_path=f.get('current_folder_path'),

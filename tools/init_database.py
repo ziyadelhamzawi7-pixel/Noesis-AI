@@ -456,6 +456,7 @@ def init_database():
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_connected_folders_user ON connected_folders(user_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_connected_folders_data_room ON connected_folders(data_room_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_synced_files_folder ON synced_files(connected_folder_id)")
+    cursor.execute("CREATE INDEX IF NOT EXISTS idx_synced_files_folder_status ON synced_files(connected_folder_id, sync_status)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_synced_files_drive_id ON synced_files(drive_file_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_folder_inventory_connected ON folder_inventory(connected_folder_id)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_connected_files_user ON connected_files(user_id)")

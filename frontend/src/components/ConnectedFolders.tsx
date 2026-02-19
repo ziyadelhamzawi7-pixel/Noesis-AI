@@ -77,7 +77,7 @@ export default function ConnectedFolders() {
 
     const pollInterval = setInterval(() => {
       loadFolders(user.id);
-    }, 2000); // Poll every 2 seconds
+    }, 4000); // Poll every 4 seconds
 
     return () => clearInterval(pollInterval);
   }, [folders, user]);
@@ -94,7 +94,7 @@ export default function ConnectedFolders() {
 
     const pollInterval = setInterval(() => {
       loadConnectedFiles(user.id);
-    }, 2000); // Poll every 2 seconds
+    }, 4000); // Poll every 4 seconds
 
     return () => clearInterval(pollInterval);
   }, [connectedFiles, user]);

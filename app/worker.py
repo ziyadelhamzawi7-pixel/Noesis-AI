@@ -287,7 +287,8 @@ class JobWorker:
                     db.update_data_room_status(data_room_id, 'complete', progress=100)
                     doc_count = len(db.get_documents_by_data_room(data_room_id))
                     with db.get_db_connection() as conn:
-                        conn.execute(
+                        cursor = conn.cursor()
+                        cursor.execute(
                             "UPDATE data_rooms SET total_documents = %s WHERE id = %s",
                             (doc_count, data_room_id)
                         )
