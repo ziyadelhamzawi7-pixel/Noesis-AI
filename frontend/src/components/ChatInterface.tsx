@@ -611,21 +611,27 @@ export default function ChatInterface() {
     })();
     const totalDocs = syncProgress?.total_files || dataRoom.total_documents;
 
-    // Phase-aware counter: show different text depending on sync stage
+    // Phase-aware counter: show different text depending on sync stage and parse progress
     const counterDisplay = (() => {
-      if (!syncProgress || !isProcessing || totalDocs <= 0) {
-        // Non-Drive upload: show parsed count as before
-        return { count: displayedParsed, total: totalDocs, label: 'documents', downloading: false };
+      if (syncProgress && isProcessing && totalDocs > 0) {
+        const stage = syncProgress.sync_stage;
+        if (stage === 'discovering' || stage === 'discovered') {
+          return { count: syncProgress.discovered_files || 0, total: null, label: 'files discovered', downloading: false };
+        }
+        if (stage === 'processing' && !parsingStarted) {
+          return { count: null, total: totalDocs, label: 'files downloading', downloading: true };
+        }
       }
-      const stage = syncProgress.sync_stage;
-      if (stage === 'discovering' || stage === 'discovered') {
-        return { count: syncProgress.discovered_files || 0, total: null, label: 'files discovered', downloading: false };
+      // When no documents have been parsed yet, show "Processing N documents..."
+      // instead of the misleading "0 of N documents"
+      if (isProcessing && displayedParsed === 0 && totalDocs > 0) {
+        return { count: null, total: totalDocs, label: 'documents processing', downloading: true };
       }
-      if (stage === 'processing' && !parsingStarted) {
-        return { count: null, total: totalDocs, label: 'files downloading', downloading: true };
+      // Once parsing starts completing, show "X of N documents parsed"
+      if (isProcessing && displayedParsed > 0 && totalDocs > 0) {
+        return { count: displayedParsed, total: totalDocs, label: 'documents parsed', downloading: false };
       }
-      // Parsing in progress or complete
-      return { count: displayedParsed, total: totalDocs, label: 'documents parsed', downloading: false };
+      return { count: displayedParsed, total: totalDocs, label: 'documents', downloading: false };
     })();
 
     return (
