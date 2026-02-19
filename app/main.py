@@ -617,6 +617,50 @@ async def startup_event():
                     if stalled_ids:
                         _sconn.commit()
 
+                    # Recover data rooms stuck in processing with 0 documents.
+                    # This happens when all Drive downloads fail (auth expired,
+                    # rate limited, Railway restart mid-download). The original
+                    # stall guard requires EXISTS documents, so these rooms are
+                    # never recovered without this additional check.
+                    _scur.execute("""
+                        SELECT dr.id
+                        FROM data_rooms dr
+                        WHERE dr.processing_status IN ('parsing', 'indexing', 'extracting')
+                        AND dr.created_at < CURRENT_TIMESTAMP - interval '10 minutes'
+                        AND NOT EXISTS (SELECT 1 FROM documents d WHERE d.data_room_id = dr.id)
+                        AND EXISTS (
+                            SELECT 1 FROM connected_folders cf
+                            WHERE cf.data_room_id = dr.id
+                            AND cf.sync_stage NOT IN ('discovering', 'processing')
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM job_queue jq
+                            WHERE jq.data_room_id = dr.id
+                            AND jq.status IN ('pending', 'running')
+                        )
+                    """)
+                    no_doc_stalled = [row['id'] for row in _scur.fetchall()]
+
+                    for room_id in no_doc_stalled:
+                        _scur.execute("""
+                            UPDATE data_rooms
+                            SET processing_status = 'complete',
+                                progress_percent = 100,
+                                total_documents = 0,
+                                completed_at = CURRENT_TIMESTAMP,
+                                error_message = 'Drive sync failed to download any files — reconnect the folder to retry'
+                            WHERE id = %s
+                        """, (room_id,))
+                        _scur.execute("""
+                            UPDATE connected_folders
+                            SET sync_stage = 'complete', sync_status = 'active'
+                            WHERE data_room_id = %s AND sync_stage != 'complete'
+                        """, (room_id,))
+                        logger.info(f"[stall-guard] Recovered stuck data room with 0 documents: {room_id}")
+
+                    if no_doc_stalled:
+                        _sconn.commit()
+
                     # Also check for complete data rooms with chunks but 0 embeddings
                     _scur.execute("""
                         SELECT dr.id

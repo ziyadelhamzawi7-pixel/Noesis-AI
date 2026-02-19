@@ -258,7 +258,10 @@ class JobWorker:
             folder_record = db.get_connected_folder(connected_folder_id)
             downloads_done = folder_record.get('sync_stage') in ('queued', 'complete') if folder_record else False
             db_processed = db.count_processed_synced_files(connected_folder_id)
-            db_total = folder_record['total_files'] if folder_record and folder_record.get('total_files') else total
+            # Use actual synced_files count from DB as the authoritative total.
+            # The total_files field on connected_folders can be stale if discovery
+            # overcounted (e.g. ON CONFLICT upserts during resumed discovery).
+            db_total = db.count_all_synced_files(connected_folder_id)
 
             if not downloads_done or db_processed < db_total:
                 # Not actually complete — downloads still running or files still processing.

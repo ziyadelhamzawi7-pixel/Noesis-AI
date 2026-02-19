@@ -2579,14 +2579,19 @@ def create_synced_file(
 
 def create_synced_files_batch(files: List[Dict[str, Any]]) -> List[str]:
     """
-    Create multiple synced file records in a single transaction using executemany.
+    Create multiple synced file records in a single transaction.
+
+    Uses execute_values with RETURNING to get the actual IDs from the database,
+    not pre-generated ones. This is critical for ON CONFLICT (upsert) scenarios:
+    when a row already exists, the DB keeps its original ID, so we must read it
+    back instead of assuming our generated ID was inserted.
 
     Args:
         files: List of dicts with keys: connected_folder_id, drive_file_id,
                file_name, file_path, mime_type, file_size, drive_modified_time
 
     Returns:
-        List of generated synced file IDs
+        List of actual synced file IDs from the database
     """
     if not files:
         return []
@@ -2609,21 +2614,27 @@ def create_synced_files_batch(files: List[Dict[str, Any]]) -> List[str]:
 
     with get_db_connection() as conn:
         cursor = conn.cursor()
-        cursor.executemany("""
+        result = psycopg2.extras.execute_values(
+            cursor,
+            """
             INSERT INTO synced_files (
                 id, connected_folder_id, drive_file_id, file_name,
                 file_path, mime_type, file_size, drive_modified_time
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ) VALUES %s
             ON CONFLICT (connected_folder_id, drive_file_id) DO UPDATE SET
                 file_name = EXCLUDED.file_name,
                 file_path = EXCLUDED.file_path,
                 mime_type = EXCLUDED.mime_type,
                 file_size = EXCLUDED.file_size,
                 drive_modified_time = EXCLUDED.drive_modified_time
-        """, values)
+            RETURNING id
+            """,
+            values,
+            fetch=True
+        )
         conn.commit()
 
-    return ids
+    return [row[0] for row in result]
 
 
 def get_synced_files_by_folder(connected_folder_id: str) -> List[Dict[str, Any]]:
@@ -2707,6 +2718,19 @@ def count_processed_synced_files(connected_folder_id: str) -> int:
         cursor = conn.cursor()
         cursor.execute(
             "SELECT COUNT(*) as cnt FROM synced_files WHERE connected_folder_id = %s AND sync_status IN ('complete', 'failed')",
+            (connected_folder_id,)
+        )
+        return cursor.fetchone()['cnt']
+
+
+def count_all_synced_files(connected_folder_id: str) -> int:
+    """Count ALL synced files for a folder (regardless of status).
+    Used as the authoritative total for completion checks instead of the
+    in-memory discovery counter which can drift on conflict/resume."""
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT COUNT(*) as cnt FROM synced_files WHERE connected_folder_id = %s",
             (connected_folder_id,)
         )
         return cursor.fetchone()['cnt']

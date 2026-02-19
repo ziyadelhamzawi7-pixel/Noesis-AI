@@ -588,14 +588,19 @@ class SyncService:
             current_folder_path=None
         )
 
-        # Update total files count
+        # Use actual DB count for total_files instead of the in-memory counter.
+        # The counter can overcount when discovery resumes and re-discovers files
+        # that already exist (ON CONFLICT upsert keeps the existing row but the
+        # counter still increments). Using the DB count prevents a total_files
+        # mismatch that blocks the completion check in _update_folder_progress.
+        actual_file_count = db.count_all_synced_files(folder_id)
         db.update_connected_folder_status(
             folder_id,
             sync_status='syncing',
-            total_files=discovered_files
+            total_files=actual_file_count
         )
 
-        logger.info(f"Discovery complete: {discovered_files} files in {discovered_folders} folders")
+        logger.info(f"Discovery complete: {actual_file_count} files in DB ({discovered_files} discovered) across {discovered_folders} folders")
 
     def _processing_phase(self, folder: Dict[str, Any], drive_service: GoogleDriveService):
         """
