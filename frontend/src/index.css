@@ -1695,6 +1695,15 @@ tr:hover td {
   color: var(--text-primary);
 }
 
+.status-count-downloading {
+  animation: downloadPulse 2s ease-in-out infinite;
+}
+
+@keyframes downloadPulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.5; }
+}
+
 /* --- Milestone Track --- */
 .milestone-track {
   display: flex;

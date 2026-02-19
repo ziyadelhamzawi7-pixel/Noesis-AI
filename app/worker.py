@@ -520,7 +520,9 @@ class JobWorker:
             if self._indexer is None:
                 self._indexer = VectorDBIndexer()
             indexer = self._indexer
-            write_pool = ThreadPoolExecutor(max_workers=10)
+            WRITE_TIMEOUT = 120  # seconds — timeout per write future
+            MAX_PENDING_WRITES = 4  # backpressure: max in-flight write batches before blocking
+            write_pool = ThreadPoolExecutor(max_workers=3)
 
             try:
                 pending_futures = []
@@ -538,10 +540,16 @@ class JobWorker:
                     total_token_count += sum(c.get('token_count', 0) for c in batch)
 
                     # Pipeline VectorDB and DB writes — don't block between batches
-                    # The write_pool's workers naturally limit concurrency
                     vector_future = write_pool.submit(index_to_vectordb, data_room_id, batch, indexer=indexer)
                     db_future = write_pool.submit(db.create_chunks_batch_optimized, batch)
                     pending_futures.append((vector_future, db_future))
+
+                    # Backpressure: drain oldest writes when too many are in-flight.
+                    # Prevents unbounded memory growth when embeddings outpace writes.
+                    while len(pending_futures) >= MAX_PENDING_WRITES:
+                        v_fut, d_fut = pending_futures.pop(0)
+                        v_fut.result(timeout=WRITE_TIMEOUT)
+                        d_fut.result(timeout=WRITE_TIMEOUT)
 
                     indexed_count += len(batch)
                     logger.debug(f"[{data_room_id}] Indexed batch: {indexed_count}/{len(chunks)} chunks")
@@ -561,8 +569,7 @@ class JobWorker:
                         single_progress = 50 + file_frac * 45
                         db.update_data_room_status(data_room_id, 'indexing', progress=int(min(single_progress, 95)))
 
-                # Wait for all pipelined writes to complete (with timeout to prevent hangs)
-                WRITE_TIMEOUT = 120  # seconds
+                # Drain remaining pipelined writes
                 for v_fut, d_fut in pending_futures:
                     try:
                         v_fut.result(timeout=WRITE_TIMEOUT)
@@ -573,7 +580,7 @@ class JobWorker:
                     except (TimeoutError, FuturesTimeoutError):
                         raise TimeoutError(f"Database write timed out after {WRITE_TIMEOUT}s for {file_name}")
             finally:
-                write_pool.shutdown(wait=True)
+                write_pool.shutdown(wait=False)
 
         # Validate embedding results — fail if all embeddings failed
         failed_embedding_count = sum(1 for c in chunks if c.get('embedding_failed'))

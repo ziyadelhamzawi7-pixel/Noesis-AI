@@ -69,6 +69,9 @@ def _detect_system_resources() -> dict:
     else:
         embedding_max_concurrent = 25
 
+    # DB pool should accommodate: max_workers × 3 (write threads per worker) + headroom
+    db_pool_size = max(10, max_workers * 3 + 5)
+
     return {
         "total_ram_mb": int(total_ram_mb),
         "cpu_count": cpu_count,
@@ -79,6 +82,7 @@ def _detect_system_resources() -> dict:
         "min_free_memory_mb": min_free_memory_mb,
         "memory_limit_percent": memory_limit_percent,
         "embedding_max_concurrent": embedding_max_concurrent,
+        "db_pool_size": db_pool_size,
     }
 
 
@@ -171,7 +175,7 @@ class Settings(BaseSettings):
     min_free_memory_mb: int = int(os.getenv("MIN_FREE_MEMORY_MB") or _RESOURCES["min_free_memory_mb"])
 
     # Database Optimization
-    db_pool_size: int = int(os.getenv("DB_POOL_SIZE", "10"))
+    db_pool_size: int = int(os.getenv("DB_POOL_SIZE") or _RESOURCES.get("db_pool_size", 10))
     db_batch_size: int = int(os.getenv("DB_BATCH_SIZE", "5000"))
 
     # Redis Configuration

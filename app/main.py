@@ -604,6 +604,14 @@ async def startup_event():
                             WHERE id = %s
                         """, (doc_count, room_id))
 
+                        # Also complete any connected_folders tied to this data room
+                        # (Google Drive syncs won't recover without this)
+                        _scur.execute("""
+                            UPDATE connected_folders
+                            SET sync_stage = 'complete', sync_status = 'active'
+                            WHERE data_room_id = %s AND sync_stage != 'complete'
+                        """, (room_id,))
+
                         logger.info(f"[stall-guard] Recovered stalled data room {room_id} ({doc_count} docs)")
 
                     if stalled_ids:

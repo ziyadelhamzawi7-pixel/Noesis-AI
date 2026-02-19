@@ -131,6 +131,10 @@ export default function ChatInterface() {
   // Trickle progress — smoothly advances displayed value between backend polls
   const trickledProgress = useRef<number>(0);
   const trickleIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // Ref to access syncProgress inside trickle interval without restarting it
+  const syncProgressRef = useRef<SyncProgress | null>(null);
+
+  useEffect(() => { syncProgressRef.current = syncProgress; }, [syncProgress]);
 
   useEffect(() => {
     if (!dataRoomId) {
@@ -328,7 +332,15 @@ export default function ChatInterface() {
       return;
     }
 
-    const messages = messagesByPhase[dataRoom.processing_status] || ['Processing...'];
+    // Pick phase-appropriate messages when a Drive sync is active
+    const messages = (() => {
+      if (syncProgress) {
+        const stage = syncProgress.sync_stage;
+        if (stage === 'discovering' || stage === 'discovered') return ['Scanning Google Drive folder...', 'Discovering files and subfolders...'];
+        if (stage === 'processing' && (syncProgress.processed_files ?? 0) === 0) return ['Downloading files from Google Drive...', 'Transferring documents from Drive...', 'Fetching your files...'];
+      }
+      return messagesByPhase[dataRoom.processing_status] || ['Processing...'];
+    })();
     const allMessages = [...messages];
     if (syncProgress?.current_file) {
       allMessages.push(`Processing ${syncProgress.current_file.file_name}...`);
@@ -353,7 +365,7 @@ export default function ChatInterface() {
     }, 3500);
 
     return () => clearInterval(interval);
-  }, [dataRoom?.processing_status, syncProgress?.current_file?.file_name]);
+  }, [dataRoom?.processing_status, syncProgress?.current_file?.file_name, syncProgress?.sync_stage]);
 
   // Trickle progress — slowly advance displayed value between backend polls
   useEffect(() => {
@@ -366,8 +378,15 @@ export default function ChatInterface() {
     if (trickleIntervalRef.current) return;
     trickleIntervalRef.current = setInterval(() => {
       const c = trickledProgress.current;
+      // Cap trickle at 10% during discovery/download — don't fake progress while 0 docs parsed
+      const sp = syncProgressRef.current;
+      const syncStage = sp?.sync_stage;
+      const isPreParse = syncStage === 'discovering' || syncStage === 'discovered' ||
+        (syncStage === 'processing' && (sp?.processed_files ?? 0) === 0);
+      const trickleMax = isPreParse ? 10 : 95;
+      if (c >= trickleMax) return;
       const inc = c < 10 ? 1.5 : c < 30 ? 0.8 : c < 60 ? 0.5 : c < 90 ? 0.3 : 0.1;
-      trickledProgress.current = Math.min(c + inc, 95);
+      trickledProgress.current = Math.min(c + inc, trickleMax);
       setDataRoom(prev => prev ? { ...prev } : prev);
     }, 1000);
     return () => { if (trickleIntervalRef.current) { clearInterval(trickleIntervalRef.current); trickleIntervalRef.current = null; } };
@@ -578,9 +597,36 @@ export default function ChatInterface() {
     if (dataRoom.processing_status === 'complete') return null;
 
     const progress = Math.max(dataRoom.progress_percent, trickledProgress.current);
-    const milestoneIndex = getMilestoneIndex(dataRoom.processing_status);
-    const milestones = ['Upload', 'Parse', 'Index', 'Ready'];
+    const milestones = syncProgress ? ['Download', 'Parse', 'Index', 'Ready'] : ['Upload', 'Parse', 'Index', 'Ready'];
+    // During 'processing' stage, distinguish download vs parse using parsed_documents
+    const parsingStarted = syncProgress && (syncProgress.processed_files > 0 || (dataRoom.parsed_documents ?? 0) > 0);
+    const milestoneIndex = (() => {
+      if (syncProgress) {
+        const stage = syncProgress.sync_stage;
+        if (stage === 'discovering' || stage === 'discovered') return 0;
+        if (stage === 'processing') return parsingStarted ? 1 : 0;
+        if (stage === 'complete') return 3;
+      }
+      return getMilestoneIndex(dataRoom.processing_status);
+    })();
     const totalDocs = syncProgress?.total_files || dataRoom.total_documents;
+
+    // Phase-aware counter: show different text depending on sync stage
+    const counterDisplay = (() => {
+      if (!syncProgress || !isProcessing || totalDocs <= 0) {
+        // Non-Drive upload: show parsed count as before
+        return { count: displayedParsed, total: totalDocs, label: 'documents', downloading: false };
+      }
+      const stage = syncProgress.sync_stage;
+      if (stage === 'discovering' || stage === 'discovered') {
+        return { count: syncProgress.discovered_files || 0, total: null, label: 'files discovered', downloading: false };
+      }
+      if (stage === 'processing' && !parsingStarted) {
+        return { count: null, total: totalDocs, label: 'files downloading', downloading: true };
+      }
+      // Parsing in progress or complete
+      return { count: displayedParsed, total: totalDocs, label: 'documents parsed', downloading: false };
+    })();
 
     return (
       <div className={`status-panel ${isFailed ? 'status-panel-error' : ''}`}>
@@ -591,12 +637,22 @@ export default function ChatInterface() {
             {isFailed && <AlertCircle size={18} style={{ color: 'var(--error)' }} />}
             <span className={config.badge}>{config.label}</span>
           </div>
-          {isProcessing && totalDocs > 0 && (
-            <span className="status-doc-count">
-              <span className="status-count-number">{displayedParsed}</span>
-              {' of '}
-              <span className="status-count-number">{totalDocs}</span>
-              {' documents'}
+          {isProcessing && (totalDocs > 0 || (counterDisplay.count !== null && counterDisplay.count > 0)) && (
+            <span className={`status-doc-count${counterDisplay.downloading ? ' status-count-downloading' : ''}`}>
+              {counterDisplay.count !== null ? (
+                <>
+                  <span className="status-count-number">{counterDisplay.count}</span>
+                  {counterDisplay.total !== null && (
+                    <>
+                      {' of '}
+                      <span className="status-count-number">{counterDisplay.total}</span>
+                    </>
+                  )}
+                </>
+              ) : (
+                <span className="status-count-number">{counterDisplay.total}</span>
+              )}
+              {' '}{counterDisplay.label}
             </span>
           )}
         </div>
