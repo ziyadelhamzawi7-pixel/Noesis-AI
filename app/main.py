@@ -90,98 +90,220 @@ from starlette.middleware.gzip import GZipMiddleware
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
 # --- Access Password Protection ---
-# When ACCESS_PASSWORD is set, all routes are gated behind a login page.
-# A signed session token is stored in a cookie to maintain the session.
+# --- User Login & Session Management ---
+# Users must sign in (Google OAuth or email) to use the app.
+# When ACCESS_PASSWORD is also set, users must enter it alongside their login.
+# A signed session cookie tracks the authenticated session.
 _access_password = settings.access_password
 _auth_secret = os.getenv("AUTH_SECRET", secrets.token_hex(32))
 
-def _make_session_token() -> str:
-    """Create a signed session token for the access password."""
-    return hashlib.sha256(f"{_auth_secret}:authenticated".encode()).hexdigest()
+def _make_session_token(user_id: str = "anonymous") -> str:
+    """Create a signed session token tied to a specific user."""
+    return hashlib.sha256(f"{_auth_secret}:{user_id}".encode()).hexdigest()
 
-if _access_password:
-    from starlette.middleware.base import BaseHTTPMiddleware
+def _set_session_cookie(response: Response, user_id: str) -> Response:
+    """Set the authenticated session cookie on a response."""
+    response.set_cookie(
+        key="noesis_session",
+        value=_make_session_token(user_id),
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 7,  # 7 days
+    )
+    # Also store user_id in a readable cookie so middleware can verify
+    response.set_cookie(
+        key="noesis_user_id",
+        value=user_id,
+        httponly=True,
+        samesite="lax",
+        max_age=60 * 60 * 24 * 7,
+    )
+    return response
 
-    _LOGIN_PAGE_HTML = """<!DOCTYPE html>
+def _verify_session(request: Request) -> bool:
+    """Check if the request has a valid session cookie."""
+    token = request.cookies.get("noesis_session")
+    user_id = request.cookies.get("noesis_user_id", "anonymous")
+    if not token:
+        return False
+    return token == _make_session_token(user_id)
+
+# Always enable login middleware (not just when ACCESS_PASSWORD is set)
+from starlette.middleware.base import BaseHTTPMiddleware
+
+_HAS_ACCESS_PASSWORD = bool(_access_password)
+
+_LOGIN_PAGE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Noesis AI — Login</title>
+<title>Noesis AI — Sign In</title>
 <style>
   * { margin: 0; padding: 0; box-sizing: border-box; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #0a0a0f; color: #e0e0e0; display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-  .card { background: #14141f; border: 1px solid #2a2a3a; border-radius: 12px; padding: 40px; width: 100%; max-width: 400px; }
-  h1 { font-size: 24px; margin-bottom: 8px; color: #fff; }
-  p.sub { font-size: 14px; color: #888; margin-bottom: 24px; }
+  .card { background: #14141f; border: 1px solid #2a2a3a; border-radius: 12px; padding: 40px; width: 100%; max-width: 420px; }
+  h1 { font-size: 24px; margin-bottom: 8px; color: #fff; text-align: center; }
+  p.sub { font-size: 14px; color: #888; margin-bottom: 28px; text-align: center; }
   label { display: block; font-size: 13px; color: #aaa; margin-bottom: 6px; }
   input { width: 100%; padding: 10px 14px; border-radius: 8px; border: 1px solid #2a2a3a; background: #0a0a0f; color: #fff; font-size: 15px; outline: none; }
   input:focus { border-color: #6c63ff; }
-  button { width: 100%; padding: 11px; margin-top: 20px; border: none; border-radius: 8px; background: #6c63ff; color: #fff; font-size: 15px; font-weight: 600; cursor: pointer; }
-  button:hover { background: #5a52d5; }
-  .error { color: #ff6b6b; font-size: 13px; margin-top: 12px; display: none; }
+  .divider { display: flex; align-items: center; gap: 12px; margin: 24px 0; color: #555; font-size: 13px; }
+  .divider::before, .divider::after { content: ''; flex: 1; height: 1px; background: #2a2a3a; }
+  .btn { width: 100%; padding: 11px; border: none; border-radius: 8px; font-size: 15px; font-weight: 600; cursor: pointer; display: flex; align-items: center; justify-content: center; gap: 10px; transition: background 0.2s; }
+  .btn-google { background: #fff; color: #333; margin-bottom: 0; }
+  .btn-google:hover { background: #f0f0f0; }
+  .btn-email { background: #6c63ff; color: #fff; margin-top: 16px; }
+  .btn-email:hover { background: #5a52d5; }
+  .error { color: #ff6b6b; font-size: 13px; margin-top: 12px; display: none; text-align: center; }
+  .access-code { margin-bottom: 20px; }
+  .access-code-label { font-size: 12px; color: #666; margin-top: 4px; }
+  .logo-wrap { text-align: center; margin-bottom: 20px; }
+  .logo-icon { width: 48px; height: 48px; border-radius: 14px; background: linear-gradient(135deg, #6c63ff 0%, #a855f7 100%); display: inline-flex; align-items: center; justify-content: center; margin-bottom: 12px; }
+  .email-section { margin-top: 0; }
 </style>
 </head>
 <body>
 <div class="card">
+  <div class="logo-wrap">
+    <div class="logo-icon">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none"><path d="M12 2C9.5 2 7.5 3.5 7 5.5C5.5 5.8 4.3 7 4 8.5C3.5 10.5 4.5 12.5 6.5 13.5C6 14.5 6 15.5 6.5 16.5C7 18 8.5 19 10 19H14C15.5 19 17 18 17.5 16.5C18 15.5 18 14.5 17.5 13.5C19.5 12.5 20.5 10.5 20 8.5C19.7 7 18.5 5.8 17 5.5C16.5 3.5 14.5 2 12 2Z" fill="white" opacity="0.9"/></svg>
+    </div>
+  </div>
   <h1>Noesis AI</h1>
-  <p class="sub">Enter the access password to continue.</p>
-  <form method="POST" action="/login">
-    <label for="password">Password</label>
-    <input type="password" id="password" name="password" placeholder="Access password" autofocus required>
-    <button type="submit">Sign in</button>
-    <p class="error" id="err">Incorrect password. Please try again.</p>
+  <p class="sub">Sign in to access your data rooms</p>
+
+  <form id="loginForm" method="POST" action="/login">
+    """ + ("""
+    <div class="access-code">
+      <label for="access_code">Access Code</label>
+      <input type="password" id="access_code" name="access_code" placeholder="Enter access code" required>
+      <p class="access-code-label">Required to use this instance</p>
+    </div>
+    """ if _HAS_ACCESS_PASSWORD else "") + """
+
+    <!-- Google Sign In -->
+    <button type="button" class="btn btn-google" onclick="handleGoogle()">
+      <svg width="18" height="18" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92a5.06 5.06 0 0 1-2.2 3.32v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.1z" fill="#4285F4"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#34A853"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" fill="#FBBC05"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#EA4335"/></svg>
+      Sign in with Google
+    </button>
+
+    <div class="divider">or</div>
+
+    <!-- Email Sign In -->
+    <div class="email-section">
+      <label for="email">Email address</label>
+      <input type="email" id="email" name="email" placeholder="you@company.com">
+      <button type="submit" name="method" value="email" class="btn btn-email">Continue with Email</button>
+    </div>
+
+    <p class="error" id="err"></p>
   </form>
+
   <script>
-    if (new URLSearchParams(window.location.search).get('error')) {
-      document.getElementById('err').style.display = 'block';
+    const params = new URLSearchParams(window.location.search);
+    const errMsg = params.get('error');
+    if (errMsg) {
+      const el = document.getElementById('err');
+      el.textContent = decodeURIComponent(errMsg);
+      el.style.display = 'block';
+    }
+
+    function handleGoogle() {
+      """ + ("""
+      // Validate access code first
+      const code = document.getElementById('access_code')?.value;
+      if (!code) { showError('Please enter the access code'); return; }
+      // Store access code temporarily so the Google callback can verify it
+      document.cookie = 'noesis_pending_access_code=' + encodeURIComponent(code) + ';path=/;max-age=600;samesite=lax';
+      """ if _HAS_ACCESS_PASSWORD else "") + """
+      // Redirect to Google OAuth
+      fetch('/api/auth/google/login')
+        .then(r => r.json())
+        .then(data => { window.location.href = data.auth_url; })
+        .catch(() => showError('Failed to start Google login'));
+    }
+
+    function showError(msg) {
+      const el = document.getElementById('err');
+      el.textContent = msg;
+      el.style.display = 'block';
     }
   </script>
 </div>
 </body>
 </html>"""
 
-    class AccessPasswordMiddleware(BaseHTTPMiddleware):
-        async def dispatch(self, request: Request, call_next):
-            path = request.url.path
-            # Allow login page, health check, and static login assets through
-            if path in ("/login", "/api/health"):
-                return await call_next(request)
-            # Check session cookie
-            token = request.cookies.get("noesis_session")
-            if token == _make_session_token():
-                return await call_next(request)
-            # Not authenticated — redirect browsers, reject API calls
-            if path.startswith("/api/"):
-                return JSONResponse(status_code=401, content={"detail": "Authentication required"})
-            return RedirectResponse(url="/login", status_code=302)
+class LoginMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        path = request.url.path
+        # Allow login page, health check, auth endpoints, and static assets through
+        if path in ("/login", "/api/health") or path.startswith("/api/auth/"):
+            return await call_next(request)
+        # Allow the auth callback page through (frontend route)
+        if path == "/auth/callback":
+            return await call_next(request)
+        # Check session cookie
+        if _verify_session(request):
+            return await call_next(request)
+        # Not authenticated — redirect browsers, reject API calls
+        if path.startswith("/api/"):
+            return JSONResponse(status_code=401, content={"detail": "Authentication required"})
+        return RedirectResponse(url="/login", status_code=302)
 
-    app.add_middleware(AccessPasswordMiddleware)
+app.add_middleware(LoginMiddleware)
 
-    @app.get("/login")
-    async def login_page():
-        """Serve the login page."""
-        from fastapi.responses import HTMLResponse
-        return HTMLResponse(content=_LOGIN_PAGE_HTML)
+@app.get("/login")
+async def login_page():
+    """Serve the login page."""
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=_LOGIN_PAGE_HTML)
 
-    @app.post("/login")
-    async def login_submit(request: Request):
-        """Validate the access password and set a session cookie."""
-        form = await request.form()
-        password = form.get("password", "")
-        if password == _access_password:
-            response = RedirectResponse(url="/", status_code=302)
-            response.set_cookie(
-                key="noesis_session",
-                value=_make_session_token(),
-                httponly=True,
-                samesite="lax",
-                max_age=60 * 60 * 24 * 7,  # 7 days
-            )
-            return response
-        return RedirectResponse(url="/login?error=1", status_code=302)
+@app.post("/login")
+async def login_submit(request: Request):
+    """Handle email login form submission."""
+    form = await request.form()
+    email = (form.get("email") or "").strip()
+    access_code = (form.get("access_code") or "").strip()
 
-    logger.info("Access password protection is ENABLED")
+    # Validate access code if required
+    if _HAS_ACCESS_PASSWORD and access_code != _access_password:
+        return RedirectResponse(url="/login?error=Incorrect+access+code", status_code=302)
+
+    # Validate email
+    if not email or "@" not in email:
+        return RedirectResponse(url="/login?error=Please+enter+a+valid+email", status_code=302)
+
+    # Create or find user
+    try:
+        user_id = db.create_or_update_user(
+            email=email,
+            name=email.split("@")[0],
+        )
+
+        # Auto-accept pending invites
+        if settings.enable_sharing:
+            try:
+                db.auto_accept_pending_invites(user_id, email)
+            except Exception:
+                pass
+
+        # Build redirect URL
+        base_url = f"{request.url.scheme}://{request.url.netloc}"
+        redirect_url = f"{base_url}/auth/callback?user_id={user_id}&email={email}"
+
+        response = RedirectResponse(url=redirect_url, status_code=302)
+        _set_session_cookie(response, user_id)
+        return response
+
+    except Exception as e:
+        logger.error(f"Email login failed: {e}")
+        return RedirectResponse(url="/login?error=Login+failed", status_code=302)
+
+if _HAS_ACCESS_PASSWORD:
+    logger.info("Access password protection is ENABLED (required alongside login)")
+else:
+    logger.info("Login required (no access password gate)")
 
 # Processing semaphore to limit concurrent background jobs
 # Prevents memory exhaustion from too many simultaneous file processing tasks
@@ -575,11 +697,9 @@ def require_data_room_access(
     if not settings.enable_sharing:
         return 'owner'
 
-    # If the user is not logged in, allow access. Sharing restricts between
-    # authenticated users, not against unauthenticated access. Password
-    # protection is handled separately by AccessPasswordMiddleware.
+    # Require login — unauthenticated users cannot access data rooms.
     if not user_id and not user_email:
-        return 'owner'
+        raise HTTPException(status_code=401, detail="Login required")
 
     role = db.check_data_room_access(data_room_id, user_id, user_email)
     if role is None:
@@ -1474,7 +1594,7 @@ async def create_data_room(
             analyst_email=analyst_email,
             security_level=security_level,
             total_documents=total_files,
-            user_id=None  # Upload-page data rooms are unowned ("legacy") — accessible without login
+            user_id=identity.get("user_id")  # Owned by the logged-in user
         )
         db.update_data_room_status(data_room_id, "uploading", progress=0)
 
@@ -3585,6 +3705,18 @@ async def google_auth_callback(
         stored_state = _oauth_states.pop(state)
         redirect_uri = stored_state['redirect_uri']
 
+        # Verify access code if required (stored in cookie by login page JS)
+        if _HAS_ACCESS_PASSWORD:
+            import urllib.parse
+            pending_code = request.cookies.get("noesis_pending_access_code", "")
+            pending_code = urllib.parse.unquote(pending_code)
+            if pending_code != _access_password:
+                if _serve_frontend:
+                    base_url = stored_state.get('base_url', f"{request.url.scheme}://{request.url.netloc}")
+                else:
+                    base_url = settings.frontend_url.rstrip("/")
+                return RedirectResponse(url=f"{base_url}/login?error=Incorrect+access+code")
+
         # Exchange code for tokens
         result = google_oauth_service.exchange_code_for_tokens(code, redirect_uri)
 
@@ -3622,7 +3754,13 @@ async def google_auth_callback(
         else:
             base_url = settings.frontend_url.rstrip("/")
         frontend_url = f"{base_url}/auth/callback?user_id={user_id}&email={email}"
-        return RedirectResponse(url=frontend_url)
+
+        # Set session cookie so LoginMiddleware allows subsequent requests
+        response = RedirectResponse(url=frontend_url)
+        _set_session_cookie(response, user_id)
+        # Clear the temporary access code cookie
+        response.delete_cookie("noesis_pending_access_code")
+        return response
 
     except HTTPException:
         raise

@@ -4,7 +4,6 @@ import { Cloud, LogIn, LogOut, User, ChevronDown } from 'lucide-react';
 import {
   getCurrentUser,
   clearCurrentUser,
-  initiateGoogleLogin,
   logoutUser,
   getUserInfo,
   UserInfo,
@@ -36,13 +35,9 @@ export default function Layout({ children }: LayoutProps) {
     }
   }, [location]);
 
-  const handleLogin = async () => {
-    try {
-      const { auth_url } = await initiateGoogleLogin();
-      window.location.href = auth_url;
-    } catch (err) {
-      console.error('Failed to initiate login:', err);
-    }
+  const handleLogin = () => {
+    // Redirect to the server-rendered login page (Google + email options)
+    window.location.href = '/login';
   };
 
   const handleLogout = async () => {
@@ -56,7 +51,10 @@ export default function Layout({ children }: LayoutProps) {
     clearCurrentUser();
     setUser(null);
     setShowUserMenu(false);
-    navigate('/');
+    // Clear session cookies and redirect to login page
+    document.cookie = 'noesis_session=;path=/;max-age=0';
+    document.cookie = 'noesis_user_id=;path=/;max-age=0';
+    window.location.href = '/login';
   };
 
   const isActive = (path: string) => {
@@ -355,7 +353,7 @@ export default function Layout({ children }: LayoutProps) {
                 }}
               >
                 <LogIn style={{ width: '16px', height: '16px' }} />
-                Connect Google Drive
+                Sign In
               </button>
             )}
           </div>

@@ -35,9 +35,10 @@ export default function AuthCallback() {
         setStatus('success');
         setMessage(`Welcome, ${userInfo.name || userInfo.email}!`);
 
-        // Redirect to drive browser after short delay
+        // Redirect to home (data rooms) after short delay.
+        // Google-authenticated users can navigate to /drive from there.
         setTimeout(() => {
-          navigate('/drive');
+          navigate('/');
         }, 1500);
       } catch (err: any) {
         setStatus('error');
@@ -64,7 +65,7 @@ export default function AuthCallback() {
             <CheckCircle className="icon success" />
             <h2>Success!</h2>
             <p>{message}</p>
-            <p className="redirect-text">Redirecting to Google Drive...</p>
+            <p className="redirect-text">Redirecting to your data rooms...</p>
           </>
         )}
 
